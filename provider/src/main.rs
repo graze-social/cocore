@@ -711,7 +711,64 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
         std::env::set_var("COCORE_INFERENCE_MODELS", desired_at_start.join(","));
     }
 
+    // Provisioning observability (#2/#3/#5): tell the tray we're coming up
+    // and stream download progress while `build_engines` (which can spend
+    // many minutes downloading weights) runs. Cleared on success; replaced
+    // with the fault on failure. A background thread polls the HF cache
+    // size so the marker carries live "downloaded N bytes".
+    let provisioning_models: Vec<String> = std::env::var("COCORE_INFERENCE_MODELS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "stub")
+        .collect();
+    let monitor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor = if provisioning_models.is_empty() {
+        clear_provision_status();
+        None
+    } else {
+        write_provision_status(
+            "provisioning",
+            &provisioning_models,
+            model_download_bytes(&provisioning_models),
+            None,
+        );
+        let models = provisioning_models.clone();
+        let stop = std::sync::Arc::clone(&monitor_stop);
+        Some(std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let bytes = model_download_bytes(&models);
+                write_provision_status("provisioning", &models, bytes, None);
+                // ~2s between updates, but wake promptly to stop.
+                for _ in 0..8 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }))
+    };
+
     let (engines, engine_fault) = build_engines(profile.ram_gb);
+
+    // Stop the progress monitor and record the outcome for the tray: clear
+    // the marker on success (tray shows normal serving), or write the fault
+    // so the tray can surface "Provisioning failed: …".
+    monitor_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = monitor {
+        let _ = h.join();
+    }
+    match &engine_fault {
+        Some(f) => write_provision_status(
+            "failed",
+            &provisioning_models,
+            model_download_bytes(&provisioning_models),
+            Some(f),
+        ),
+        None => clear_provision_status(),
+    }
+
     // Advertise the LIVE set, not every registered engine: `live_models()`
     // filters to engines whose `ready()` holds, so a child that failed to
     // come up (or has already died by the time we publish) never lands in
@@ -1021,6 +1078,9 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
         _ = serve => {}
         _ = wait_for_shutdown_signal() => {
             tracing::info!("graceful shutdown signal received — marking provider offline");
+            // Don't leave a stale "provisioning"/"failed" marker behind for a
+            // machine the owner just stopped.
+            clear_provision_status();
             if provider_rkey.is_some() {
                 // Flip `serving` to false WITHOUT clobbering the owner /
                 // console-authored switches. Our in-memory `provider_record`
@@ -1089,6 +1149,89 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+// ── Provisioning status marker (agent → tray) ──────────────────────
+//
+// `~/.cocore/provision-status.json` — written while the agent is
+// bringing a model online (downloading weights + loading) so the
+// menu-bar app can show a real "Provisioning…" state with download
+// progress, and surface a fault if it fails, instead of claiming
+// "Serving" the moment the process is alive. Best-effort + content-free
+// (model ids + byte counts only). The tray polls it like bad-standing-at.
+
+fn provision_status_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".cocore")
+            .join("provision-status.json"),
+    )
+}
+
+/// Total bytes of the configured models' HuggingFace cache dirs (incl.
+/// in-progress `.incomplete` blobs) — the download-progress signal.
+fn model_download_bytes(models: &[String]) -> u64 {
+    let Ok(home) = std::env::var("HOME") else {
+        return 0;
+    };
+    if home.is_empty() {
+        return 0;
+    }
+    let hub = std::path::Path::new(&home)
+        .join(".cache")
+        .join("huggingface")
+        .join("hub");
+    let mut total = 0u64;
+    for m in models {
+        let dir = hub.join(format!("models--{}", m.replace('/', "--")));
+        total = total.saturating_add(provision_dir_size(&dir));
+    }
+    total
+}
+
+/// Recursively sum regular-file sizes under `dir` (best-effort). Uses
+/// `symlink_metadata` so HF's `snapshots/*` symlinks aren't double-
+/// counted — only the real `blobs/` files (completed + `.incomplete`).
+fn provision_dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_dir() => total = total.saturating_add(provision_dir_size(&path)),
+            Ok(md) if md.is_file() => total = total.saturating_add(md.len()),
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Write the provisioning marker. `phase` is "provisioning" or "failed".
+/// Best-effort; content-free (ids + byte counts + an optional fault
+/// code/message, all already public on the provider record).
+fn write_provision_status(phase: &str, models: &[String], bytes: u64, fault: Option<&EngineFault>) {
+    let Some(path) = provision_status_path() else {
+        return;
+    };
+    let body = serde_json::json!({
+        "phase": phase,
+        "models": models,
+        "bytesDownloaded": bytes,
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+        "fault": fault.map(|f| serde_json::json!({ "code": f.code, "message": f.message })),
+    });
+    let _ = std::fs::write(path, body.to_string());
+}
+
+/// Remove the provisioning marker (engine is up + serving, or the
+/// machine stopped) so the tray falls back to its normal serving state.
+fn clear_provision_status() {
+    if let Some(path) = provision_status_path() {
+        let _ = std::fs::remove_file(path);
     }
 }
 

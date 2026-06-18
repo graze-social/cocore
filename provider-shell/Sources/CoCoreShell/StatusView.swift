@@ -52,6 +52,16 @@ struct StatusRows: View {
         if sched.limited && !sched.within {
             return "Idle until \(PreferencesView.hourLabel(sched.start)) (scheduled)"
         }
+        // The agent is still bringing a model online — the process is up but
+        // it isn't serving yet, so don't claim "Serving".
+        if let p = MenuBarController.provisionStatus() {
+            if p.phase == "provisioning" {
+                return p.bytesDownloaded > 0
+                    ? "Provisioning… (\(MenuBarController.provisionMB(p.bytesDownloaded)) downloaded)"
+                    : "Provisioning…"
+            }
+            if p.phase == "failed" { return "Provisioning failed" }
+        }
         return state.serving ? "Serving" : "Not serving"
     }
 }

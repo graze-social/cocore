@@ -131,24 +131,51 @@ final class MenuBarController {
         // PROCESS, so it stays true — this is what makes a remote stop
         // visible locally instead of still reading "Serving".
         let remotelyPaused = Self.isRemotelyPaused()
-        let effectiveServing = state.serving && !scheduledIdle && !remotelyPaused
+        // While the agent is still downloading/loading a model the PROCESS is
+        // alive (state.serving == true), but it isn't actually serving yet.
+        // The provisioning marker is the truth here — show it instead of
+        // "serving and earning" so the app doesn't claim earnings prematurely.
+        let provision = Self.provisionStatus()
+        let provisioning = provision?.phase == "provisioning"
+        let effectiveServing =
+            state.serving && !scheduledIdle && !remotelyPaused && !provisioning
 
         menu.addItem(.separator())
         // At-a-glance state + the one metric worth a glance. Everything
         // else — identity detail, models, preferences, profile, bug report,
         // sign out, uninstall, version — moved into the "Open cocore…"
         // window so the menu stays short.
-        menu.addItem(disabled(
-            remotelyPaused
-                ? "⏸ Stopped from the console"
-                : (scheduledIdle
-                    ? "✓ Set up — idle until \(PreferencesView.hourLabel(sched.start)) (scheduled)"
-                    : (effectiveServing
-                        ? "✓ You're set up — serving and earning credits"
-                        : "Next: choose “Start serving” below to begin earning"))))
+        let atAGlance: String
+        if remotelyPaused {
+            atAGlance = "⏸ Stopped from the console"
+        } else if provisioning {
+            let bytes = provision?.bytesDownloaded ?? 0
+            atAGlance =
+                bytes > 0
+                ? "⏳ Provisioning… downloading model (\(Self.provisionMB(bytes)))"
+                : "⏳ Provisioning a model… (not earning yet)"
+        } else if provision?.phase == "failed" {
+            atAGlance = "⚠ Provisioning failed — not serving"
+        } else if scheduledIdle {
+            atAGlance = "✓ Set up — idle until \(PreferencesView.hourLabel(sched.start)) (scheduled)"
+        } else if effectiveServing {
+            atAGlance = "✓ You're set up — serving and earning credits"
+        } else {
+            atAGlance = "Next: choose “Start serving” below to begin earning"
+        }
+        menu.addItem(disabled(atAGlance))
         menu.addItem(disabled("Earnings (24h): \(creditsDisplay(state.creditsLast24h))"))
 
         menu.addItem(.separator())
+        if provision?.phase == "failed", let msg = provision?.faultMessage {
+            // Provisioning failed (e.g. a model download that gave up, or a
+            // non-MLX repo). Surface it with the agent's content-safe reason +
+            // a one-click restart, instead of leaving the operator guessing.
+            menu.addItem(disabled("⚠ Couldn't start serving"))
+            menu.addItem(disabled(String(msg.prefix(180))))
+            menu.addItem(action(title: "Restart serving", #selector(restartServing)))
+            menu.addItem(.separator())
+        }
         if badStanding {
             // The advisor stopped routing jobs here. Surface it loudly with
             // a one-click restart, plus the specific reason / remediation the
@@ -725,6 +752,36 @@ final class MenuBarController {
         guard lines.count >= 2 else { return nil }
         let reason = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
         return reason.isEmpty ? nil : reason
+    }
+
+    /// Provisioning state the agent reports while bringing a model online,
+    /// from `~/.cocore/provision-status.json` (see `write_provision_status`).
+    /// nil when absent — the agent cleared it because it's serving (or the
+    /// machine is stopped). A marker older than 1h is ignored so a crashed
+    /// agent can't pin "Provisioning…" on forever.
+    struct ProvisionStatus {
+        let phase: String  // "provisioning" | "failed"
+        let bytesDownloaded: UInt64
+        let faultMessage: String?
+    }
+    static func provisionStatus() -> ProvisionStatus? {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cocore/provision-status.json").path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+            let mtime = attrs[.modificationDate] as? Date,
+            Date().timeIntervalSince(mtime) < 3600,
+            let data = FileManager.default.contents(atPath: path),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let phase = obj["phase"] as? String
+        else { return nil }
+        let bytes = (obj["bytesDownloaded"] as? NSNumber)?.uint64Value ?? 0
+        let fault = (obj["fault"] as? [String: Any])?["message"] as? String
+        return ProvisionStatus(phase: phase, bytesDownloaded: bytes, faultMessage: fault)
+    }
+
+    /// Content-safe human download size for the provisioning line.
+    static func provisionMB(_ bytes: UInt64) -> String {
+        String(format: "%.0f MB", Double(bytes) / (1024 * 1024))
     }
 
     /// Map the marker's reason to a one-line, operator-facing remediation.
