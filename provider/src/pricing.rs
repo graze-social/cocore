@@ -131,6 +131,68 @@ pub fn pickable_for_machine(ram_gb: u32) -> Vec<&'static ModelRate> {
         .collect()
 }
 
+/// The catalog RAM floor for a model id, or `None` for an off-catalog
+/// (custom MLX) model whose footprint we can't reason about.
+pub fn min_ram_gb(model_id: &str) -> Option<u32> {
+    RATES
+        .iter()
+        .find(|r| r.model_id == model_id)
+        .map(|r| r.min_ram_gb)
+}
+
+/// Overprovisioning guard. Pick the subset of `models` whose summed
+/// catalog RAM floors fit within `ram_gb`, dropping the LARGEST models
+/// first until the rest fit. Returns `(kept, dropped)`, `kept` in the
+/// original order.
+///
+/// Why: the per-model RAM guard only checks each model against its floor
+/// individually, so a 7B (16 GB floor) AND a 3B (8 GB) could both be
+/// configured on a 16 GB Mac and OOM. Per-model scheduling makes this
+/// sharper (overlapping windows load several at once), so we sum the
+/// concurrent set here. Off-catalog models have no known floor — they're
+/// always KEPT and contribute 0 to the budget (we can't reason about
+/// them; let the subprocess arbitrate rather than guess). `stub` is free.
+/// Ties break by model id so the result is deterministic.
+pub fn fit_within_budget(models: &[String], ram_gb: u32) -> (Vec<String>, Vec<String>) {
+    // Largest-known-floor first; unknown/stub (floor 0) sort last and are
+    // never chosen as a prune victim.
+    let mut by_size: Vec<usize> = (0..models.len()).collect();
+    by_size.sort_by(|&a, &b| {
+        let ra = min_ram_gb(&models[a]).unwrap_or(0);
+        let rb = min_ram_gb(&models[b]).unwrap_or(0);
+        rb.cmp(&ra).then_with(|| models[a].cmp(&models[b]))
+    });
+    let mut keep = vec![true; models.len()];
+    loop {
+        let used: u32 = (0..models.len())
+            .filter(|&i| keep[i])
+            .map(|i| min_ram_gb(&models[i]).unwrap_or(0))
+            .sum();
+        if used <= ram_gb {
+            break;
+        }
+        // Drop the largest still-kept model that has a known floor > 0.
+        let victim = by_size
+            .iter()
+            .copied()
+            .find(|&i| keep[i] && min_ram_gb(&models[i]).unwrap_or(0) > 0);
+        match victim {
+            Some(i) => keep[i] = false,
+            None => break, // only unknown/stub left — nothing safe to prune.
+        }
+    }
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for (i, m) in models.iter().enumerate() {
+        if keep[i] {
+            kept.push(m.clone());
+        } else {
+            dropped.push(m.clone());
+        }
+    }
+    (kept, dropped)
+}
+
 /// Look up the rate for a model id; falls back to the stub rate so
 /// receipts always carry _some_ price.
 pub fn rate_for(model_id: &str) -> &'static ModelRate {
@@ -361,5 +423,42 @@ mod tests {
         assert_eq!(estimate_tokens(b"abcd"), 1);
         assert_eq!(estimate_tokens(b"abcde"), 2);
         assert_eq!(estimate_tokens(&vec![0u8; 401]), 101);
+    }
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn fit_within_budget_prunes_largest_first() {
+        // 7B (16 GB floor) + 3B (8 GB) on a 16 GB Mac → drop the 7B, keep 3B.
+        let models = sv(&[
+            "mlx-community/Qwen2.5-7B-Instruct-4bit",
+            "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        ]);
+        let (kept, dropped) = fit_within_budget(&models, 16);
+        assert_eq!(kept, sv(&["mlx-community/Qwen2.5-3B-Instruct-4bit"]));
+        assert_eq!(dropped, sv(&["mlx-community/Qwen2.5-7B-Instruct-4bit"]));
+    }
+
+    #[test]
+    fn fit_within_budget_keeps_all_when_fitting() {
+        let models = sv(&[
+            "mlx-community/Qwen2.5-3B-Instruct-4bit",
+            "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        ]); // 8 + 4 = 12 ≤ 16
+        let (kept, dropped) = fit_within_budget(&models, 16);
+        assert_eq!(kept, models);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn fit_within_budget_never_prunes_unknown_or_stub() {
+        // Off-catalog (unknown floor) + stub contribute 0 and are always kept,
+        // even on a tiny RAM budget.
+        let models = sv(&["custom/whatever-4bit", "stub"]);
+        let (kept, dropped) = fit_within_budget(&models, 1);
+        assert_eq!(kept, models);
+        assert!(dropped.is_empty());
     }
 }

@@ -12,6 +12,7 @@
 //! "don't compete with my daytime use" knob, not a billing boundary.
 
 use chrono::{Local, Timelike};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServeWindow {
@@ -63,6 +64,67 @@ impl ServeWindow {
     /// outside the window.
     pub fn seconds_until_open(&self) -> u64 {
         seconds_until_hour(self.start)
+    }
+}
+
+/// Per-model serve windows, parsed from `COCORE_MODEL_SCHEDULES` — a JSON
+/// object mapping model id → `{"start": h, "end": h}` (hours 0–23, local
+/// time, end exclusive, wrap supported). A model NOT present is "always
+/// on" (subject only to the whole-agent [`ServeWindow`]). Written by the
+/// menu-bar app's per-model Schedule UI. A malformed/out-of-range entry is
+/// dropped (that model stays always-on) — a bad schedule must never brick
+/// serving.
+#[derive(Clone, Debug, Default)]
+pub struct ModelSchedules {
+    windows: HashMap<String, ServeWindow>,
+}
+
+impl ModelSchedules {
+    pub fn from_env() -> ModelSchedules {
+        match std::env::var("COCORE_MODEL_SCHEDULES") {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => ModelSchedules::default(),
+        }
+    }
+
+    pub fn parse(raw: &str) -> ModelSchedules {
+        let Ok(obj) = serde_json::from_str::<HashMap<String, serde_json::Value>>(raw) else {
+            return ModelSchedules::default();
+        };
+        let mut windows = HashMap::new();
+        for (model, v) in obj {
+            let start = v.get("start").and_then(serde_json::Value::as_u64);
+            let end = v.get("end").and_then(serde_json::Value::as_u64);
+            if let (Some(s), Some(e)) = (start, end) {
+                if let (Ok(s), Ok(e)) = (u8::try_from(s), u8::try_from(e)) {
+                    if let Some(w) = ServeWindow::new(s, e) {
+                        windows.insert(model, w);
+                    }
+                }
+            }
+        }
+        ModelSchedules { windows }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// The subset of `models` that should be loaded right now (local time):
+    /// a model with no per-model window is always active; a scheduled one
+    /// is active only while its window is open. Input order preserved.
+    pub fn active_now(&self, models: &[String]) -> Vec<String> {
+        self.active_at(local_hour(), models)
+    }
+
+    /// Active subset at a specific `hour` (0–23). Split out from
+    /// [`active_now`] so it's unit-testable without mocking the clock.
+    pub fn active_at(&self, hour: u8, models: &[String]) -> Vec<String> {
+        models
+            .iter()
+            .filter(|m| self.windows.get(*m).is_none_or(|w| w.contains(hour)))
+            .cloned()
+            .collect()
     }
 }
 
@@ -132,5 +194,27 @@ mod tests {
         assert_eq!(parse_hour("24"), None);
         assert_eq!(parse_hour(""), None);
         assert_eq!(parse_hour("x"), None);
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn model_schedules_active_by_hour() {
+        let sched = ModelSchedules::parse(r#"{"A":{"start":9,"end":17},"B":{"start":22,"end":8}}"#);
+        let models = s(&["A", "B", "C"]); // C has no schedule → always on
+        assert_eq!(sched.active_at(12, &models), s(&["A", "C"])); // A daytime open, B closed
+        assert_eq!(sched.active_at(23, &models), s(&["B", "C"])); // B overnight open, A closed
+        assert_eq!(sched.active_at(8, &models), s(&["C"])); // both closed (8 is exclusive end of B, before A)
+    }
+
+    #[test]
+    fn model_schedules_malformed_keeps_models_always_on() {
+        assert!(ModelSchedules::parse("not json").is_empty());
+        // out-of-range start + empty window → both dropped, models stay always-on.
+        let sched = ModelSchedules::parse(r#"{"A":{"start":25,"end":2},"B":{"start":5,"end":5}}"#);
+        assert!(sched.is_empty());
+        assert_eq!(sched.active_at(3, &s(&["A", "B"])), s(&["A", "B"]));
     }
 }

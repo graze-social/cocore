@@ -716,6 +716,17 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
         std::env::set_var("COCORE_INFERENCE_MODELS", desired_at_start.join(","));
     }
 
+    // Per-model schedules + the full configured set they apply to. The serve
+    // loop reloads (restarts) when a window boundary flips the active set;
+    // `build_engines` narrows to the currently-active subset on each build.
+    let model_schedules = cocore_provider::schedule::ModelSchedules::from_env();
+    let configured_models: Vec<String> = std::env::var("COCORE_INFERENCE_MODELS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // Provisioning observability (#2/#3/#5): tell the tray we're coming up
     // and stream download progress while `build_engines` (which can spend
     // many minutes downloading weights) runs. Cleared on success; replaced
@@ -989,6 +1000,8 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
                             &engines,
                             provider_rkey.as_deref(),
                             &desired_at_start,
+                            &model_schedules,
+                            &configured_models,
                         )
                         .await;
                     let lived = connected_at.elapsed();
@@ -1048,7 +1061,7 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start) => {
+                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start, &model_schedules, &configured_models) => {
                                 if let Err(e) = res {
                                     tracing::warn!(error = %e, "advisor run ended; reconnecting within window in 5s");
                                 }
@@ -1323,6 +1336,19 @@ fn build_engines(
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Per-model scheduling: narrow to the models whose time window is open
+    // right now (a model with no per-model window stays on). Applied here —
+    // the single point every build flows through (startup, whole-app window
+    // re-open, health rebuild) — so the loaded set always matches the clock.
+    let schedules = cocore_provider::schedule::ModelSchedules::from_env();
+    let configured: Vec<String> = if schedules.is_empty() {
+        configured
+    } else {
+        let active = schedules.active_now(&configured);
+        tracing::info!(active = ?active, "per-model schedule: loading the models whose window is open now");
+        active
+    };
+
     // RAM-fit guard. Skip catalog models whose conservative `min_ram_gb`
     // floor exceeds this machine's memory before spending a spawn + cold
     // weight download on a load that can only OOM. We judge ONLY models
@@ -1354,6 +1380,26 @@ fn build_engines(
                 !over_floor
             })
             .collect()
+    };
+
+    // Overprovisioning guard. Even when each model individually fits its
+    // floor, the SUM of a concurrent set can exceed RAM — a 7B + 3B on a
+    // 16 GB Mac, or two models a per-model schedule lands in the same hour.
+    // Prune largest-first until the summed floors fit; pruned models are
+    // surfaced like too-large ones. Bypassed by COCORE_IGNORE_RAM_FLOOR.
+    let configured: Vec<String> = if ignore_ram_floor {
+        configured
+    } else {
+        let (kept, over_budget) = cocore_provider::pricing::fit_within_budget(&configured, ram_gb);
+        for m in &over_budget {
+            tracing::warn!(
+                model = %m,
+                ram_gb,
+                "skipping model to stay within the RAM budget — the concurrent set's summed floors exceed this machine's memory (set COCORE_IGNORE_RAM_FLOOR=1 to override)"
+            );
+        }
+        too_large.extend(over_budget);
+        kept
     };
 
     let mut failed: Vec<String> = vec![];

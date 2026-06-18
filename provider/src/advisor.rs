@@ -109,6 +109,11 @@ impl AdvisorClient {
         // reload — compared to THIS set (not what loaded) so a model that
         // won't fit RAM doesn't look like a perpetual change.
         desired_at_start: &[String],
+        // Per-model schedules + the full configured set they apply to. The
+        // serve loop watches for a window boundary (a model's active state
+        // flipping) and restarts to reload the new active set.
+        model_schedules: &crate::schedule::ModelSchedules,
+        configured_models: &[String],
     ) -> Result<()> {
         tracing::info!(url = %self.url, "connecting to advisor");
         let (ws, _resp) =
@@ -178,6 +183,9 @@ impl AdvisorClient {
             tracing::info!("owner has this machine stopped; not serving");
             return Ok(());
         }
+        // The per-model active set this serve loaded against. A schedule
+        // window opening/closing changes it; we restart to reload (below).
+        let active_at_start = model_schedules.active_now(configured_models);
         let mut active_reads = FuturesUnordered::new();
         let mut active_poll = tokio::time::interval(std::time::Duration::from_secs(30));
         active_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -278,6 +286,22 @@ impl AdvisorClient {
                 // `active_reads` (below), never inline, so it can't stall
                 // ping handling.
                 _ = active_poll.tick() => {
+                    // Per-model schedule boundary: if a window opened or closed
+                    // since this serve started, the active set changed — reload
+                    // by restarting (engines are built once per serve). Local +
+                    // cheap, and independent of the PDS read, so it works even
+                    // without a provider_rkey. Skipped entirely when no per-model
+                    // schedules are set (the common case).
+                    if !model_schedules.is_empty() {
+                        let active_now = model_schedules.active_now(configured_models);
+                        if models_changed(&active_now, &active_at_start) {
+                            tracing::info!(
+                                from = ?active_at_start, to = ?active_now,
+                                "a model's schedule window changed the active set; restarting to reload engines"
+                            );
+                            std::process::exit(3);
+                        }
+                    }
                     if active_reads.is_empty() {
                         if let Some(rk) = provider_rkey {
                             active_reads.push(read_provider_control(pds, rk));
