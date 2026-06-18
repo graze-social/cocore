@@ -664,7 +664,12 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
             active: None,
             desiredModels: None,
             provisioning: Some(true),
-            serving: Some(true),
+            // NOT serving yet: this record is published immediately (so the
+            // machine is visible) while the engine is still loading/downloading.
+            // Claiming `serving: true` here is a lie — it makes the console +
+            // tray say "serving and earning" before any model is loaded. The
+            // real record below flips this to true once engines are up.
+            serving: Some(false),
             engineFault: None,
             createdAt: chrono::Utc::now(),
         };

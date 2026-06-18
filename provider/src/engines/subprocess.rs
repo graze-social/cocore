@@ -129,6 +129,54 @@ fn render_ring(label: &str, buffer: &Arc<Mutex<VecDeque<String>>>) -> String {
         .join("\n")
 }
 
+/// Total bytes of `model_id`'s HuggingFace hub cache dir (including
+/// in-progress `.incomplete` blobs) — the download-progress signal used
+/// by the stall-based readiness wait. Best-effort: 0 when the dir
+/// doesn't exist yet or can't be read. The agent sets no HF cache
+/// override, so this is the default `$HOME/.cache/huggingface/hub`, and
+/// a repo `org/name` maps to the `models--org--name` directory.
+fn hf_cache_size(model_id: &str) -> u64 {
+    let Ok(home) = std::env::var("HOME") else {
+        return 0;
+    };
+    if home.is_empty() {
+        return 0;
+    }
+    let dir = Path::new(&home)
+        .join(".cache")
+        .join("huggingface")
+        .join("hub")
+        .join(format!("models--{}", model_id.replace('/', "--")));
+    dir_size_bytes(&dir)
+}
+
+/// Recursively sum regular-file sizes under `dir`. Uses
+/// `symlink_metadata` so HF's `snapshots/*` symlinks (which point back
+/// into `blobs/`) aren't double-counted — only the real `blobs/` files
+/// (completed + `.incomplete`) are summed. Best-effort; returns 0 on
+/// any read error.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_dir() => total = total.saturating_add(dir_size_bytes(&path)),
+            Ok(md) if md.is_file() => total = total.saturating_add(md.len()),
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Content-safe human size for progress logs (bytes only, never any
+/// prompt/token data).
+fn human_mb(bytes: u64) -> String {
+    format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 /// Embedded Python wrapper. Written to disk once at first spawn so the
 /// agent ships as a single static binary, no separate file to install
 /// alongside it.
@@ -142,13 +190,21 @@ fn state_dir() -> Result<PathBuf> {
     Ok(home.join(".cocore"))
 }
 
-/// Max time to wait for the child to print `READY` on stdout. Model
-/// load on a cold first run can take a long time (HF download + Metal
-/// mmap); 5 minutes is a generous-but-not-infinite ceiling. The
-/// install script's "wait for registration" phase has its own 3-min
-/// budget, so any cold-load past 5 min will surface as a registration-
-/// wait warning anyway.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Readiness is **stall-based**, not a fixed total budget. A cold first
+/// run downloads the model weights from HuggingFace inside the child
+/// (can be tens of GB), then Metal-mmaps them — a 20 GB model at a
+/// healthy ~6 MB/s is ~55 min, so the old fixed 300 s total budget
+/// killed perfectly healthy slow downloads. Instead we watch the
+/// model's HF cache dir grow: as long as bytes keep arriving (or the
+/// post-download load makes the socket ready), we keep waiting. We give
+/// up only when there's been NO readiness AND NO download progress for
+/// `READY_STALL_TIMEOUT` (a truly stuck/failed download or a wedged
+/// load), with `READY_HARD_CAP` as an absolute backstop.
+const READY_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Absolute ceiling regardless of progress — paranoia backstop so a
+/// pathological "1 byte every 4 min forever" can't hang the serve loop.
+/// Sized for a multi-tens-of-GB download on a slow link.
+const READY_HARD_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Per-request HTTP timeout against the subprocess. Inference can take
 /// 30+ seconds for long completions on a small Mac; 300s is the same
@@ -281,8 +337,8 @@ impl SubprocessEngine {
 
     /// Spawn the Python child and block until it answers an HTTP
     /// probe against the UDS. Returns an error if the child crashes
-    /// during startup or doesn't become reachable within
-    /// READY_TIMEOUT.
+    /// during startup or stalls (no readiness + no download progress
+    /// for `READY_STALL_TIMEOUT`; see the stall-based wait below).
     ///
     /// "Ready" is defined as: (a) the child process is alive, (b)
     /// the socket file exists, and (c) `GET /v1/models` against the
@@ -402,18 +458,19 @@ impl SubprocessEngine {
         // by Metal mmap (seconds, not milliseconds), so polling
         // faster doesn't help much. 250ms keeps the polling overhead
         // negligible while still feeling responsive.
-        let deadline = Instant::now() + READY_TIMEOUT;
+        // Stall-based wait: keep going as long as the child is alive AND
+        // (it becomes ready OR the HF download keeps making progress).
+        // Give up only after READY_STALL_TIMEOUT of no readiness + no new
+        // bytes, or the absolute READY_HARD_CAP. This lets a healthy slow
+        // download (tens of GB at a few MB/s) finish instead of being
+        // killed by a fixed total budget.
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut last_bytes = hf_cache_size(&self.model_id);
+        let mut last_log = started;
         loop {
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                bail!(
-                    "inference subprocess for {} did not become ready within {}s. Common causes: HF model download failure, vllm-mlx import error, or missing venv.\n\
-                     Recent engine output (no request has been served yet — content-safe to share):\n{}\n{}",
-                    self.model_id,
-                    READY_TIMEOUT.as_secs(),
-                    render_ring("stdout", &stdout_buf),
-                    render_ring("stderr", &stderr_buf),
-                );
+            if self.socket_path.exists() && self.probe_ready() {
+                break;
             }
             if let Ok(Some(status)) = child.try_wait() {
                 bail!(
@@ -425,10 +482,51 @@ impl SubprocessEngine {
                     render_ring("stderr", &stderr_buf),
                 );
             }
-            if self.socket_path.exists() && self.probe_ready() {
-                break;
+
+            let now = Instant::now();
+            let bytes = hf_cache_size(&self.model_id);
+            if bytes > last_bytes {
+                last_bytes = bytes;
+                last_progress = now;
             }
-            std::thread::sleep(Duration::from_millis(250));
+            // Periodic, content-safe progress line (byte counts only — no
+            // prompt/token data). Gives the agent log *some* visibility into
+            // an otherwise-silent multi-GB download.
+            if last_bytes > 0 && now.duration_since(last_log) >= Duration::from_secs(15) {
+                tracing::info!(
+                    model = %self.model_id,
+                    downloaded = %human_mb(last_bytes),
+                    "provisioning: model weights downloading"
+                );
+                last_log = now;
+            }
+
+            if now.duration_since(last_progress) > READY_STALL_TIMEOUT {
+                let _ = child.kill();
+                bail!(
+                    "inference subprocess for {} made no progress for {}s ({} downloaded so far) and never became ready. \
+                     Common causes: a stalled/failed HF download, vllm-mlx import error, or missing venv.\n\
+                     Recent engine output (no request has been served yet — content-safe to share):\n{}\n{}",
+                    self.model_id,
+                    READY_STALL_TIMEOUT.as_secs(),
+                    human_mb(last_bytes),
+                    render_ring("stdout", &stdout_buf),
+                    render_ring("stderr", &stderr_buf),
+                );
+            }
+            if now.duration_since(started) > READY_HARD_CAP {
+                let _ = child.kill();
+                bail!(
+                    "inference subprocess for {} did not become ready within the {}h hard cap ({} downloaded). \
+                     Recent engine output (content-safe):\n{}\n{}",
+                    self.model_id,
+                    READY_HARD_CAP.as_secs() / 3600,
+                    human_mb(last_bytes),
+                    render_ring("stdout", &stdout_buf),
+                    render_ring("stderr", &stderr_buf),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
 
         tracing::info!(model = %self.model_id, "inference subprocess ready");
@@ -443,8 +541,7 @@ impl SubprocessEngine {
     /// and the caller retries.
     fn probe_ready(&self) -> bool {
         // Short timeouts here — we're inside a polling loop and don't
-        // want a single hung probe to eat the full READY_TIMEOUT
-        // budget.
+        // want a single hung probe to eat into the stall window.
         let Ok(mut stream) = UnixStream::connect(&self.socket_path) else {
             return false;
         };
