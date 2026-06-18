@@ -96,6 +96,97 @@ final class ModelManager: ObservableObject {
         return fits + tooBig
     }
 
+    // MARK: per-model schedules
+
+    /// A per-model serve window: hours 0–23, `end` exclusive, wrap allowed
+    /// (start > end = overnight). Byte-compatible with the agent's
+    /// `COCORE_MODEL_SCHEDULES` JSON.
+    struct Window: Equatable, Codable {
+        var start: Int
+        var end: Int
+    }
+    static let schedulesDefaultsKey = "inferenceModelsSchedules"
+
+    /// Per-model windows from UserDefaults, stored as JSON
+    /// `{"model":{"start":9,"end":17}}` — the same shape the agent reads.
+    /// Out-of-range / empty windows are dropped (that model stays always-on).
+    static func loadSchedules() -> [String: Window] {
+        guard let raw = UserDefaults.standard.string(forKey: schedulesDefaultsKey),
+            let data = raw.data(using: .utf8),
+            let obj = try? JSONDecoder().decode([String: Window].self, from: data)
+        else { return [:] }
+        return obj.filter { (0...23).contains($0.value.start) && (0...23).contains($0.value.end) && $0.value.start != $0.value.end }
+    }
+
+    static func saveSchedules(_ schedules: [String: Window]) {
+        let clean = schedules.filter { $0.value.start != $0.value.end }
+        if clean.isEmpty {
+            UserDefaults.standard.removeObject(forKey: schedulesDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(clean), let json = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(json, forKey: schedulesDefaultsKey)
+        }
+    }
+
+    /// The `COCORE_MODEL_SCHEDULES` value to hand the agent, or nil when no
+    /// per-model schedules are set (every model always-on).
+    static func modelSchedulesEnvJSON() -> String? {
+        let s = loadSchedules()
+        guard !s.isEmpty, let data = try? JSONEncoder().encode(s),
+            let json = String(data: data, encoding: .utf8)
+        else { return nil }
+        return json
+    }
+
+    /// Catalog RAM floor for a model id, or 0 for an off-catalog/unknown one
+    /// (mirrors the agent's `pricing::min_ram_gb` → None handling).
+    static func minRamGB(for nsid: String) -> Int {
+        catalog.first(where: { $0.nsid == nsid })?.minRamGB ?? 0
+    }
+
+    /// Is a model active at `hour` given its window? No window = always on.
+    static func active(at hour: Int, window: Window?) -> Bool {
+        guard let w = window else { return true }
+        return w.start < w.end ? (hour >= w.start && hour < w.end) : (hour >= w.start || hour < w.end)
+    }
+
+    /// Overprovisioning check (the validator half): for each hour, sum the
+    /// active models' RAM floors; if any hour's total exceeds this Mac's RAM,
+    /// return a human warning naming the worst hour. nil when every hour fits
+    /// (or device RAM is unknown). The agent enforces the same budget by
+    /// pruning largest-first, so this is a "you didn't mean to do that" nudge.
+    static func overprovisionWarning(models: [String], schedules: [String: Window]) -> String? {
+        guard deviceRamGB > 0 else { return nil }
+        var worstHour = 0
+        var worstSum = 0
+        for hour in 0..<24 {
+            let sum = models
+                .filter { active(at: hour, window: schedules[$0]) }
+                .map { minRamGB(for: $0) }
+                .reduce(0, +)
+            if sum > worstSum {
+                worstSum = sum
+                worstHour = hour
+            }
+        }
+        guard worstSum > deviceRamGB else { return nil }
+        return "At \(PreferencesView.hourLabel(worstHour)), \(worstSum)GB of models are scheduled at once — more than this Mac's \(deviceRamGB)GB. The agent will drop the largest until they fit; stagger their hours so they don't overlap."
+    }
+
+    /// Persist the full per-model schedule set and reload the agent. Called
+    /// debounced from the editor so dragging a picker doesn't bounce the
+    /// agent on every tick.
+    func applySchedules(_ schedules: [String: Window]) async {
+        Self.saveSchedules(schedules)
+        if let sup = supervisor {
+            await sup.applyModelSchedulesAndReconnect()
+        } else {
+            // LaunchAgent install (no supervisor handle here): edit plist + bounce.
+            AgentSupervisor.applyModelSchedules(json: Self.modelSchedulesEnvJSON())
+        }
+    }
+
     static func storedModels() -> [String] {
         (UserDefaults.standard.string(forKey: modelsDefaultsKey) ?? "")
             .split(separator: ",")
@@ -274,6 +365,10 @@ struct ModelsView: View {
     @StateObject private var venv = VenvBootstrapper()
     @State private var customNSID = ""
     @State private var venvInstalled = VenvBootstrapper.isInstalled
+    /// Editor state for per-model schedules; source of truth while editing.
+    /// Loaded from UserDefaults on appear, applied (debounced) on change.
+    @State private var schedules: [String: ModelManager.Window] = [:]
+    @State private var scheduleApplyTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -318,6 +413,8 @@ struct ModelsView: View {
                     }
                 }
             }
+
+            scheduleSection
 
             GroupBox("Add from catalog") {
                 ForEach(ModelManager.catalogForDevice, id: \.nsid) { item in
@@ -407,6 +504,94 @@ struct ModelsView: View {
         .frame(minWidth: 460, maxWidth: .infinity, minHeight: 500, maxHeight: .infinity)
         .brandStyled()
         .task { await manager.refresh() }
+        .onAppear { schedules = ModelManager.loadSchedules() }
+    }
+
+    // MARK: per-model schedule editor
+
+    @ViewBuilder private var scheduleSection: some View {
+        GroupBox("Per-model schedule") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Give a model its own hours so it only loads (and uses RAM) part of the day. A model with no schedule is always on while the agent serves.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let warn = ModelManager.overprovisionWarning(models: manager.models, schedules: schedules) {
+                    Text("⚠ \(warn)")
+                        .font(.footnote).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if manager.models.isEmpty {
+                    Text("Add a model above to schedule it.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(manager.models, id: \.self) { m in scheduleRow(m) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func scheduleRow(_ m: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(m)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Toggle(
+                    "Custom hours",
+                    isOn: Binding(
+                        get: { schedules[m] != nil },
+                        set: { on in
+                            schedules[m] = on ? ModelManager.Window(start: 9, end: 17) : nil
+                            scheduleChanged()
+                        }
+                    )
+                )
+                .toggleStyle(.switch).labelsHidden().disabled(manager.busy)
+            }
+            if schedules[m] != nil {
+                HStack(spacing: 6) {
+                    Text("from").font(.caption2).foregroundStyle(.secondary)
+                    hourPicker(m, isStart: true)
+                    Text("to").font(.caption2).foregroundStyle(.secondary)
+                    hourPicker(m, isStart: false)
+                    Spacer()
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func hourPicker(_ m: String, isStart: Bool) -> some View {
+        Picker(
+            "",
+            selection: Binding(
+                get: { isStart ? (schedules[m]?.start ?? 9) : (schedules[m]?.end ?? 17) },
+                set: { v in
+                    var w = schedules[m] ?? ModelManager.Window(start: 9, end: 17)
+                    if isStart { w.start = v } else { w.end = v }
+                    schedules[m] = w
+                    scheduleChanged()
+                }
+            )
+        ) {
+            ForEach(0..<24) { h in Text(PreferencesView.hourLabel(h)).tag(h) }
+        }
+        .labelsHidden().frame(width: 116).disabled(manager.busy)
+    }
+
+    /// Debounce: the editor updates instantly, but the (expensive) agent
+    /// bounce waits ~800ms after the last change so dragging a picker
+    /// doesn't restart the agent on every tick.
+    private func scheduleChanged() {
+        scheduleApplyTask?.cancel()
+        let snapshot = schedules
+        scheduleApplyTask = Task {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            if Task.isCancelled { return }
+            await manager.applySchedules(snapshot)
+        }
     }
 
     /// Prompt to install the Python runtime real models need, with live

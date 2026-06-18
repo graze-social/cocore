@@ -269,6 +269,12 @@ final class AgentSupervisor {
             env["COCORE_SERVE_START"] = String(start)
             env["COCORE_SERVE_END"] = String(end)
         }
+        // Per-model schedules — the no-LaunchAgent analogue of the plist's
+        // COCORE_MODEL_SCHEDULES. The agent's `ModelSchedules::from_env()`
+        // reads this; absent/empty means every model is always-on.
+        if let json = ModelManager.modelSchedulesEnvJSON() {
+            env["COCORE_MODEL_SCHEDULES"] = json
+        }
         p.environment = env
 
         let outPipe = Pipe(), errPipe = Pipe()
@@ -432,6 +438,43 @@ final class AgentSupervisor {
             await stop()
             await start()
         }
+    }
+
+    /// Apply the current per-model schedules (`COCORE_MODEL_SCHEDULES`) to the
+    /// running agent and reload. Same mode split as the whole-app schedule:
+    /// edit the plist + bounce (LaunchAgent), or restart the supervised child
+    /// (which re-reads the env in `spawnChild`).
+    func applyModelSchedulesAndReconnect() async {
+        if isLaunchAgentManaged {
+            Self.applyModelSchedules(json: ModelManager.modelSchedulesEnvJSON())
+        } else {
+            await stop()
+            await start()
+        }
+    }
+
+    /// Write/clear `COCORE_MODEL_SCHEDULES` in the LaunchAgent plist + bounce.
+    /// `json == nil` (no per-model schedules) deletes the key so the agent
+    /// treats every model as always-on. No-op without a LaunchAgent.
+    nonisolated static func applyModelSchedules(json: String?) {
+        let label = "dev.cocore.provider"
+        let plist = NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
+        guard FileManager.default.fileExists(atPath: plist) else { return }
+        func plistBuddy(_ command: String) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/libexec/PlistBuddy")
+            p.arguments = ["-c", command, plist]
+            try? p.run()
+            p.waitUntilExit()
+        }
+        let path = ":EnvironmentVariables:COCORE_MODEL_SCHEDULES"
+        if let json {
+            plistBuddy("Set \(path) \(json)")
+            plistBuddy("Add \(path) string \(json)")
+        } else {
+            plistBuddy("Delete \(path)")
+        }
+        bounce(label: label)
     }
 
     /// Apply the current Network settings (console/advisor URLs, from
