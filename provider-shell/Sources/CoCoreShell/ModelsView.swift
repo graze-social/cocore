@@ -49,17 +49,52 @@ final class ModelManager: ObservableObject {
     init(supervisor: AgentSupervisor? = nil) { self.supervisor = supervisor }
     private var appManaged: Bool { supervisor.map { !$0.isLaunchAgentManaged } ?? false }
 
-    /// RAM-aware catalog mirrored from the installer's picker, offered as
-    /// quick-adds. These are curated suggestions, not an allowlist — any
-    /// MLX-format HuggingFace `org/model` NSID works via the custom field.
-    static let catalog: [(nsid: String, label: String)] = [
-        ("mlx-community/Qwen2.5-0.5B-Instruct-4bit", "Qwen 2.5 0.5B · needs ~4GB"),
-        ("mlx-community/Qwen2.5-3B-Instruct-4bit", "Qwen 2.5 3B · needs ~8GB"),
-        ("mlx-community/gemma-3-4b-it-qat-4bit", "Gemma 3 4B · needs ~8GB"),
-        ("mlx-community/Qwen2.5-7B-Instruct-4bit", "Qwen 2.5 7B · needs ~16GB"),
-        ("mlx-community/Qwen2.5-32B-Instruct-4bit", "Qwen 2.5 32B · needs ~32GB"),
-        ("mlx-community/Llama-3.3-70B-Instruct-4bit", "Llama 3.3 70B · needs ~64GB"),
+    /// Curated quick-add catalog. `minRamGB` floors mirror the agent's
+    /// `pricing::pickable_for_machine`. These are suggestions, not an
+    /// allowlist — any MLX-format HuggingFace `org/model` NSID works via
+    /// the custom field.
+    static let catalog: [(nsid: String, label: String, minRamGB: Int)] = [
+        ("mlx-community/Qwen2.5-0.5B-Instruct-4bit", "Qwen 2.5 0.5B", 4),
+        ("mlx-community/Qwen2.5-3B-Instruct-4bit", "Qwen 2.5 3B", 8),
+        ("mlx-community/gemma-3-4b-it-qat-4bit", "Gemma 3 4B", 8),
+        ("mlx-community/Qwen2.5-7B-Instruct-4bit", "Qwen 2.5 7B", 16),
+        ("mlx-community/Qwen2.5-32B-Instruct-4bit", "Qwen 2.5 32B", 32),
+        ("mlx-community/Llama-3.3-70B-Instruct-4bit", "Llama 3.3 70B", 64),
     ]
+
+    /// This Mac's physical RAM in GB (rounded), via sysctl `hw.memsize`.
+    /// 0 if the probe fails, in which case the picker degrades to showing
+    /// every model without a fit judgment.
+    static let deviceRamGB: Int = {
+        var bytes: UInt64 = 0
+        var size = MemoryLayout<UInt64>.size
+        guard sysctlbyname("hw.memsize", &bytes, &size, nil, 0) == 0, bytes > 0 else { return 0 }
+        return Int((Double(bytes) / 1_073_741_824.0).rounded())
+    }()
+
+    static func fitsDevice(_ minRamGB: Int) -> Bool {
+        deviceRamGB == 0 || minRamGB <= deviceRamGB
+    }
+
+    /// The biggest catalog model that fits this Mac — the suggested
+    /// default. nil when RAM is unknown or nothing fits.
+    static var recommendedNSID: String? {
+        guard deviceRamGB > 0 else { return nil }
+        return catalog.filter { $0.minRamGB <= deviceRamGB }
+            .max(by: { $0.minRamGB < $1.minRamGB })?
+            .nsid
+    }
+
+    /// Catalog ordered best-for-this-device first: fitting models by
+    /// descending size (recommended on top), then the ones that need more
+    /// RAM than this Mac has. Falls back to declaration order when RAM is
+    /// unknown.
+    static var catalogForDevice: [(nsid: String, label: String, minRamGB: Int)] {
+        guard deviceRamGB > 0 else { return catalog }
+        let fits = catalog.filter { $0.minRamGB <= deviceRamGB }.sorted { $0.minRamGB > $1.minRamGB }
+        let tooBig = catalog.filter { $0.minRamGB > deviceRamGB }.sorted { $0.minRamGB < $1.minRamGB }
+        return fits + tooBig
+    }
 
     static func storedModels() -> [String] {
         (UserDefaults.standard.string(forKey: modelsDefaultsKey) ?? "")
@@ -285,21 +320,44 @@ struct ModelsView: View {
             }
 
             GroupBox("Add from catalog") {
-                ForEach(ModelManager.catalog, id: \.nsid) { item in
+                ForEach(ModelManager.catalogForDevice, id: \.nsid) { item in
+                    let fits = ModelManager.fitsDevice(item.minRamGB)
+                    let recommended = item.nsid == ModelManager.recommendedNSID
                     HStack {
                         VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(item.label)
+                                    .font(.caption)
+                                    .fontWeight(recommended ? .semibold : .regular)
+                                if recommended {
+                                    Text("recommended")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.accentColor.opacity(0.15))
+                                        .clipShape(Capsule())
+                                }
+                            }
                             Text(item.nsid)
-                                .font(.system(.caption, design: .monospaced))
+                                .font(.system(.caption2, design: .monospaced))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Text(item.label)
-                                .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            Text(
+                                ModelManager.deviceRamGB == 0
+                                    ? "needs ~\(item.minRamGB)GB"
+                                    : (fits
+                                        ? "needs ~\(item.minRamGB)GB · fits this Mac (\(ModelManager.deviceRamGB)GB)"
+                                        : "needs ~\(item.minRamGB)GB — more than this Mac's \(ModelManager.deviceRamGB)GB")
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(fits ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
                         }
                         Spacer()
                         Button("Add") { Task { await manager.add(item.nsid) } }
                             .disabled(manager.busy || manager.models.contains(item.nsid))
                     }
+                    .opacity(fits ? 1 : 0.65)
                     .padding(.vertical, 2)
                 }
             }
@@ -316,9 +374,10 @@ struct ModelsView: View {
                     }
                     .disabled(manager.busy || customNSID.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
-                Text("Browse MLX models at huggingface.co/mlx-community. Find a model elsewhere? Look for an MLX (4-bit) conversion — the original PyTorch repo won't load.")
+                Text("Browse MLX models at [huggingface.co/mlx-community](https://huggingface.co/mlx-community). Find a model elsewhere? Look for an MLX (4-bit) conversion — the original PyTorch repo won't load.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .tint(.accentColor)
                     .fixedSize(horizontal: false, vertical: true)
             }
 

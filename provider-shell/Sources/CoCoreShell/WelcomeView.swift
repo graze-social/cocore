@@ -264,11 +264,17 @@ struct WelcomeView: View {
                 }
                 HStack(spacing: 10) {
                     Menu {
-                        ForEach(ModelManager.catalog, id: \.nsid) { item in
+                        // Best-fitting model for this Mac first; each shows its
+                        // RAM need + whether it fits this device.
+                        ForEach(ModelManager.catalogForDevice, id: \.nsid) { item in
                             Button {
                                 Task { await models.onboardingToggle(item.nsid); await refresh() }
                             } label: {
-                                Text(item.label)
+                                Text(
+                                    ModelManager.fitsDevice(item.minRamGB)
+                                        ? "\(item.label) · needs ~\(item.minRamGB)GB"
+                                        : "\(item.label) · needs ~\(item.minRamGB)GB (more than this Mac)"
+                                )
                             }
                             .disabled(models.models.contains(item.nsid))
                         }
