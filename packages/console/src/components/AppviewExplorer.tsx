@@ -514,35 +514,76 @@ function shortDid(did: string): string {
   return did.length > 22 ? `${did.slice(0, 14)}…${did.slice(-4)}` : did;
 }
 
-function repoAccountLabel(row: AppviewIndexedRecordEnriched): string {
-  const displayName = row.repoDisplayName?.trim();
-  const handle = row.repoHandle?.trim();
-  if (displayName) return displayName;
-  if (handle) return `@${handle}`;
-  return shortDid(row.repo);
-}
-
-function RepoAccountCell({ row }: { row: AppviewIndexedRecordEnriched }) {
-  const displayName = row.repoDisplayName?.trim() || null;
-  const handle = row.repoHandle?.trim() || null;
-  const label = repoAccountLabel(row);
-  const handleLine = displayName && handle ? `@${handle}` : null;
-  const fallback = (displayName?.[0] ?? handle?.[0] ?? row.repo[0] ?? "?").toUpperCase();
+/** A person/provider as an avatar + display name + handle, linking to
+ *  `href`. Falls back to a shortened DID when no profile resolved, so an
+ *  unresolved actor still reads as "someone", not a blank cell. */
+function ActorChip({
+  did,
+  displayName,
+  handle,
+  avatarUrl,
+  href,
+  title,
+}: {
+  did: string;
+  displayName: string | null;
+  handle: string | null;
+  avatarUrl: string | null;
+  href: string;
+  title?: string;
+}) {
+  const dn = displayName?.trim() || null;
+  const h = handle?.trim() || null;
+  const label = dn ?? (h ? `@${h}` : shortDid(did));
+  const handleLine = dn && h ? `@${h}` : null;
+  const fallback = (dn?.[0] ?? h?.[0] ?? did[0] ?? "?").toUpperCase();
 
   return (
     <a
-      href={pdslsRecordUrl(row.uri)}
+      href={href}
       target="_blank"
       rel="noopener noreferrer"
-      title={row.uri}
+      title={title ?? did}
       {...stylex.props(styles.accountLink)}
     >
-      <Avatar src={row.repoAvatarUrl ?? undefined} alt={label} fallback={fallback} size="sm" />
+      <Avatar src={avatarUrl ?? undefined} alt={label} fallback={fallback} size="sm" />
       <span {...stylex.props(styles.accountText)}>
         <span {...stylex.props(styles.accountName)}>{label}</span>
         {handleLine ? <span {...stylex.props(styles.accountHandle)}>{handleLine}</span> : null}
       </span>
     </a>
+  );
+}
+
+/** The provider (the repo the record lives on) — links to the signed
+ *  record on pds.ls so the row stays inspectable. */
+function RepoAccountCell({ row }: { row: AppviewIndexedRecordEnriched }) {
+  return (
+    <ActorChip
+      did={row.repo}
+      displayName={row.repoDisplayName}
+      handle={row.repoHandle}
+      avatarUrl={row.repoAvatarUrl}
+      href={pdslsRecordUrl(row.uri)}
+      title={row.uri}
+    />
+  );
+}
+
+/** The requester (who the compute was done *for*) — links to their
+ *  profile. Shows "—" only when a record genuinely carries no requester. */
+function RequesterCell({ row }: { row: AppviewIndexedRecordEnriched }) {
+  if (!row.requesterDid) return <>—</>;
+  const identifier = row.requesterHandle?.trim() || row.requesterDid;
+  return (
+    <ActorChip
+      did={row.requesterDid}
+      displayName={row.requesterDisplayName}
+      handle={row.requesterHandle}
+      avatarUrl={row.requesterAvatarUrl}
+      href={`/u/${identifier}`}
+      title={row.requesterDid}
+    />
   );
 }
 
@@ -565,7 +606,7 @@ function IndexedTable({
         <table {...stylex.props(styles.table)}>
           <thead>
             <tr>
-              <th {...stylex.props(styles.th)}>account</th>
+              <th {...stylex.props(styles.th)}>provider</th>
               <th {...stylex.props(styles.th)}>hardware</th>
               <th {...stylex.props(styles.th)}>status</th>
               <th {...stylex.props(styles.th)}>trust</th>
@@ -588,12 +629,12 @@ function IndexedTable({
         <table {...stylex.props(styles.table)}>
           <thead>
             <tr>
-              <th {...stylex.props(styles.th)}>account</th>
+              <th {...stylex.props(styles.th)}>provider</th>
+              <th {...stylex.props(styles.th)}>requester</th>
               <th {...stylex.props(styles.th)}>model</th>
               <th {...stylex.props(styles.th)}>tokens</th>
               <th {...stylex.props(styles.th)}>price</th>
               <th {...stylex.props(styles.th)}>completed</th>
-              <th {...stylex.props(styles.th)}>requester</th>
               <th {...stylex.props(styles.th)}>job</th>
             </tr>
           </thead>
@@ -801,7 +842,6 @@ function ReceiptTableRow({ row }: { row: AppviewIndexedRecordEnriched }) {
   const tokensOut = tokens ? jsonNumber(tokens.out) : null;
   const price = o ? jsonMoney(o.price) : null;
   const completedAt = o ? jsonString(o.completedAt) : null;
-  const requester = o ? jsonString(o.requester) : null;
   const jobUri = o ? jsonStrongRefUri(o.job) : null;
 
   const tokenLabel =
@@ -812,14 +852,14 @@ function ReceiptTableRow({ row }: { row: AppviewIndexedRecordEnriched }) {
       <td {...stylex.props(styles.td)}>
         <RepoAccountCell row={row} />
       </td>
+      <td {...stylex.props(styles.td)}>
+        <RequesterCell row={row} />
+      </td>
       <td {...stylex.props(styles.td, styles.mono)}>{model ?? "—"}</td>
       <td {...stylex.props(styles.td, styles.mono)}>{tokenLabel}</td>
       <td {...stylex.props(styles.td, styles.mono)}>{price ? formatMoney(price) : "—"}</td>
       <td {...stylex.props(styles.td, styles.bodyMeta)}>
         {completedAt ? formatShortTime(completedAt) : "—"}
-      </td>
-      <td {...stylex.props(styles.td, styles.mono)} title={requester ?? undefined}>
-        {requester ? shortDid(requester) : "—"}
       </td>
       <td {...stylex.props(styles.td)}>
         {jobUri ? (
