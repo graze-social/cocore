@@ -32,6 +32,7 @@ export default mergeConfig(
       allowedHosts: [
         ".cocore.dev",
         ".railway.app",
+        "app.modelo.social",
         ...(process.env["CONSOLE_ALLOWED_HOSTS"]
           ?.split(",")
           .map((s) => s.trim())

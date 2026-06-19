@@ -2,6 +2,13 @@ packages:
   - "packages/*"
   - "infra/*"
 
+overrides:
+  # @atproto/pds pins better-sqlite3@10.x, whose native source predates
+  # Node 24's C++20-only V8 headers and won't compile (no Node 24 prebuilt
+  # exists either). Force the 11.x our own packages already use, which
+  # builds cleanly from source on Node 24.
+  better-sqlite3: "^11.10.0"
+
 allowBuilds:
   better-sqlite3: true
   core-js: true

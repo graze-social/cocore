@@ -15,6 +15,11 @@ export interface CocoreConfig {
   appviewUrl: string;
   advisorUrl: string;
   exchangeDid: string;
+  /** The console's own service DID. Inbound AT Protocol service-auth
+   *  JWTs (e.g. for the dev.cocore.account.* management endpoints
+   *  reached via PDS service proxying) must carry this as their `aud`.
+   *  Its DID document is served at /.well-known/did.json. */
+  consoleDid: string;
   /** Shared secret for internal-only services endpoints (must match the
    *  services container's COCORE_INTERNAL_API_KEY). Used to countersign
    *  terms acceptances via the exchange. Empty when unset — callers that
@@ -32,5 +37,9 @@ export function cocoreConfig(): CocoreConfig {
     // override with COCORE_EXCHANGE_DID=did:web:exchange.local
     // (or whatever resolves locally).
     exchangeDid: process.env["COCORE_EXCHANGE_DID"] ?? "did:web:console.cocore.dev:exchange",
+    // Defaults to the production console DID. In local dev, override
+    // with COCORE_CONSOLE_DID=did:web:127.0.0.1%3A3000 (or whatever
+    // matches the host a requester's PDS will proxy to).
+    consoleDid: process.env["COCORE_CONSOLE_DID"] ?? "did:web:console.cocore.dev",
   };
 }

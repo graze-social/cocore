@@ -16,6 +16,10 @@ import { Route as HeaderLayoutRouteImport } from './routes/_header-layout'
 import { Route as DocsHeaderLayoutRouteImport } from './routes/_docs-header-layout'
 import { Route as LexiconsIndexRouteImport } from './routes/lexicons.index'
 import { Route as HeaderLayoutIndexRouteImport } from './routes/_header-layout.index'
+import { Route as XrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]revokeApiKey'
+import { Route as XrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]listApiKeys'
+import { Route as XrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]deleteApiKey'
+import { Route as XrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]createApiKey'
 import { Route as V1ModelsRouteImport } from './routes/v1.models'
 import { Route as LexiconsNsidRouteImport } from './routes/lexicons.$nsid'
 import { Route as ExchangeDidDotjsonRouteImport } from './routes/exchange.did[.]json'
@@ -38,6 +42,7 @@ import { Route as HeaderLayoutChatPreviewRouteImport } from './routes/_header-la
 import { Route as HeaderLayoutChatRouteImport } from './routes/_header-layout.chat'
 import { Route as HeaderLayoutAccountRouteImport } from './routes/_header-layout.account'
 import { Route as HeaderLayoutAcceptTermsRouteImport } from './routes/_header-layout.accept-terms'
+import { Route as DotwellKnownDidDotjsonRouteImport } from './routes/[.]well-known.did[.]json'
 import { Route as HeaderLayoutMachinesIndexRouteImport } from './routes/_header-layout.machines.index'
 import { Route as HeaderLayoutBlogIndexRouteImport } from './routes/_header-layout.blog.index'
 import { Route as DocsHeaderLayoutDocsIndexRouteImport } from './routes/_docs-header-layout.docs.index'
@@ -116,6 +121,30 @@ const HeaderLayoutIndexRoute = HeaderLayoutIndexRouteImport.update({
   path: '/',
   getParentRoute: () => HeaderLayoutRoute,
 } as any)
+const XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute =
+  XrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport.update({
+    id: '/xrpc/dev.cocore.account.revokeApiKey',
+    path: '/xrpc/dev.cocore.account.revokeApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const XrpcDevDotcocoreDotaccountDotlistApiKeysRoute =
+  XrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport.update({
+    id: '/xrpc/dev.cocore.account.listApiKeys',
+    path: '/xrpc/dev.cocore.account.listApiKeys',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute =
+  XrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport.update({
+    id: '/xrpc/dev.cocore.account.deleteApiKey',
+    path: '/xrpc/dev.cocore.account.deleteApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute =
+  XrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport.update({
+    id: '/xrpc/dev.cocore.account.createApiKey',
+    path: '/xrpc/dev.cocore.account.createApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const V1ModelsRoute = V1ModelsRouteImport.update({
   id: '/v1/models',
   path: '/v1/models',
@@ -225,6 +254,11 @@ const HeaderLayoutAcceptTermsRoute = HeaderLayoutAcceptTermsRouteImport.update({
   id: '/accept-terms',
   path: '/accept-terms',
   getParentRoute: () => HeaderLayoutRoute,
+} as any)
+const DotwellKnownDidDotjsonRoute = DotwellKnownDidDotjsonRouteImport.update({
+  id: '/.well-known/did.json',
+  path: '/.well-known/did.json',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const HeaderLayoutMachinesIndexRoute =
   HeaderLayoutMachinesIndexRouteImport.update({
@@ -480,6 +514,7 @@ export interface FileRoutesByFullPath {
   '/agent': typeof AgentRouteWithChildren
   '/login': typeof LoginRoute
   '/og.png': typeof OgDotpngRoute
+  '/.well-known/did.json': typeof DotwellKnownDidDotjsonRoute
   '/accept-terms': typeof HeaderLayoutAcceptTermsRoute
   '/account': typeof HeaderLayoutAccountRoute
   '/chat': typeof HeaderLayoutChatRoute
@@ -502,6 +537,10 @@ export interface FileRoutesByFullPath {
   '/exchange/did.json': typeof ExchangeDidDotjsonRoute
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
+  '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/xrpc/dev.cocore.account.revokeApiKey': typeof XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/lexicons/': typeof LexiconsIndexRoute
   '/docs/api': typeof DocsHeaderLayoutDocsApiRoute
   '/docs/inference': typeof DocsHeaderLayoutDocsInferenceRouteWithChildren
@@ -553,6 +592,7 @@ export interface FileRoutesByTo {
   '/agent': typeof AgentRouteWithChildren
   '/login': typeof LoginRoute
   '/og.png': typeof OgDotpngRoute
+  '/.well-known/did.json': typeof DotwellKnownDidDotjsonRoute
   '/accept-terms': typeof HeaderLayoutAcceptTermsRoute
   '/account': typeof HeaderLayoutAccountRoute
   '/chat': typeof HeaderLayoutChatRoute
@@ -575,6 +615,10 @@ export interface FileRoutesByTo {
   '/exchange/did.json': typeof ExchangeDidDotjsonRoute
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
+  '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/xrpc/dev.cocore.account.revokeApiKey': typeof XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/lexicons': typeof LexiconsIndexRoute
   '/docs/api': typeof DocsHeaderLayoutDocsApiRoute
   '/docs/lexicons': typeof DocsHeaderLayoutDocsLexiconsRoute
@@ -627,6 +671,7 @@ export interface FileRoutesById {
   '/agent': typeof AgentRouteWithChildren
   '/login': typeof LoginRoute
   '/og.png': typeof OgDotpngRoute
+  '/.well-known/did.json': typeof DotwellKnownDidDotjsonRoute
   '/_header-layout/accept-terms': typeof HeaderLayoutAcceptTermsRoute
   '/_header-layout/account': typeof HeaderLayoutAccountRoute
   '/_header-layout/chat': typeof HeaderLayoutChatRoute
@@ -649,6 +694,10 @@ export interface FileRoutesById {
   '/exchange/did.json': typeof ExchangeDidDotjsonRoute
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
+  '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/xrpc/dev.cocore.account.revokeApiKey': typeof XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/_header-layout/': typeof HeaderLayoutIndexRoute
   '/lexicons/': typeof LexiconsIndexRoute
   '/_docs-header-layout/docs/api': typeof DocsHeaderLayoutDocsApiRoute
@@ -703,6 +752,7 @@ export interface FileRouteTypes {
     | '/agent'
     | '/login'
     | '/og.png'
+    | '/.well-known/did.json'
     | '/accept-terms'
     | '/account'
     | '/chat'
@@ -725,6 +775,10 @@ export interface FileRouteTypes {
     | '/exchange/did.json'
     | '/lexicons/$nsid'
     | '/v1/models'
+    | '/xrpc/dev.cocore.account.createApiKey'
+    | '/xrpc/dev.cocore.account.deleteApiKey'
+    | '/xrpc/dev.cocore.account.listApiKeys'
+    | '/xrpc/dev.cocore.account.revokeApiKey'
     | '/lexicons/'
     | '/docs/api'
     | '/docs/inference'
@@ -776,6 +830,7 @@ export interface FileRouteTypes {
     | '/agent'
     | '/login'
     | '/og.png'
+    | '/.well-known/did.json'
     | '/accept-terms'
     | '/account'
     | '/chat'
@@ -798,6 +853,10 @@ export interface FileRouteTypes {
     | '/exchange/did.json'
     | '/lexicons/$nsid'
     | '/v1/models'
+    | '/xrpc/dev.cocore.account.createApiKey'
+    | '/xrpc/dev.cocore.account.deleteApiKey'
+    | '/xrpc/dev.cocore.account.listApiKeys'
+    | '/xrpc/dev.cocore.account.revokeApiKey'
     | '/lexicons'
     | '/docs/api'
     | '/docs/lexicons'
@@ -849,6 +908,7 @@ export interface FileRouteTypes {
     | '/agent'
     | '/login'
     | '/og.png'
+    | '/.well-known/did.json'
     | '/_header-layout/accept-terms'
     | '/_header-layout/account'
     | '/_header-layout/chat'
@@ -871,6 +931,10 @@ export interface FileRouteTypes {
     | '/exchange/did.json'
     | '/lexicons/$nsid'
     | '/v1/models'
+    | '/xrpc/dev.cocore.account.createApiKey'
+    | '/xrpc/dev.cocore.account.deleteApiKey'
+    | '/xrpc/dev.cocore.account.listApiKeys'
+    | '/xrpc/dev.cocore.account.revokeApiKey'
     | '/_header-layout/'
     | '/lexicons/'
     | '/_docs-header-layout/docs/api'
@@ -925,9 +989,14 @@ export interface RootRouteChildren {
   AgentRoute: typeof AgentRouteWithChildren
   LoginRoute: typeof LoginRoute
   OgDotpngRoute: typeof OgDotpngRoute
+  DotwellKnownDidDotjsonRoute: typeof DotwellKnownDidDotjsonRoute
   ExchangeDidDotjsonRoute: typeof ExchangeDidDotjsonRoute
   LexiconsNsidRoute: typeof LexiconsNsidRoute
   V1ModelsRoute: typeof V1ModelsRoute
+  XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute: typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute: typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  XrpcDevDotcocoreDotaccountDotlistApiKeysRoute: typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute: typeof XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   LexiconsIndexRoute: typeof LexiconsIndexRoute
   ApiAgentBugReportRoute: typeof ApiAgentBugReportRoute
   ApiAgentHealthRoute: typeof ApiAgentHealthRoute
@@ -1011,6 +1080,34 @@ declare module '@tanstack/react-router' {
       fullPath: '/'
       preLoaderRoute: typeof HeaderLayoutIndexRouteImport
       parentRoute: typeof HeaderLayoutRoute
+    }
+    '/xrpc/dev.cocore.account.revokeApiKey': {
+      id: '/xrpc/dev.cocore.account.revokeApiKey'
+      path: '/xrpc/dev.cocore.account.revokeApiKey'
+      fullPath: '/xrpc/dev.cocore.account.revokeApiKey'
+      preLoaderRoute: typeof XrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/xrpc/dev.cocore.account.listApiKeys': {
+      id: '/xrpc/dev.cocore.account.listApiKeys'
+      path: '/xrpc/dev.cocore.account.listApiKeys'
+      fullPath: '/xrpc/dev.cocore.account.listApiKeys'
+      preLoaderRoute: typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/xrpc/dev.cocore.account.deleteApiKey': {
+      id: '/xrpc/dev.cocore.account.deleteApiKey'
+      path: '/xrpc/dev.cocore.account.deleteApiKey'
+      fullPath: '/xrpc/dev.cocore.account.deleteApiKey'
+      preLoaderRoute: typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/xrpc/dev.cocore.account.createApiKey': {
+      id: '/xrpc/dev.cocore.account.createApiKey'
+      path: '/xrpc/dev.cocore.account.createApiKey'
+      fullPath: '/xrpc/dev.cocore.account.createApiKey'
+      preLoaderRoute: typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/v1/models': {
       id: '/v1/models'
@@ -1165,6 +1262,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/accept-terms'
       preLoaderRoute: typeof HeaderLayoutAcceptTermsRouteImport
       parentRoute: typeof HeaderLayoutRoute
+    }
+    '/.well-known/did.json': {
+      id: '/.well-known/did.json'
+      path: '/.well-known/did.json'
+      fullPath: '/.well-known/did.json'
+      preLoaderRoute: typeof DotwellKnownDidDotjsonRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_header-layout/machines/': {
       id: '/_header-layout/machines/'
@@ -1594,9 +1698,18 @@ const rootRouteChildren: RootRouteChildren = {
   AgentRoute: AgentRouteWithChildren,
   LoginRoute: LoginRoute,
   OgDotpngRoute: OgDotpngRoute,
+  DotwellKnownDidDotjsonRoute: DotwellKnownDidDotjsonRoute,
   ExchangeDidDotjsonRoute: ExchangeDidDotjsonRoute,
   LexiconsNsidRoute: LexiconsNsidRoute,
   V1ModelsRoute: V1ModelsRoute,
+  XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute:
+    XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute,
+  XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute:
+    XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute,
+  XrpcDevDotcocoreDotaccountDotlistApiKeysRoute:
+    XrpcDevDotcocoreDotaccountDotlistApiKeysRoute,
+  XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute:
+    XrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute,
   LexiconsIndexRoute: LexiconsIndexRoute,
   ApiAgentBugReportRoute: ApiAgentBugReportRoute,
   ApiAgentHealthRoute: ApiAgentHealthRoute,

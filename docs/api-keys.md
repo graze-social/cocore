@@ -10,32 +10,69 @@ The server stores only a SHA-256 hash plus a short displayable `prefix`
 (e.g. `cocore-AbCd1234`); the full secret is shown **exactly once**, at
 creation, and is unrecoverable afterward.
 
-These endpoints are served by the console at
-`https://console.cocore.dev/api/xrpc/<nsid>` and are defined by lexicons
-under `dev.cocore.account.*` (published as resolvable
-`com.atproto.lexicon.schema` records, see [`lexicons/README.md`](../lexicons/README.md)).
+The key-management methods are defined by lexicons under `dev.cocore.account.*`
+(published as resolvable `com.atproto.lexicon.schema` records, see
+[`lexicons/README.md`](../lexicons/README.md)) and are reachable two ways:
+
+- **`/xrpc/<nsid>`** — the proper AT Protocol surface, authenticated by
+  **service auth** (recommended; no bootstrapping problem). See below.
+- **`/api/xrpc/<nsid>`** — the legacy alias, authenticated by an existing
+  bearer key or the console session cookie.
 
 ## Authentication
 
-Every key-management endpoint accepts either credential:
+### Service auth (the `/xrpc/*` surface)
 
-- **`Authorization: Bearer cocore-...`** — an existing API key. This is the
-  automation path: mint one key from the console UI, then create, list,
-  revoke, and delete the rest headlessly.
+The `/xrpc/dev.cocore.account.*` endpoints authenticate **only** with an AT
+Protocol service-auth token — a short-lived JWT signed by the signing key in
+*your* DID document. You don't craft it by hand: your client asks its own PDS
+to proxy the call, and the PDS mints and attaches the JWT. With an `atproto`
+agent that's just the `atproto-proxy` header:
+
+```ts
+// agent already authenticated to the requester's PDS
+await agent.call(
+  "dev.cocore.account.listApiKeys",
+  {},
+  { headers: { "atproto-proxy": "did:web:console.cocore.dev#cocore_account" } },
+);
+```
+
+The PDS resolves the console's DID document (served at
+`https://console.cocore.dev/.well-known/did.json`), forwards the request to
+`https://console.cocore.dev/xrpc/<nsid>`, and signs a JWT whose `iss` is your
+DID, `aud` is `did:web:console.cocore.dev`, and `lxm` is the method NSID. The
+console verifies that signature against your DID document — so a valid token is
+proof you control the DID, with no shared secret. This is the recommended path:
+because you authenticate with your own identity, there's nothing to bootstrap.
+
+A missing, malformed, expired, wrong-audience, or wrong-`lxm` token returns
+`401` (`AuthRequired`, `BadJwt`, `JwtExpired`, `BadJwtAudience`,
+`BadJwtLexicon`, `BadJwtIssuer`, or `BadJwtSignature`).
+
+### Bearer key / session (the legacy `/api/xrpc/*` surface)
+
+The `/api/xrpc/dev.cocore.account.*` aliases accept either credential:
+
+- **`Authorization: Bearer cocore-...`** — an existing API key. Mint one key
+  from the console UI, then create, list, revoke, and delete the rest headlessly.
 - **Console session cookie** — what the signed-in web UI sends.
 
 The owning DID is derived from whichever credential you present, and every
 operation is scoped to that DID — you can only ever touch your own keys. A
 missing or invalid credential returns `401` with `{ "error": "AuthRequired" }`.
 
-> **Bootstrapping.** Creating your *first* key needs a credential you didn't
-> mint via the API: sign in to the console and create one key under
-> **Account → API keys**, or let `cocore agent pair` mint one for a machine.
-> After that, that key can create every subsequent key over the API.
+> **Bootstrapping.** Creating your *first* key over the bearer-key path needs a
+> credential you didn't mint via the API: sign in to the console and create one
+> key under **Account → API keys**, or let `cocore agent pair` mint one for a
+> machine. The service-auth `/xrpc/*` path above avoids this entirely.
 
 ## Endpoints
 
-Base URL: `https://console.cocore.dev/api/xrpc`
+The examples below use the legacy bearer-key base URL
+`https://console.cocore.dev/api/xrpc`. The same NSIDs, bodies, and responses
+are served at `https://console.cocore.dev/xrpc/<nsid>` under service auth —
+swap the base URL and the `Authorization` header accordingly.
 
 ### `dev.cocore.account.createApiKey` — mint a key
 
