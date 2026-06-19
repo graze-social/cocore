@@ -1519,7 +1519,7 @@ function MarketingPage() {
           <div {...stylex.props(styles.statLabel)}>free to start</div>
           <div {...stylex.props(styles.statValue)}>
             {compactBig.format(marketing.stats.tokenGrant)}{" "}
-            <span {...stylex.props(styles.statUnit)}>tokens · one-time</span>
+            <span {...stylex.props(styles.statUnit)}>tokens</span>
           </div>
         </div>
       </div>
