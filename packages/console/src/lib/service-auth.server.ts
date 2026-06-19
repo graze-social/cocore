@@ -43,11 +43,7 @@ export type ServiceAuthResult =
   | { ok: true; did: string }
   | { ok: false; status: number; error: string; message: string };
 
-function fail(
-  status: number,
-  error: string,
-  message: string,
-): ServiceAuthResult {
+function fail(status: number, error: string, message: string): ServiceAuthResult {
   return { ok: false, status, error, message };
 }
 
@@ -90,11 +86,7 @@ export async function verifyServiceAuth(
 ): Promise<ServiceAuthResult> {
   const jwt = readBearer(request);
   if (!jwt) {
-    return fail(
-      401,
-      "AuthRequired",
-      "Authorization: Bearer <service-auth jwt> required",
-    );
+    return fail(401, "AuthRequired", "Authorization: Bearer <service-auth jwt> required");
   }
 
   const parts = jwt.split(".");
@@ -111,11 +103,7 @@ export async function verifyServiceAuth(
   }
 
   if (header.alg !== "ES256" && header.alg !== "ES256K") {
-    return fail(
-      401,
-      "BadJwt",
-      "unsupported JWT alg (expected ES256 or ES256K)",
-    );
+    return fail(401, "BadJwt", "unsupported JWT alg (expected ES256 or ES256K)");
   }
 
   const { iss, aud, lxm, exp, nbf } = payload;
@@ -153,11 +141,7 @@ export async function verifyServiceAuth(
     return fail(401, "BadJwtIssuer", "could not resolve issuer DID document");
   }
   if (!material) {
-    return fail(
-      401,
-      "BadJwtIssuer",
-      "issuer DID document has no atproto signing key",
-    );
+    return fail(401, "BadJwtIssuer", "issuer DID document has no atproto signing key");
   }
 
   let verified: boolean;
@@ -171,8 +155,7 @@ export async function verifyServiceAuth(
   } catch {
     return fail(401, "BadJwtSignature", "signature verification failed");
   }
-  if (!verified)
-    return fail(401, "BadJwtSignature", "signature verification failed");
+  if (!verified) return fail(401, "BadJwtSignature", "signature verification failed");
 
   return { ok: true, did: iss };
 }

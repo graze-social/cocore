@@ -37,18 +37,14 @@ export const Route = createFileRoute("/xrpc/dev.cocore.account.createApiKey")({
           return xrpcError(400, "InvalidRequest", "body must be JSON");
         }
         const parsed = parseCreateApiKeyBody(raw as Record<string, unknown>);
-        if (typeof parsed === "string")
-          return xrpcError(400, "InvalidRequest", parsed);
+        if (typeof parsed === "string") return xrpcError(400, "InvalidRequest", parsed);
 
         const created = createKey({
           did: auth.did,
           name: parsed.name,
           expiresAt: parsed.expiresAt,
         });
-        return xrpcJson(
-          { key: apiKeyView(created.key), secret: created.secret },
-          200,
-        );
+        return xrpcJson({ key: apiKeyView(created.key), secret: created.secret }, 200);
       },
     },
   },

@@ -34,8 +34,7 @@ export const Route = createFileRoute("/.well-known/did.json")({
       GET: ({ request }) => {
         const did = consoleDidFor(request);
         const baseUrl =
-          process.env["CONSOLE_PUBLIC_URL"]?.replace(/\/$/, "") ??
-          new URL(request.url).origin;
+          process.env["CONSOLE_PUBLIC_URL"]?.replace(/\/$/, "") ?? new URL(request.url).origin;
 
         const doc = {
           id: did,
