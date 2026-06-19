@@ -13,12 +13,26 @@ import { INFERENCE_API_INTRO_ID } from "@/lib/inference-docs/navigation-api.ts";
 import {
   INFERENCE_DOCS_CATALOG,
   INFERENCE_DOCS_SECTIONS,
+  type InferenceDocsSlug,
 } from "@/lib/inference-docs/navigation.ts";
 
+function normalizeInferenceDocsPath(pathname: string): string {
+  if (pathname.length > 1 && pathname.endsWith("/")) {
+    return pathname.slice(0, -1);
+  }
+  return pathname;
+}
+
 function isApiReferencePath(pathname: string): boolean {
-  return (
-    pathname === "/docs/inference/api-reference" || pathname === "/docs/inference/api-reference/"
-  );
+  return normalizeInferenceDocsPath(pathname) === "/docs/inference/api-reference";
+}
+
+function isInferenceOverviewActive(pathname: string): boolean {
+  return normalizeInferenceDocsPath(pathname) === "/docs/inference";
+}
+
+function isInferenceSlugActive(pathname: string, slug: InferenceDocsSlug): boolean {
+  return normalizeInferenceDocsPath(pathname) === `/docs/inference/${slug}`;
 }
 
 export function InferenceDocsNav() {
@@ -55,8 +69,10 @@ export function InferenceDocsNav() {
                 <Link
                   to="/docs/inference/$slug"
                   params={{ slug: "api-reference" }}
-                  {...stylex.props(docsStyles.refNavLink)}
-                  activeProps={stylex.props(docsStyles.refNavLink, docsStyles.refNavLinkActive)}
+                  {...stylex.props(
+                    docsStyles.refNavLink,
+                    isInferenceSlugActive(pathname, "api-reference") && docsStyles.refNavLinkActive,
+                  )}
                 >
                   Overview
                 </Link>
@@ -126,8 +142,10 @@ export function InferenceDocsNav() {
                 <Link
                   key={entry.label}
                   to="/docs/inference"
-                  {...stylex.props(docsStyles.refNavLink)}
-                  activeProps={stylex.props(docsStyles.refNavLink, docsStyles.refNavLinkActive)}
+                  {...stylex.props(
+                    docsStyles.refNavLink,
+                    isInferenceOverviewActive(pathname) && docsStyles.refNavLinkActive,
+                  )}
                 >
                   {entry.label}
                 </Link>
@@ -136,8 +154,10 @@ export function InferenceDocsNav() {
                   key={entry.label}
                   to="/docs/inference/$slug"
                   params={{ slug: entry.slug }}
-                  {...stylex.props(docsStyles.refNavLink)}
-                  activeProps={stylex.props(docsStyles.refNavLink, docsStyles.refNavLinkActive)}
+                  {...stylex.props(
+                    docsStyles.refNavLink,
+                    isInferenceSlugActive(pathname, entry.slug) && docsStyles.refNavLinkActive,
+                  )}
                 >
                   {entry.label}
                 </Link>

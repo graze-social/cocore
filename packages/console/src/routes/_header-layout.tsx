@@ -228,14 +228,8 @@ function HeaderLayoutChrome() {
             </Footer.Logo>
             <Footer.NavSection>
               <Footer.NavGroup title="Resources">
-                <FooterRouterLink to="/docs/lexicons" preload="intent">
-                  Lexicons
-                </FooterRouterLink>
-                <FooterRouterLink to="/docs/api" preload="intent">
-                  AppView
-                </FooterRouterLink>
                 <FooterRouterLink to="/docs" preload="intent">
-                  Inference
+                  Docs
                 </FooterRouterLink>
                 <FooterRouterLink to="/models" preload="intent">
                   Models
