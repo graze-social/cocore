@@ -76,7 +76,36 @@
     // not-yet-shipped blog feature — there's no consumer yet. The
     // exports are deliberate API surface for the upcoming blog
     // routes; suppress until those land.
-    "packages/console/src/lib/blog.ts": ["types"]
+    "packages/console/src/lib/blog.ts": ["types"],
+    // `public-url.ts` is a forward-compat helper for absolute links (OG
+    // tags, OAuth, share URLs) with no consumer wired up yet — deliberate
+    // infra, same shape as blog.ts. Suppress until a page imports it.
+    "packages/console/src/lib/public-url.ts": ["files"],
+    // ── In-progress API / inference docs feature ───────────────────────
+    // The docs feature is mid-build (commits "docs", "docs polish", "fix
+    // docs header"). Its fixtures/examples + nav infrastructure — server
+    // fns, fixture helpers, curl/nav builders, scroll-spy + page-title
+    // helpers, the catalog types — is written but not yet wired into the
+    // pages, so knip sees these exports/files as unused (e.g.
+    // `discover-fixtures.server.ts` is literally a "no DB discovery yet"
+    // stub). They're deliberate API surface for the in-progress docs UI,
+    // same shape as blog.ts above; suppress per-path until they get
+    // consumed (then drop the matching entry so knip re-tightens).
+    "packages/console/src/server/api-docs/discover-fixtures.server.ts": ["files"],
+    "packages/console/src/components/docs/api-docs-fixtures-context.tsx": ["exports"],
+    "packages/console/src/components/docs/docs-page.stylex.tsx": ["exports"],
+    "packages/console/src/components/docs/lexicon-docs-entry.tsx": ["exports"],
+    "packages/console/src/components/inference-docs/inference-docs-mobile-nav.tsx": ["exports"],
+    "packages/console/src/integrations/tanstack-query/api-docs.functions.ts": ["exports"],
+    "packages/console/src/lib/api-docs/fixture-defaults.ts": ["exports"],
+    "packages/console/src/lib/api-docs/interactive-params.ts": ["exports"],
+    "packages/console/src/lib/api-docs/navigation.ts": ["exports"],
+    "packages/console/src/lib/api-docs/catalog.ts": ["types"],
+    "packages/console/src/lib/inference-docs/base-url.ts": ["exports"],
+    "packages/console/src/lib/inference-docs/build-curl.ts": ["exports"],
+    "packages/console/src/lib/inference-docs/catalog.ts": ["types"],
+    "packages/console/src/lib/inference-docs/navigation-api.ts": ["exports"],
+    "packages/console/src/lib/inference-docs/navigation.ts": ["exports", "types"]
   },
 
   // ── Workspaces ────────────────────────────────────────────────────────
