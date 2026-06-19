@@ -120,7 +120,7 @@ final class StatusWindowController {
         if window == nil {
             let hosting = NSHostingController(rootView: StatusView().environmentObject(state))
             let w = NSWindow(contentViewController: hosting)
-            w.title = "cocore — Status"
+            w.title = "co/core — Status"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
             w.center()

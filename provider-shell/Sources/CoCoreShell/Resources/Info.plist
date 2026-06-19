@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>cocore</string>
+	<string>co/core</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.cocore.shell</string>
 	<key>CFBundleName</key>
-	<string>cocore</string>
+	<string>co/core</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.9.16</string>
 	<key>CFBundleURLTypes</key>

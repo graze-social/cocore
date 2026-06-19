@@ -27,7 +27,7 @@ final class ModelManager: ObservableObject {
             switch self {
             case .loaded(let m): return "✓ \(m) loaded and serving."
             case .failed(let m):
-                return "✗ \(m) failed to load. cocore runs MLX-format models only "
+                return "✗ \(m) failed to load. co/core runs MLX-format models only "
                     + "(mlx-community/… or another repo with MLX 4-bit weights); a stock "
                     + "PyTorch repo won't load. See this machine on console.cocore.dev for details."
             case .pending(let m):
@@ -338,7 +338,7 @@ final class ModelManager: ObservableObject {
         await withCheckedContinuation { (cont: CheckedContinuation<(Int32, String), Never>) in
             DispatchQueue.global().async {
                 guard let bin = AgentSupervisor.locateBinary() else {
-                    cont.resume(returning: (-1, "cocore binary not found"))
+                    cont.resume(returning: (-1, "co/core binary not found"))
                     return
                 }
                 let p = Process()
@@ -383,7 +383,7 @@ struct ModelsView: View {
             Text("Models this machine loads and advertises. Changes bounce the agent and re-publish your provider record within seconds.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Text("Any MLX-format model works — not just the suggestions below. cocore runs MLX weights (mlx-community/… or another repo with MLX 4-bit weights); stock PyTorch repos won't load.")
+            Text("Any MLX-format model works — not just the suggestions below. co/core runs MLX weights (mlx-community/… or another repo with MLX 4-bit weights); stock PyTorch repos won't load.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -655,7 +655,7 @@ final class ModelsWindowController {
         if window == nil {
             let hosting = NSHostingController(rootView: ModelsView(manager: manager))
             let w = NSWindow(contentViewController: hosting)
-            w.title = "cocore — Models"
+            w.title = "co/core — Models"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
             w.center()

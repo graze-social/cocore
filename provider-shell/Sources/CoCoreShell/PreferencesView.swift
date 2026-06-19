@@ -28,7 +28,7 @@ final class PreferencesWindowController {
             let hosting = NSHostingController(
                 rootView: PreferencesView(supervisor: supervisor).environmentObject(state))
             let w = NSWindow(contentViewController: hosting)
-            w.title = "cocore — Preferences"
+            w.title = "co/core — Settings"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
             w.center()

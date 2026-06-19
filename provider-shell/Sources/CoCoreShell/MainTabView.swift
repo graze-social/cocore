@@ -1,8 +1,8 @@
-// MainWindow: the single window the tray's "Open cocore…" opens. It folds
+// MainWindow: the single window the tray's "Open co/core…" opens. It folds
 // what used to be separate Status / Models / Preferences windows plus the
 // About housekeeping (version, updates, bug report, uninstall) into one
 // window, so the status-bar menu can stay short — the menu keeps only the
-// serving toggle, the at-a-glance lines, contextual alerts, "Open cocore…",
+// serving toggle, the at-a-glance lines, contextual alerts, "Open co/core…",
 // and Quit.
 //
 // Why AppKit toolbar tabs (NSTabViewController `.toolbar`) instead of a
@@ -83,7 +83,7 @@ final class MainWindowController {
                         onUninstall: onUninstall)),
             ]
             let w = NSWindow(contentViewController: tabs)
-            w.title = "cocore"
+            w.title = "co/core"
             w.styleMask = [.titled, .closable, .miniaturizable]
             // `.preference` centers the tab toolbar under the title — the
             // standard preferences-window layout, and what gives the tabs
@@ -109,10 +109,10 @@ final class MainWindowController {
         host.sizingOptions = []
         // NSTabViewController titles the window from the selected pane's
         // controller — leaving it nil reads "Untitled", and using the tab
-        // label makes the title flip per tab. Pin every pane to "cocore" so
+        // label makes the title flip per tab. Pin every pane to "co/core" so
         // the window stays consistently branded; the toolbar buttons still
         // carry their own labels (set on the NSTabViewItem below).
-        host.title = "cocore"
+        host.title = "co/core"
         let item = NSTabViewItem(viewController: host)
         item.label = label
         item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
@@ -198,7 +198,7 @@ private struct AboutTab: View {
                     .foregroundStyle(.secondary)
             }
             Section {
-                Button("Uninstall cocore…", role: .destructive, action: onUninstall)
+                Button("Uninstall co/core…", role: .destructive, action: onUninstall)
             }
         }
         .formStyle(.grouped)

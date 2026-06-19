@@ -36,7 +36,7 @@ final class WelcomeWindowController {
                 close: { [weak self] in self?.window?.close() }
             )
             let w = NSWindow(contentViewController: NSHostingController(rootView: view))
-            w.title = "Welcome to cocore"
+            w.title = "Welcome to co/core"
             w.styleMask = [.titled, .closable]
             w.isReleasedWhenClosed = false
             w.center()
@@ -138,7 +138,7 @@ struct WelcomeView: View {
                 .frame(width: 44, height: 44)
                 .foregroundStyle(Brand.mark)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Welcome to cocore")
+                Text("Welcome to co/core")
                     .font(.largeTitle).bold()
                     .foregroundStyle(Brand.accentText)
                 Text("Turn this Mac into a verifiable compute provider — a few quick steps and you're earning credits.")
@@ -352,7 +352,7 @@ struct WelcomeView: View {
     private var footer: some View {
         HStack(spacing: 12) {
             if allDone {
-                Text("🎉 You're all set — this Mac is a live cocore provider.")
+                Text("🎉 You're all set — this Mac is a live co/core provider.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -432,9 +432,14 @@ struct WelcomeView: View {
                 await state.refreshSession()
                 await state.refreshStatus()
                 await refresh()
+                state.lastError = nil  // clear any prior failed-sign-in line
             } catch {
                 pairError = "Couldn't finish pairing. Click “Sign in with ATProto” to try again."
-                state.setError("Pairing failed: \(error)")
+                // The window shows the actionable `pairError` above; the menu's
+                // catch-all gets a short, directive line (the raw error goes to
+                // the log, not the menu, so it can't balloon a single row).
+                NSLog("cocore: pairing failed: %@", String(describing: error))
+                state.setError("Sign-in didn’t finish — open co/core to retry.")
             }
         }
     }

@@ -50,7 +50,7 @@ final class MenuBarController {
         self.updater = updater
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = MenuBarController.brandImage()
-        item.button?.toolTip = "cocore"
+        item.button?.toolTip = "co/core"
         refreshServing()
         rebuildMenu()
 
@@ -112,12 +112,12 @@ final class MenuBarController {
         if let s = state.session {
             menu.addItem(disabled("Signed in as \(s.handle)"))
         } else {
-            menu.addItem(disabled("Welcome to cocore"))
-            menu.addItem(disabled("Step 1: sign in to turn this Mac into a provider."))
+            menu.addItem(disabled("Welcome to co/core"))
+            menu.addItem(disabled("Sign in to turn this Mac into a provider."))
             menu.addItem(.separator())
             menu.addItem(action(title: "Sign in with ATProto…", #selector(signIn)))
             menu.addItem(.separator())
-            menu.addItem(action(title: "Quit", #selector(quit)))
+            menu.addItem(action(title: "Quit co/core", #selector(quit)))
             item.menu = menu
             return
         }
@@ -143,7 +143,7 @@ final class MenuBarController {
         menu.addItem(.separator())
         // At-a-glance state + the one metric worth a glance. Everything
         // else — identity detail, models, preferences, profile, bug report,
-        // sign out, uninstall, version — moved into the "Open cocore…"
+        // sign out, uninstall, version — moved into the "Open co/core…"
         // window so the menu stays short.
         let atAGlance: String
         if remotelyPaused {
@@ -173,9 +173,9 @@ final class MenuBarController {
             // it; offer a one-click restart and point at the window for the
             // full reason. We deliberately DON'T put the fault message here —
             // NSMenu items don't wrap, so a long reason balloons the whole
-            // menu. The wrapped detail lives in Open cocore… → Status.
+            // menu. The wrapped detail lives in Open co/core… → Status.
             menu.addItem(action(title: "Restart serving", #selector(restartServing)))
-            menu.addItem(disabled("Open cocore… → Status for the reason"))
+            menu.addItem(disabled("Open co/core… → Status for the reason"))
             menu.addItem(.separator())
         }
         if badStanding {
@@ -213,11 +213,15 @@ final class MenuBarController {
         // up to date, a routine "Check for updates…" (also in the Help tab).
         addUpdateItems(to: menu)
         menu.addItem(.separator())
-        menu.addItem(action(title: "Open cocore…", #selector(openMainWindow)))
-        if let err = state.lastError {
-            menu.addItem(disabled("⚠ \(err)"))
+        menu.addItem(action(title: "Open co/core…", #selector(openMainWindow)))
+        if let err = state.lastError, !err.isEmpty {
+            // Catch-all for a surfaced error (e.g. a failed sign-in). Clip it
+            // so a raw, multi-line error string can't balloon the menu — it
+            // stays one tidy line like the rest, and the full detail lives in
+            // the window / logs.
+            menu.addItem(disabled("⚠ \(Self.clip(err))"))
         }
-        menu.addItem(action(title: "Quit cocore", #selector(quit)))
+        menu.addItem(action(title: "Quit co/core", #selector(quit)))
         item.menu = menu
     }
 
@@ -304,7 +308,7 @@ final class MenuBarController {
             return true
         }
         image.isTemplate = !hasDot
-        image.accessibilityDescription = hasDot ? "cocore — status" : "cocore"
+        image.accessibilityDescription = hasDot ? "co/core — status" : "co/core"
         return image
     }
 
@@ -312,6 +316,15 @@ final class MenuBarController {
         let it = NSMenuItem(title: s, action: nil, keyEquivalent: "")
         it.isEnabled = false
         return it
+    }
+
+    /// Clip a variable-length string to one tidy menu line. The contextual
+    /// state lines are ~45–55 chars; anything an upstream error throws at us
+    /// (a raw pairing/update error) gets trimmed to an ellipsis so it can
+    /// never balloon the menu the way a long, non-wrapping NSMenu item does.
+    static func clip(_ s: String, _ cap: Int = 60) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count > cap ? String(t.prefix(cap - 1)) + "…" : t
     }
 
     private func action(title: String, _ sel: Selector) -> NSMenuItem {
@@ -469,7 +482,7 @@ final class MenuBarController {
     /// Model-list state for the Models tab (one shared instance).
     private lazy var modelManager = ModelManager(supervisor: supervisor)
 
-    /// The single window the tray's "Open cocore…" opens — Status / Models /
+    /// The single window the tray's "Open co/core…" opens — Status / Models /
     /// Preferences / Help as tabs. Action closures route back to the methods
     /// here (which own the NSAlert flows + supervisor lifecycle).
     private lazy var mainWindow: MainWindowController = MainWindowController(
@@ -514,10 +527,10 @@ final class MenuBarController {
     @objc private func confirmUninstall() {
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Uninstall cocore?"
+        alert.messageText = "Uninstall co/core?"
         alert.informativeText = """
         This deregisters this machine (removes its provider record from \
-        your PDS) and removes the cocore agent, its LaunchAgent, the \
+        your PDS) and removes the co/core agent, its LaunchAgent, the \
         ~/.cocore state, the Python runtime, and this app.
 
         Your identity-level records (past receipts, API keys, console \
@@ -579,7 +592,7 @@ final class MenuBarController {
             } else {
                 alert.alertStyle = .warning
                 alert.messageText = "Couldn't create a bug report"
-                alert.informativeText = "The cocore agent binary wasn't found. Try reinstalling."
+                alert.informativeText = "The co/core agent binary wasn't found. Try reinstalling."
             }
             alert.addButton(withTitle: "OK")
             NSApp.activate(ignoringOtherApps: true)
@@ -602,7 +615,7 @@ final class MenuBarController {
         case .updating(let v):
             menu.addItem(disabled("Updating to \(v)…"))
         case .failed(let m):
-            menu.addItem(disabled("⚠ \(m)"))
+            menu.addItem(disabled("⚠ \(Self.clip(m))"))
             menu.addItem(action(title: "Retry update", #selector(installUpdate)))
         case .upToDate:
             // No pending update — offer a routine on-demand check right here
@@ -797,8 +810,8 @@ final class MenuBarController {
             return "Recovery requested — restarting the inference engine."
         default:
             // Already a human-readable sentence (e.g. the recovery-failed
-            // detail). Keep it short for the menu.
-            return reason.count > 120 ? String(reason.prefix(117)) + "…" : reason
+            // detail). Clip to one menu line like the other state rows.
+            return clip(reason)
         }
     }
 }
