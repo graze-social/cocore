@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.account.listApiKeys",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List every API key belonging to the authenticated account, most-recently-created first. The owning DID is derived from the credential presented (session cookie or `Authorization: Bearer cocore-...`); there is no way to list another account's keys. Secrets are never returned — see `apiKeyView`.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["keys"],
+          "properties": {
+            "keys": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "dev.cocore.account.defs#apiKeyView"
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "AuthRequired", "description": "No valid session cookie or bearer key was presented." }
+      ]
+    }
+  }
+}

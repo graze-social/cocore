@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.account.createApiKey",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Mint a new cocore API key for the authenticated account. Authenticate with either a console session cookie or an existing `Authorization: Bearer cocore-...` key. The full secret is returned exactly once in `secret` and is never retrievable again — only its SHA-256 hash is stored. Use the returned key to authenticate subsequent automated requests (inference, the record proxy, and these key-management methods themselves).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "description": "Human-readable label so the owner can tell their keys apart."
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Optional RFC3339 expiry. Omit (or send null) for a key that never expires on its own."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["key", "secret"],
+          "properties": {
+            "key": {
+              "type": "ref",
+              "ref": "dev.cocore.account.defs#apiKeyView"
+            },
+            "secret": {
+              "type": "string",
+              "description": "The full plaintext key (`cocore-<43 url-safe base64 chars>`). Shown exactly once; store it now."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "AuthRequired", "description": "No valid session cookie or bearer key was presented." }
+      ]
+    }
+  }
+}

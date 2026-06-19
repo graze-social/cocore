@@ -51,6 +51,10 @@ import { Route as ApiXrpcDevDotcocoreDotinferenceDotdispatchRouteImport } from '
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotstartRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]start'
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotpollRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]poll'
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotconfirmRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]confirm'
+import { Route as ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]revokeApiKey'
+import { Route as ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]listApiKeys'
+import { Route as ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]deleteApiKey'
+import { Route as ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]createApiKey'
 import { Route as ApiV1ModelsRouteImport } from './routes/api/v1/models'
 import { Route as ApiInternalWipeEverythingRouteImport } from './routes/api/internal/wipe-everything'
 import { Route as ApiInternalWipeRouteImport } from './routes/api/internal/wipe'
@@ -298,6 +302,30 @@ const ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute =
     path: '/api/xrpc/dev.cocore.devicePair.confirm',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute =
+  ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport.update({
+    id: '/api/xrpc/dev.cocore.account.revokeApiKey',
+    path: '/api/xrpc/dev.cocore.account.revokeApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute =
+  ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport.update({
+    id: '/api/xrpc/dev.cocore.account.listApiKeys',
+    path: '/api/xrpc/dev.cocore.account.listApiKeys',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute =
+  ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport.update({
+    id: '/api/xrpc/dev.cocore.account.deleteApiKey',
+    path: '/api/xrpc/dev.cocore.account.deleteApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute =
+  ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport.update({
+    id: '/api/xrpc/dev.cocore.account.createApiKey',
+    path: '/api/xrpc/dev.cocore.account.createApiKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiV1ModelsRoute = ApiV1ModelsRouteImport.update({
   id: '/api/v1/models',
   path: '/api/v1/models',
@@ -490,6 +518,10 @@ export interface FileRoutesByFullPath {
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
@@ -558,6 +590,10 @@ export interface FileRoutesByTo {
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
@@ -630,6 +666,10 @@ export interface FileRoutesById {
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
@@ -701,6 +741,10 @@ export interface FileRouteTypes {
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/v1/models'
+    | '/api/xrpc/dev.cocore.account.createApiKey'
+    | '/api/xrpc/dev.cocore.account.deleteApiKey'
+    | '/api/xrpc/dev.cocore.account.listApiKeys'
+    | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
@@ -769,6 +813,10 @@ export interface FileRouteTypes {
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/v1/models'
+    | '/api/xrpc/dev.cocore.account.createApiKey'
+    | '/api/xrpc/dev.cocore.account.deleteApiKey'
+    | '/api/xrpc/dev.cocore.account.listApiKeys'
+    | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
@@ -840,6 +888,10 @@ export interface FileRouteTypes {
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/v1/models'
+    | '/api/xrpc/dev.cocore.account.createApiKey'
+    | '/api/xrpc/dev.cocore.account.deleteApiKey'
+    | '/api/xrpc/dev.cocore.account.listApiKeys'
+    | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
@@ -884,6 +936,10 @@ export interface RootRouteChildren {
   ApiInternalWipeRoute: typeof ApiInternalWipeRoute
   ApiInternalWipeEverythingRoute: typeof ApiInternalWipeEverythingRoute
   ApiV1ModelsRoute: typeof ApiV1ModelsRoute
+  ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
+  ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
+  ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute: typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
+  ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
   ApiXrpcDevDotcocoreDotdevicePairDotpollRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   ApiXrpcDevDotcocoreDotdevicePairDotstartRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
@@ -1199,6 +1255,34 @@ declare module '@tanstack/react-router' {
       path: '/api/xrpc/dev.cocore.devicePair.confirm'
       fullPath: '/api/xrpc/dev.cocore.devicePair.confirm'
       preLoaderRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/xrpc/dev.cocore.account.revokeApiKey': {
+      id: '/api/xrpc/dev.cocore.account.revokeApiKey'
+      path: '/api/xrpc/dev.cocore.account.revokeApiKey'
+      fullPath: '/api/xrpc/dev.cocore.account.revokeApiKey'
+      preLoaderRoute: typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/xrpc/dev.cocore.account.listApiKeys': {
+      id: '/api/xrpc/dev.cocore.account.listApiKeys'
+      path: '/api/xrpc/dev.cocore.account.listApiKeys'
+      fullPath: '/api/xrpc/dev.cocore.account.listApiKeys'
+      preLoaderRoute: typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/xrpc/dev.cocore.account.deleteApiKey': {
+      id: '/api/xrpc/dev.cocore.account.deleteApiKey'
+      path: '/api/xrpc/dev.cocore.account.deleteApiKey'
+      fullPath: '/api/xrpc/dev.cocore.account.deleteApiKey'
+      preLoaderRoute: typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/xrpc/dev.cocore.account.createApiKey': {
+      id: '/api/xrpc/dev.cocore.account.createApiKey'
+      path: '/api/xrpc/dev.cocore.account.createApiKey'
+      fullPath: '/api/xrpc/dev.cocore.account.createApiKey'
+      preLoaderRoute: typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/v1/models': {
@@ -1521,6 +1605,14 @@ const rootRouteChildren: RootRouteChildren = {
   ApiInternalWipeRoute: ApiInternalWipeRoute,
   ApiInternalWipeEverythingRoute: ApiInternalWipeEverythingRoute,
   ApiV1ModelsRoute: ApiV1ModelsRoute,
+  ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute:
+    ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute,
+  ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute:
+    ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute,
+  ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute:
+    ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute,
+  ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute:
+    ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute,
   ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute:
     ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute,
   ApiXrpcDevDotcocoreDotdevicePairDotpollRoute:

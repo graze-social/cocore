@@ -18,7 +18,12 @@
 
 import { createFileRoute } from "@tanstack/react-router";
 
+import accountCreateApiKey from "../../../../lexicons/dev/cocore/account/createApiKey.json" with { type: "json" };
+import accountDefs from "../../../../lexicons/dev/cocore/account/defs.json" with { type: "json" };
+import accountDeleteApiKey from "../../../../lexicons/dev/cocore/account/deleteApiKey.json" with { type: "json" };
+import accountListApiKeys from "../../../../lexicons/dev/cocore/account/listApiKeys.json" with { type: "json" };
 import accountProfile from "../../../../lexicons/dev/cocore/account/profile.json" with { type: "json" };
+import accountRevokeApiKey from "../../../../lexicons/dev/cocore/account/revokeApiKey.json" with { type: "json" };
 import attestation from "../../../../lexicons/dev/cocore/compute/attestation.json" with { type: "json" };
 import defs from "../../../../lexicons/dev/cocore/compute/defs.json" with { type: "json" };
 import dispute from "../../../../lexicons/dev/cocore/compute/dispute.json" with { type: "json" };
@@ -32,7 +37,12 @@ import settlement from "../../../../lexicons/dev/cocore/compute/settlement.json"
 import termsAcceptance from "../../../../lexicons/dev/cocore/compute/termsAcceptance.json" with { type: "json" };
 
 const REGISTRY: Record<string, unknown> = {
+  "dev.cocore.account.createApiKey": accountCreateApiKey,
+  "dev.cocore.account.defs": accountDefs,
+  "dev.cocore.account.deleteApiKey": accountDeleteApiKey,
+  "dev.cocore.account.listApiKeys": accountListApiKeys,
   "dev.cocore.account.profile": accountProfile,
+  "dev.cocore.account.revokeApiKey": accountRevokeApiKey,
   "dev.cocore.compute.attestation": attestation,
   "dev.cocore.compute.defs": defs,
   "dev.cocore.compute.dispute": dispute,

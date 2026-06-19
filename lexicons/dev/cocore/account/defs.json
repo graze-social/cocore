@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.account.defs",
+  "description": "Shared type definitions for dev.cocore.account.* methods.",
+  "defs": {
+    "apiKeyView": {
+      "type": "object",
+      "description": "Public metadata for a single API key. Never contains the secret — the full key is returned exactly once, by createApiKey, and is unrecoverable afterwards. The server persists only a SHA-256 hash of the secret plus the displayable `prefix`.",
+      "required": ["id", "did", "name", "prefix", "createdAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable identifier for this key. Pass it to revokeApiKey / deleteApiKey."
+        },
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the account that owns this key."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Human-readable label set at creation time."
+        },
+        "prefix": {
+          "type": "string",
+          "description": "First characters of the key (e.g. `cocore-AbCd1234`), stored in plaintext so a key can be recognised in a list without revealing the secret."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the key was minted."
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Optional expiry. Absent means the key never expires on its own."
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Set when the key was revoked. A revoked key no longer authenticates but the row survives for audit until deleteApiKey removes it."
+        },
+        "lastUsedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Last time the key successfully authenticated a request. Absent if never used."
+        }
+      }
+    }
+  }
+}

@@ -13,7 +13,12 @@
 import { createFileRoute } from "@tanstack/react-router";
 
 const NSIDS = [
+  "dev.cocore.account.createApiKey",
+  "dev.cocore.account.defs",
+  "dev.cocore.account.deleteApiKey",
+  "dev.cocore.account.listApiKeys",
   "dev.cocore.account.profile",
+  "dev.cocore.account.revokeApiKey",
   "dev.cocore.compute.attestation",
   "dev.cocore.compute.defs",
   "dev.cocore.compute.dispute",

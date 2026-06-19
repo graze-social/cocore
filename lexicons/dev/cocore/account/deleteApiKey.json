@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.account.deleteApiKey",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Hard-delete one of the authenticated account's API keys, removing the row entirely (no audit trail recovery afterwards). For most flows revokeApiKey is preferable; use this to clean up revoked or expired keys you no longer want listed. Scoped to the caller's DID. Idempotent: deleting an unknown key returns `deleted: false`.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["id"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "The `id` of the key to delete (from createApiKey or listApiKeys)."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["deleted"],
+          "properties": {
+            "deleted": {
+              "type": "boolean",
+              "description": "True if a key owned by the caller was deleted by this call; false if no matching key existed."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "AuthRequired", "description": "No valid session cookie or bearer key was presented." }
+      ]
+    }
+  }
+}

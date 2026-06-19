@@ -20,6 +20,28 @@ work.
 | `dev.cocore.compute.receipt`                    | provider    | Signed proof a job was completed; strong-refs job + attestation. |
 | `dev.cocore.compute.settlement`                 | exchange    | Signed proof of payment; strong-refs receipt + authorization. |
 
+## Namespace: `dev.cocore.account`
+
+Records and methods scoped to a cocore account rather than a unit of work.
+
+| NSID                                | Type      | Purpose                                                              |
+| ----------------------------------- | --------- | -------------------------------------------------------------------- |
+| `dev.cocore.account.defs`           | defs      | Shared object definitions for account methods (e.g. `apiKeyView`).   |
+| `dev.cocore.account.profile`        | record    | A user's cocore-side profile.                                        |
+| `dev.cocore.account.friend`         | record    | A directed trust edge between two accounts.                          |
+| `dev.cocore.account.tokenGrant`     | record    | An auditable co-op token grant.                                      |
+| `dev.cocore.account.tokenPatronage` | record    | An auditable co-op patronage record.                                 |
+| `dev.cocore.account.createApiKey`   | procedure | Mint a new API key; returns the secret exactly once.                 |
+| `dev.cocore.account.listApiKeys`    | query     | List the authenticated account's API keys (no secrets).             |
+| `dev.cocore.account.revokeApiKey`   | procedure | Revoke a key (soft; keeps the row for audit).                        |
+| `dev.cocore.account.deleteApiKey`   | procedure | Hard-delete a key row.                                               |
+
+The API-key methods are served by the console at
+`/api/xrpc/<nsid>` and authenticate with either a console session or an
+existing `Authorization: Bearer cocore-...` key. See
+[`docs/api-keys.md`](../docs/api-keys.md) for the full guide and curl
+examples.
+
 ## Verification chain
 
 A complete unit of work, fully verified by an outside party with no API

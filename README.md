@@ -155,8 +155,10 @@ docs/                  install, deploy, and the ADRs behind the big decisions
 Lexicon NSIDs live under `dev.cocore.*`: `compute.{provider,job,attestation,
 receipt,settlement}` for the work itself, `compute.exchangePolicy` for the
 published rules, and `account.{tokenGrant,tokenPatronage}` for the auditable
-co-op trail. Lexicons only ever change **additively** — existing fields never
-change meaning; new behavior is a new optional field or a new NSID.
+co-op trail. The `account.{create,list,revoke,delete}ApiKey` methods expose
+API-key lifecycle over XRPC so you can automate access ([`docs/api-keys.md`](docs/api-keys.md)).
+Lexicons only ever change **additively** — existing fields never change
+meaning; new behavior is a new optional field or a new NSID.
 
 ## Hack on it
 
