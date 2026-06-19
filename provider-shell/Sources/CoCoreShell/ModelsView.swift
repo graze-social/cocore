@@ -371,8 +371,13 @@ struct ModelsView: View {
     @State private var scheduleApplyTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Models")
+        // Scrollable: the tab area is a fixed 520×600, and the content (model
+        // list + per-model schedules + catalog + custom field) easily exceeds
+        // it. Without this the bottom clips AND the overflow pushes the header
+        // up under the tab bar. Mirrors the Form-backed Status/Help tabs.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Models")
                 .font(.title2).bold()
                 .foregroundStyle(Brand.accentText)
             Text("Models this machine loads and advertises. Changes bounce the agent and re-publish your provider record within seconds.")
@@ -498,10 +503,11 @@ struct ModelsView: View {
                     .foregroundStyle(s.isFailure ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 0)
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(20)
-        .frame(minWidth: 460, maxWidth: .infinity, minHeight: 500, maxHeight: .infinity)
+        .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
         .brandStyled()
         .task { await manager.refresh() }
         .onAppear { schedules = ModelManager.loadSchedules() }
