@@ -4,6 +4,7 @@ import { ensureMyProfile } from "@/lib/account-profile.server.ts";
 import { issueAppSession } from "@/integrations/auth/app-session-store.server.ts";
 import { atprotoOAuthCallbackEffect } from "@/integrations/auth/atproto.server.ts";
 import { AUTH_SESSION_TOKEN_COOKIE } from "@/integrations/auth/constants.ts";
+import { authCookieDomain } from "@/integrations/auth/cookie-domain.ts";
 import { fetchBlueskyPublicProfileFieldsEffect } from "@/lib/bluesky-public-profile.server.ts";
 import { sanitizeAuthRedirectTarget } from "@/utils/auth-redirect.ts";
 
@@ -47,11 +48,13 @@ function oauthCallbackResponseEffect(request: Request): Effect.Effect<Response, 
     );
     const sessionToken = issueAppSession(did);
     const isSecure = request.url.startsWith("https://");
+    const cookieDomain = authCookieDomain(new URL(request.url).host);
     const cookieAttributes = [
       `Path=/`,
       `HttpOnly`,
       `SameSite=Lax`,
       ...(isSecure ? ["Secure"] : []),
+      ...(cookieDomain ? [`Domain=${cookieDomain}`] : []),
       `Max-Age=${30 * 24 * 60 * 60}`,
     ].join("; ");
 

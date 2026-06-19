@@ -6,6 +6,7 @@ import { Effect, Either } from "effect";
 
 import { revokeAppSession } from "@/integrations/auth/app-session-store.server.ts";
 import { AUTH_SESSION_TOKEN_COOKIE } from "@/integrations/auth/constants.ts";
+import { authCookieDomain } from "@/integrations/auth/cookie-domain.ts";
 import { readAuthSessionToken } from "@/integrations/auth/cookie-parse.ts";
 import { ensureMyProfile } from "@/lib/account-profile.server.ts";
 import { deriveChatStorageKey } from "@/lib/chat-storage-key.server.ts";
@@ -78,12 +79,16 @@ const signOutServerFn = createServerFn({ method: "POST" }).handler(() =>
       }
 
       const isHttps = request.url.startsWith("https://");
+      // Must match the Domain used when the cookie was set (oauth-callback),
+      // or the browser won't clear the .cocore.dev-scoped cookie on sign-out.
+      const cookieDomain = authCookieDomain(new URL(request.url).host);
       setCookie(AUTH_SESSION_TOKEN_COOKIE, "", {
         path: "/",
         httpOnly: true,
         sameSite: "lax",
         maxAge: 0,
         ...(isHttps ? { secure: true } : {}),
+        ...(cookieDomain ? { domain: cookieDomain } : {}),
       });
 
       return { success: true } as const;
