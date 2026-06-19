@@ -1,84 +1,137 @@
-// MainTabView: the single window the tray opens, folding what used to be
-// the separate Status / Models / Preferences windows plus the Help/About
-// actions (bug report, updates, version, uninstall) into one tabbed window.
-// That lets the status-bar menu stay short — it keeps only the serving
-// toggle, the at-a-glance lines, contextual alerts, "Open cocore…", and
-// Quit. Action closures route back to MenuBarController, which owns the
-// NSAlert flows and the supervisor lifecycle.
+// MainWindow: the single window the tray's "Open cocore…" opens. It folds
+// what used to be separate Status / Models / Preferences windows plus the
+// About housekeeping (version, updates, bug report, uninstall) into one
+// window, so the status-bar menu can stay short — the menu keeps only the
+// serving toggle, the at-a-glance lines, contextual alerts, "Open cocore…",
+// and Quit.
+//
+// Why AppKit toolbar tabs (NSTabViewController `.toolbar`) instead of a
+// SwiftUI `TabView`: SwiftUI renders its tab strip jammed against the
+// titlebar with no breathing room. The toolbar tab style gives the native,
+// System-Settings look — icon+label tabs integrated into the titlebar with
+// correct spacing — and names the window after the active tab. Each tab is a
+// SwiftUI view hosted in an NSHostingController; action closures route back
+// to MenuBarController, which owns the NSAlert flows and supervisor lifecycle.
+//
+// Flow / ordering (what a provider wants, in order): Status (am I serving +
+// earning?) → Models (what am I running?) → Settings (configure it) → About
+// (version / updates / report / uninstall).
 
 import AppKit
 import SwiftUI
 
-struct MainTabView: View {
-    @ObservedObject var state: AppState
-    let supervisor: AgentSupervisor
-    @ObservedObject var updater: Updater
-    @ObservedObject var modelManager: ModelManager
+@MainActor
+final class MainWindowController {
+    private var window: NSWindow?
 
-    let onOpenProfile: () -> Void
-    let onOpenSetupGuide: () -> Void
-    let onSignOut: () -> Void
-    let onSendBugReport: () -> Void
-    let onCheckUpdates: () -> Void
-    let onInstallUpdate: () -> Void
-    let onUninstall: () -> Void
+    private let state: AppState
+    private let supervisor: AgentSupervisor
+    private let updater: Updater
+    private let modelManager: ModelManager
+    private let onOpenProfile: () -> Void
+    private let onOpenSetupGuide: () -> Void
+    private let onSignOut: () -> Void
+    private let onSendBugReport: () -> Void
+    private let onCheckUpdates: () -> Void
+    private let onInstallUpdate: () -> Void
+    private let onUninstall: () -> Void
 
-    var body: some View {
-        TabView {
-            StatusTab(
-                updater: updater,
-                onOpenProfile: onOpenProfile,
-                onOpenSetupGuide: onOpenSetupGuide,
-                onSignOut: onSignOut,
-                onCheckUpdates: onCheckUpdates,
-                onInstallUpdate: onInstallUpdate
-            )
-            .tabItem { Label("Status", systemImage: "waveform.path.ecg") }
+    init(
+        state: AppState,
+        supervisor: AgentSupervisor,
+        updater: Updater,
+        modelManager: ModelManager,
+        onOpenProfile: @escaping () -> Void,
+        onOpenSetupGuide: @escaping () -> Void,
+        onSignOut: @escaping () -> Void,
+        onSendBugReport: @escaping () -> Void,
+        onCheckUpdates: @escaping () -> Void,
+        onInstallUpdate: @escaping () -> Void,
+        onUninstall: @escaping () -> Void
+    ) {
+        self.state = state
+        self.supervisor = supervisor
+        self.updater = updater
+        self.modelManager = modelManager
+        self.onOpenProfile = onOpenProfile
+        self.onOpenSetupGuide = onOpenSetupGuide
+        self.onSignOut = onSignOut
+        self.onSendBugReport = onSendBugReport
+        self.onCheckUpdates = onCheckUpdates
+        self.onInstallUpdate = onInstallUpdate
+        self.onUninstall = onUninstall
+    }
 
-            ModelsView(manager: modelManager)
-                .tabItem { Label("Models", systemImage: "cpu") }
-
-            PreferencesView(supervisor: supervisor)
-                .tabItem { Label("Preferences", systemImage: "gearshape") }
-
-            HelpTab(
-                updater: updater,
-                onSendBugReport: onSendBugReport,
-                onCheckUpdates: onCheckUpdates,
-                onInstallUpdate: onInstallUpdate,
-                onUninstall: onUninstall
-            )
-            .tabItem { Label("Help", systemImage: "questionmark.circle") }
+    func show() {
+        if window == nil {
+            let tabs = NSTabViewController()
+            tabs.tabStyle = .toolbar
+            tabs.tabViewItems = [
+                tab("Status", "gauge.medium",
+                    StatusTab(
+                        onOpenProfile: onOpenProfile,
+                        onOpenSetupGuide: onOpenSetupGuide,
+                        onSignOut: onSignOut)),
+                tab("Models", "cpu", ModelsView(manager: modelManager)),
+                tab("Settings", "gearshape", PreferencesView(supervisor: supervisor)),
+                tab("About", "info.circle",
+                    AboutTab(
+                        updater: updater,
+                        onSendBugReport: onSendBugReport,
+                        onCheckUpdates: onCheckUpdates,
+                        onInstallUpdate: onInstallUpdate,
+                        onUninstall: onUninstall)),
+            ]
+            let w = NSWindow(contentViewController: tabs)
+            w.title = "cocore"
+            w.styleMask = [.titled, .closable, .miniaturizable]
+            // `.preference` centers the tab toolbar under the title — the
+            // standard preferences-window layout, and what gives the tabs
+            // their breathing room instead of hugging the titlebar.
+            w.toolbarStyle = .preference
+            w.isReleasedWhenClosed = false
+            w.center()
+            window = w
         }
-        .environmentObject(state)
-        .frame(width: 520, height: 600)
-        .brandStyled()
+        if let w = window { WindowActivation.present(w) }
+    }
+
+    /// Wrap a SwiftUI tab body in an NSHostingController with the shared
+    /// environment + brand tint at a fixed size, so the window stays one
+    /// consistent size across tabs (no per-tab resize jank).
+    private func tab(_ label: String, _ symbol: String, _ content: some View) -> NSTabViewItem {
+        let root =
+            content
+            .environmentObject(state)
+            .frame(width: 540, height: 600)
+            .brandStyled()
+        let host = NSHostingController(rootView: root)
+        host.sizingOptions = []
+        // NSTabViewController titles the window from the selected pane's
+        // controller — leaving it nil reads "Untitled", and using the tab
+        // label makes the title flip per tab. Pin every pane to "cocore" so
+        // the window stays consistently branded; the toolbar buttons still
+        // carry their own labels (set on the NSTabViewItem below).
+        host.title = "cocore"
+        let item = NSTabViewItem(viewController: host)
+        item.label = label
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        return item
     }
 }
 
-/// Identity + serving + credits + versions (the shared `StatusRows`), with
-/// the account actions that used to be their own menu items. The update
-/// control sits right under the version rows so "Check for updates…" is on
-/// the first page, not buried in Help.
+/// Identity + serving + credits + versions (the shared `StatusRows`), plus
+/// the account actions that used to be their own menu items. Updates live in
+/// About now, so there's one home for them instead of two.
 private struct StatusTab: View {
-    @ObservedObject var updater: Updater
     let onOpenProfile: () -> Void
     let onOpenSetupGuide: () -> Void
     let onSignOut: () -> Void
-    let onCheckUpdates: () -> Void
-    let onInstallUpdate: () -> Void
     @EnvironmentObject private var state: AppState
 
     var body: some View {
         Form {
             StatusRows()
-            Section("Updates") {
-                UpdateControl(
-                    updater: updater,
-                    onCheckUpdates: onCheckUpdates,
-                    onInstallUpdate: onInstallUpdate
-                )
-            }
             Section {
                 Button("View my profile on console", action: onOpenProfile)
                     .disabled(state.session == nil)
@@ -91,8 +144,9 @@ private struct StatusTab: View {
     }
 }
 
-/// The update affordance, shared by the Status tab and the Help tab so both
-/// surfaces show the same state-appropriate control (check / update / retry).
+/// The update affordance — shown in About (and mirrored by the status-bar
+/// menu when an update is pending), so it surfaces the same state-appropriate
+/// control: check / update / retry.
 private struct UpdateControl: View {
     @ObservedObject var updater: Updater
     let onCheckUpdates: () -> Void
@@ -115,9 +169,9 @@ private struct UpdateControl: View {
     }
 }
 
-/// Software/version, the update control, the bug-report action, and the
-/// uninstall — the housekeeping that doesn't belong in the tray menu.
-private struct HelpTab: View {
+/// Version, the update control, the bug-report action, and the uninstall —
+/// the housekeeping that doesn't belong in the tray menu.
+private struct AboutTab: View {
     @ObservedObject var updater: Updater
     let onSendBugReport: () -> Void
     let onCheckUpdates: () -> Void
@@ -148,27 +202,5 @@ private struct HelpTab: View {
             }
         }
         .formStyle(.grouped)
-    }
-}
-
-/// Hosts MainTabView in the single window the tray's "Open cocore…" opens.
-@MainActor
-final class MainWindowController {
-    private var window: NSWindow?
-    private let rootView: MainTabView
-
-    init(rootView: MainTabView) { self.rootView = rootView }
-
-    func show() {
-        if window == nil {
-            let hosting = NSHostingController(rootView: rootView)
-            let w = NSWindow(contentViewController: hosting)
-            w.title = "cocore"
-            w.styleMask = [.titled, .closable, .miniaturizable]
-            w.isReleasedWhenClosed = false
-            w.center()
-            window = w
-        }
-        if let w = window { WindowActivation.present(w) }
     }
 }

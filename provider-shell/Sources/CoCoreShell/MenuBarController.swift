@@ -472,22 +472,19 @@ final class MenuBarController {
     /// The single window the tray's "Open cocore…" opens — Status / Models /
     /// Preferences / Help as tabs. Action closures route back to the methods
     /// here (which own the NSAlert flows + supervisor lifecycle).
-    private lazy var mainWindow: MainWindowController = {
-        let view = MainTabView(
-            state: state,
-            supervisor: supervisor,
-            updater: updater,
-            modelManager: modelManager,
-            onOpenProfile: { [weak self] in self?.openProfile() },
-            onOpenSetupGuide: { [weak self] in self?.openWelcome() },
-            onSignOut: { [weak self] in self?.signOut() },
-            onSendBugReport: { [weak self] in self?.sendBugReport() },
-            onCheckUpdates: { [weak self] in self?.checkUpdates() },
-            onInstallUpdate: { [weak self] in self?.installUpdate() },
-            onUninstall: { [weak self] in self?.confirmUninstall() }
-        )
-        return MainWindowController(rootView: view)
-    }()
+    private lazy var mainWindow: MainWindowController = MainWindowController(
+        state: state,
+        supervisor: supervisor,
+        updater: updater,
+        modelManager: modelManager,
+        onOpenProfile: { [weak self] in self?.openProfile() },
+        onOpenSetupGuide: { [weak self] in self?.openWelcome() },
+        onSignOut: { [weak self] in self?.signOut() },
+        onSendBugReport: { [weak self] in self?.sendBugReport() },
+        onCheckUpdates: { [weak self] in self?.checkUpdates() },
+        onInstallUpdate: { [weak self] in self?.installUpdate() },
+        onUninstall: { [weak self] in self?.confirmUninstall() }
+    )
     @objc private func openMainWindow() { mainWindow.show() }
 
     private lazy var welcomeWindow: WelcomeWindowController = {
