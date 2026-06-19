@@ -25,6 +25,16 @@ struct StatusRows: View {
         }
         Section("Serving") {
             LabeledContent("State", value: servingText)
+            // The full provisioning-failure reason lives here (not the menu,
+            // where a long single line can't wrap and balloons the window).
+            if let p = MenuBarController.provisionStatus(), p.phase == "failed",
+                let msg = p.faultMessage
+            {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             LabeledContent("Trust level", value: state.trustLevel.rawValue)
             if let exp = state.attestationExpiresAt {
                 LabeledContent("Attestation expires", value: exp.formatted(.dateTime))

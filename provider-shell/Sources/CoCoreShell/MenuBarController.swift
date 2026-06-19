@@ -167,13 +167,15 @@ final class MenuBarController {
         menu.addItem(disabled("Earnings (24h): \(creditsDisplay(state.creditsLast24h))"))
 
         menu.addItem(.separator())
-        if provision?.phase == "failed", let msg = provision?.faultMessage {
-            // Provisioning failed (e.g. a model download that gave up, or a
-            // non-MLX repo). Surface it with the agent's content-safe reason +
-            // a one-click restart, instead of leaving the operator guessing.
-            menu.addItem(disabled("⚠ Couldn't start serving"))
-            menu.addItem(disabled(String(msg.prefix(180))))
+        if provision?.phase == "failed" {
+            // Provisioning failed (a model that gave up downloading, didn't
+            // fit RAM, or isn't MLX). The at-a-glance line above already flags
+            // it; offer a one-click restart and point at the window for the
+            // full reason. We deliberately DON'T put the fault message here —
+            // NSMenu items don't wrap, so a long reason balloons the whole
+            // menu. The wrapped detail lives in Open cocore… → Status.
             menu.addItem(action(title: "Restart serving", #selector(restartServing)))
+            menu.addItem(disabled("Open cocore… → Status for the reason"))
             menu.addItem(.separator())
         }
         if badStanding {
