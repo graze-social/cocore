@@ -1835,6 +1835,98 @@ fn inference_models_action(confidential: bool, desired: &[String]) -> InferenceM
 /// for `start()` to arbitrate. Set `COCORE_IGNORE_RAM_FLOOR=1` to bypass
 /// the guard (e.g. a machine the operator knows can run a model the
 /// conservative floor rejects).
+/// True when the operator selected the OpenAI-compatible HTTP backend via
+/// `COCORE_ENGINE_BACKEND=openai` (case-insensitive, surrounding whitespace
+/// ignored). Default (unset / anything else) keeps the existing Apple-MLX/vllm
+/// path, so this is purely opt-in and changes nothing for existing installs.
+fn backend_is_openai() -> bool {
+    std::env::var("COCORE_ENGINE_BACKEND")
+        .map(|v| v.trim().eq_ignore_ascii_case("openai"))
+        .unwrap_or(false)
+}
+
+/// Build the engine registry for the OpenAI-compatible HTTP backend: one
+/// `OpenAiEngine` per configured model id, all pointed at
+/// `COCORE_OPENAI_BASE_URL` (Bearer `COCORE_OPENAI_API_KEY` if set). The
+/// cocore model id is sent verbatim as the upstream `model`. We gate
+/// registration on a `/v1/models` reachability probe so a dead/misconfigured
+/// endpoint surfaces as an `engineFault` (and isn't advertised) instead of a
+/// green machine that drops every job. No RAM-floor guard — inference is
+/// remote.
+fn build_openai_engines(
+    mut registry: cocore_provider::engines::EngineRegistry,
+    configured: Vec<String>,
+) -> (
+    cocore_provider::engines::EngineRegistry,
+    Option<EngineFault>,
+) {
+    use cocore_provider::engines::openai::OpenAiEngine;
+    use cocore_provider::engines::Engine; // bring `ready()` into scope
+
+    let base_url = std::env::var("COCORE_OPENAI_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(base_url) = base_url else {
+        tracing::warn!(
+            "COCORE_ENGINE_BACKEND=openai but COCORE_OPENAI_BASE_URL is unset; serving stub only"
+        );
+        let fault = EngineFault {
+            code: "openai-base-url-missing".to_string(),
+            message: "The OpenAI-compatible backend is selected \
+                      (COCORE_ENGINE_BACKEND=openai) but COCORE_OPENAI_BASE_URL is not set, so no \
+                      endpoint could be reached. The machine is online but only serving the no-op \
+                      `stub` engine. Fix: set COCORE_OPENAI_BASE_URL to your endpoint (e.g. \
+                      http://127.0.0.1:8080) and start serving again."
+                .to_string(),
+            models: vec![],
+            at: chrono::Utc::now(),
+        };
+        return (registry, Some(fault));
+    };
+    let api_key = std::env::var("COCORE_OPENAI_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut failed: Vec<String> = vec![];
+    for model in &configured {
+        match OpenAiEngine::new(model.as_str(), &base_url, api_key.clone()) {
+            // Gate on reachability: `ready()` probes `GET /v1/models`.
+            Ok(engine) if engine.ready() => {
+                tracing::info!(model = %model, "openai endpoint engine ready");
+                registry.register(model.clone(), std::sync::Arc::new(engine));
+            }
+            Ok(_) => {
+                tracing::warn!(model = %model, "inference engine load failed");
+                failed.push(model.clone());
+            }
+            Err(e) => {
+                tracing::warn!(model = %model, error = %format!("{e:#}"), "inference engine load failed");
+                failed.push(model.clone());
+            }
+        }
+    }
+
+    if failed.is_empty() {
+        return (registry, None);
+    }
+    let fault = EngineFault {
+        code: "openai-endpoint-unreachable".to_string(),
+        message: format!(
+            "The OpenAI-compatible endpoint at {base_url} did not answer a /v1/models probe for \
+             model(s) [{}], so they were not loaded. The machine is online but only serving the \
+             no-op `stub` engine. Fix: confirm the endpoint is running and reachable, that \
+             COCORE_OPENAI_BASE_URL is correct, and that COCORE_OPENAI_API_KEY (if the endpoint \
+             requires auth) is set, then start serving again.",
+            failed.join(", "),
+        ),
+        models: failed,
+        at: chrono::Utc::now(),
+    };
+    (registry, Some(fault))
+}
+
 fn build_engines(
     ram_gb: u32,
 ) -> (
@@ -1931,6 +2023,21 @@ fn build_engines(
         // (inference runs in-process), so a native failure is the fault to
         // surface here. On best-effort machines `native_fault` is `None`.
         return (registry, native_fault);
+    }
+
+    // Backend selection. The OpenAI-compatible HTTP engine (the Linux
+    // real-inference path) attaches to an external endpoint, so it skips the
+    // venv + RAM-floor machinery the Apple-MLX path below needs — a remote
+    // endpoint's RAM isn't this machine's concern. Opt in with
+    // COCORE_ENGINE_BACKEND=openai; the default keeps the vllm-mlx path below
+    // unchanged.
+    if backend_is_openai() {
+        let configured: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return build_openai_engines(registry, configured);
     }
 
     // Resolve the venv interpreter once. The install script writes it

@@ -52,7 +52,12 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 ] }
 tracing-opentelemetry = "0.33"
 
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# `blocking` powers the OpenAI-compatible HTTP engine (engines/openai.rs): the
+# Engine trait is synchronous (called on a spawn_blocking thread), and the
+# blocking Response implements `Read` for SSE streaming. (The blocking client
+# is already in the tree via opentelemetry-otlp's reqwest-blocking-client; this
+# enables it on our direct dependency so we can use it explicitly.)
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 
 # rustls is already in the tree (via tokio-tungstenite + reqwest). We depend on
 # it directly only to install a process-default CryptoProvider at startup: with
