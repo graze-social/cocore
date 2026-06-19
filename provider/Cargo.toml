@@ -17,7 +17,11 @@ path = "src/lib.rs"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+# rustls (not native-tls) so the agent builds on a stock Linux box with NO
+# system OpenSSL dev dependency — matching the `rustls-tls` choice for `reqwest`
+# below and the "stay portable" rationale on `flate2`. `*-native-roots` keeps
+# cert verification anchored in the OS trust store, same as native-tls did.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +53,12 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 tracing-opentelemetry = "0.33"
 
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# rustls is already in the tree (via tokio-tungstenite + reqwest). We depend on
+# it directly only to install a process-default CryptoProvider at startup: with
+# both aws-lc-rs and ring compiled in, rustls 0.23 can't auto-select one and
+# panics at the first TLS handshake. See `install_crypto_provider` in main.rs.
+rustls = "0.23"
 
 # `cocore agent update` extracts the release tarball in-process so we
 # don't need a system tar / curl in the path. flate2's `rust_backend`

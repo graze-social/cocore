@@ -190,6 +190,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
 
+    // Install a process-default rustls CryptoProvider before any TLS handshake
+    // (the advisor WebSocket, the OpenAI engine, PDS/console HTTPS). Required
+    // because this tree compiles in more than one provider (see the fn).
+    install_crypto_provider();
+
     match cli.cmd {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
         Cmd::Agent(AgentCmd::Serve { advisor }) => cmd_serve_entry(advisor).await,
@@ -431,6 +436,34 @@ fn init_tracing(level: &str) {
     // Stderr (as before) PLUS a rolling, content-safe file log under
     // ~/.cocore/logs so a crash leaves a durable trail.
     cocore_provider::diagnostics::init_logging(level);
+}
+
+/// Install a process-wide default rustls `CryptoProvider`.
+///
+/// rustls 0.23 resolves its crypto backend from a process-level default, and
+/// auto-selects one only when exactly one of the `aws-lc-rs` / `ring` features
+/// is compiled in. This dependency tree pulls in BOTH (reqwest's `rustls-tls`
+/// brings aws-lc-rs; the tokio-tungstenite rustls stack brings ring), so the
+/// auto-select fails and rustls panics at the first TLS handshake — which is
+/// the advisor WebSocket connect in `cmd_serve`. We pick `aws-lc-rs`
+/// explicitly (the rustls 0.23 default, and what reqwest uses) so every TLS
+/// path — the WebSocket, the OpenAI engine, and PDS/console HTTPS — shares one
+/// provider. Idempotent: `install_default` returns `Err` if a default is
+/// already set, which we ignore (first winner stands).
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    #[test]
+    fn install_sets_a_process_default() {
+        // After installing, a process-default provider must exist — without it,
+        // the rustls WebSocket connect panics at runtime. Idempotent, so this
+        // is safe regardless of test ordering.
+        super::install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 }
 
 async fn cmd_pair(console: &str) -> Result<()> {
