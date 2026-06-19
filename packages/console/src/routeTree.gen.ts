@@ -64,6 +64,7 @@ import { Route as ApiPdsDeleteRecordRouteImport } from './routes/api/pds/deleteR
 import { Route as ApiPdsCreateRecordRouteImport } from './routes/api/pds/createRecord'
 import { Route as ApiInternalWipeEverythingRouteImport } from './routes/api/internal/wipe-everything'
 import { Route as ApiInternalWipeRouteImport } from './routes/api/internal/wipe'
+import { Route as ApiInternalMigrateSessionsToAppviewRouteImport } from './routes/api/internal/migrate-sessions-to-appview'
 import { Route as ApiAgentWhoamiRouteImport } from './routes/api/agent.whoami'
 import { Route as ApiAgentStatusRouteImport } from './routes/api/agent.status'
 import { Route as ApiAgentHealthRouteImport } from './routes/api/agent.health'
@@ -381,6 +382,12 @@ const ApiInternalWipeRoute = ApiInternalWipeRouteImport.update({
   path: '/api/internal/wipe',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiInternalMigrateSessionsToAppviewRoute =
+  ApiInternalMigrateSessionsToAppviewRouteImport.update({
+    id: '/api/internal/migrate-sessions-to-appview',
+    path: '/api/internal/migrate-sessions-to-appview',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiAgentWhoamiRoute = ApiAgentWhoamiRouteImport.update({
   id: '/api/agent/whoami',
   path: '/api/agent/whoami',
@@ -566,6 +573,7 @@ export interface FileRoutesByFullPath {
   '/api/agent/health': typeof ApiAgentHealthRoute
   '/api/agent/status': typeof ApiAgentStatusRoute
   '/api/agent/whoami': typeof ApiAgentWhoamiRoute
+  '/api/internal/migrate-sessions-to-appview': typeof ApiInternalMigrateSessionsToAppviewRoute
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
@@ -645,6 +653,7 @@ export interface FileRoutesByTo {
   '/api/agent/health': typeof ApiAgentHealthRoute
   '/api/agent/status': typeof ApiAgentStatusRoute
   '/api/agent/whoami': typeof ApiAgentWhoamiRoute
+  '/api/internal/migrate-sessions-to-appview': typeof ApiInternalMigrateSessionsToAppviewRoute
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
@@ -728,6 +737,7 @@ export interface FileRoutesById {
   '/api/agent/health': typeof ApiAgentHealthRoute
   '/api/agent/status': typeof ApiAgentStatusRoute
   '/api/agent/whoami': typeof ApiAgentWhoamiRoute
+  '/api/internal/migrate-sessions-to-appview': typeof ApiInternalMigrateSessionsToAppviewRoute
   '/api/internal/wipe': typeof ApiInternalWipeRoute
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
@@ -810,6 +820,7 @@ export interface FileRouteTypes {
     | '/api/agent/health'
     | '/api/agent/status'
     | '/api/agent/whoami'
+    | '/api/internal/migrate-sessions-to-appview'
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
@@ -889,6 +900,7 @@ export interface FileRouteTypes {
     | '/api/agent/health'
     | '/api/agent/status'
     | '/api/agent/whoami'
+    | '/api/internal/migrate-sessions-to-appview'
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
@@ -971,6 +983,7 @@ export interface FileRouteTypes {
     | '/api/agent/health'
     | '/api/agent/status'
     | '/api/agent/whoami'
+    | '/api/internal/migrate-sessions-to-appview'
     | '/api/internal/wipe'
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
@@ -1025,6 +1038,7 @@ export interface RootRouteChildren {
   ApiAgentHealthRoute: typeof ApiAgentHealthRoute
   ApiAgentStatusRoute: typeof ApiAgentStatusRoute
   ApiAgentWhoamiRoute: typeof ApiAgentWhoamiRoute
+  ApiInternalMigrateSessionsToAppviewRoute: typeof ApiInternalMigrateSessionsToAppviewRoute
   ApiInternalWipeRoute: typeof ApiInternalWipeRoute
   ApiInternalWipeEverythingRoute: typeof ApiInternalWipeEverythingRoute
   ApiPdsCreateRecordRoute: typeof ApiPdsCreateRecordRoute
@@ -1441,6 +1455,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiInternalWipeRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/internal/migrate-sessions-to-appview': {
+      id: '/api/internal/migrate-sessions-to-appview'
+      path: '/api/internal/migrate-sessions-to-appview'
+      fullPath: '/api/internal/migrate-sessions-to-appview'
+      preLoaderRoute: typeof ApiInternalMigrateSessionsToAppviewRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/agent/whoami': {
       id: '/api/agent/whoami'
       path: '/api/agent/whoami'
@@ -1756,6 +1777,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiAgentHealthRoute: ApiAgentHealthRoute,
   ApiAgentStatusRoute: ApiAgentStatusRoute,
   ApiAgentWhoamiRoute: ApiAgentWhoamiRoute,
+  ApiInternalMigrateSessionsToAppviewRoute:
+    ApiInternalMigrateSessionsToAppviewRoute,
   ApiInternalWipeRoute: ApiInternalWipeRoute,
   ApiInternalWipeEverythingRoute: ApiInternalWipeEverythingRoute,
   ApiPdsCreateRecordRoute: ApiPdsCreateRecordRoute,

@@ -50,3 +50,50 @@ export async function handOffSessionToAppview(did: string): Promise<boolean> {
     return false;
   }
 }
+
+export interface SessionMigrationResult {
+  total: number;
+  pushed: number;
+  failed: number;
+}
+
+/** Bulk-push every stored OAuth session to the AppView. This is the
+ *  one-time cutover migration: existing users who don't re-log-in still
+ *  need their session on the AppView for the forwarded write path. The
+ *  per-login handoff covers everyone who signs in after the flip; this
+ *  covers the back catalogue.
+ *
+ *  Idempotent (the AppView upserts by DID), so it's safe to re-run, but it
+ *  is NOT wired to run automatically — invoke it deliberately at cutover
+ *  (see scripts/migrate-sessions-to-appview.ts), after the forward env is
+ *  set so the console has stopped refreshing the sessions it pushes. */
+export async function migrateAllSessionsToAppview(): Promise<SessionMigrationResult> {
+  const base = process.env["COCORE_APPVIEW_INTERNAL_URL"]?.replace(/\/$/, "");
+  const secret = process.env["COCORE_INTERNAL_SECRET"];
+  if (!base || !secret) {
+    console.warn(
+      "[appview-handoff] migrate skipped — COCORE_APPVIEW_INTERNAL_URL / COCORE_INTERNAL_SECRET not set",
+    );
+    return { total: 0, pushed: 0, failed: 0 };
+  }
+
+  let dids: string[];
+  try {
+    const rows = consoleDb().prepare(`SELECT did FROM oauth_sessions`).all() as { did: string }[];
+    dids = rows.map((r) => r.did);
+  } catch (e) {
+    console.warn("[appview-handoff] migrate: could not read oauth_sessions:", (e as Error).message);
+    return { total: 0, pushed: 0, failed: 0 };
+  }
+
+  let pushed = 0;
+  let failed = 0;
+  for (const did of dids) {
+    if (await handOffSessionToAppview(did)) pushed++;
+    else failed++;
+  }
+  console.log(
+    `[appview-handoff] migrate complete: ${pushed}/${dids.length} sessions pushed (${failed} failed)`,
+  );
+  return { total: dids.length, pushed, failed };
+}
