@@ -38,18 +38,16 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
-      # Set BOTH so the Railway CLI picks it up whether you created an
-      # account/team token (RAILWAY_API_TOKEN) or a project token
-      # (RAILWAY_TOKEN). Cross-PR-env access needs an account/team token.
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      # An account/team token (not a project token, which can't span all PR
+      # envs). The Railway CLI reads account tokens from RAILWAY_API_TOKEN.
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure this PR's Railway env
         run: |
-          if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::notice::RAILWAY_TOKEN not set — skipping PR-env config (the app build still targets this PR's URLs)."
+          if [ -z "${RAILWAY_API_TOKEN:-}" ]; then
+            echo "::notice::RAILWAY_API_TOKEN not set — skipping PR-env config (the app build still targets this PR's URLs)."
             exit 0
           fi
           npm i -g @railway/cli >/dev/null 2>&1
