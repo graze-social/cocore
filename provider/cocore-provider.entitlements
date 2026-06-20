@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Entitlements for the WORKER agent binary (`cocore`), the process that
+         decrypts the prompt and runs inference. WS-AGENT-SIGNING: today only
+         the shell carried hardened-runtime entitlements; the worker was spawned
+         ad-hoc, so its cdhash was meaningless. These mirror the shell's
+         hardened posture and add the GPU-isolation entitlement the in-process
+         Metal engine needs.
+
+         MUST be code-signed with codesign options "runtime,library" (see
+         provider/spikes/SPIKE_RESULTS.md: the S3 spike proved "runtime" alone
+         leaves CS_REQUIRE_LV unset, so libraryValidation would read false and
+         the confidential tier would never qualify). -->
+
+    <!-- Hardened runtime: every "loosen the sandbox" escape hatch off.
+         allow-jit stays FALSE — the S1 reference finding is that MLX runs from
+         a PRECOMPILED, signed `.metallib`, so no runtime shader JIT is needed
+         for standard inference. -->
+    <key>com.apple.security.cs.allow-jit</key><false/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key><false/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key><false/>
+    <key>com.apple.security.cs.disable-library-validation</key><false/>
+    <key>com.apple.security.cs.disable-executable-page-protection</key><false/>
+
+    <!-- Critical: block external task-port acquisition. Without this, any
+         process running as the same user could task_for_pid() this address
+         space and read decrypted plaintext. The agent also applies
+         PT_DENY_ATTACH at startup (security::apply_all); this is defense in
+         depth, and the value the attestation reports as getTaskAllow=false. -->
+    <key>com.apple.security.get-task-allow</key><false/>
+
+    <!-- GPU / DMA isolation: darkbloom relies on the hypervisor entitlement for
+         IOMMU page-table isolation (so a DMA peripheral can't read unified
+         memory holding plaintext). The in-process Metal engine runs under it. -->
+    <key>com.apple.security.hypervisor</key><true/>
+
+    <!-- Sandbox stays off for now (the agent reads its state dir + spawns no
+         children once the native engine lands). Keychain scoped to our group so
+         the Secure Enclave signing identity isn't readable by other apps. -->
+    <key>com.apple.security.app-sandbox</key><false/>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)dev.cocore.provider</string>
+    </array>
+
+    <!-- Outbound only (advisor WebSocket + PDS writes). Never inbound. -->
+    <key>com.apple.security.network.client</key><true/>
+    <key>com.apple.security.network.server</key><false/>
+</dict>
+</plist>

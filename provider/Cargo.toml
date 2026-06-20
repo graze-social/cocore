@@ -83,6 +83,13 @@ default = []
 # Links the macOS-only Secure Enclave Swift framework. Without this,
 # the agent uses a software P-256 fallback (still self-attested).
 secure_enclave = []
+# WS-ENGINE: native in-process MLX inference engine. Off by default so the
+# Linux/CI build (and any host without the Metal toolchain) stays green. The
+# scaffold compiles without mlx-rs; wiring the actual MLX calls requires a
+# full-Xcode build host (the Metal shader compiler) — see
+# provider/spikes/SPIKE_RESULTS.md (S1/S2). When enabled, the engine reports
+# in_process=true and pins the precompiled signed mlx.metallib hash.
+native_mlx = []
 
 [dev-dependencies]
 tempfile = "3"

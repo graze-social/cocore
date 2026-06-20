@@ -909,6 +909,16 @@ async fn cmd_serve(advisor_url: &str) -> Result<()> {
     let mut attestation_inputs =
         attestation::build_stub_inputs(&session.did, &enc.public_key_b64());
     attestation_inputs.mda_cert_chain = cocore_provider::mda_loader::try_load();
+    // Reflect the serving engine's confidential properties honestly: the
+    // confidential tier requires inference to run inside THIS measured binary
+    // (an in-process native engine), and pins the metallib the GPU kernels load.
+    // The subprocess/stub backends report neither, so this stays false/None
+    // until the native engine ships (WS-ENGINE).
+    attestation_inputs.in_process_backend = engines.entries().iter().any(|(_, e)| e.in_process());
+    attestation_inputs.metallib_hash = engines
+        .entries()
+        .iter()
+        .find_map(|(_, e)| e.metallib_hash());
     // Echo the signed attestation's measured identity + tier on the Register
     // frame so the advisor can compute confidential eligibility (accelerator
     // only — the PDS attestation stays authoritative for client verification).
