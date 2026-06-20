@@ -1,0 +1,50 @@
+# Auto-wire each PR's Railway preview environment to itself.
+#
+# Railway clones every PR env (`cocore-pr-<N>`) from `production`, which uses
+# custom domains — so a fresh clone points its public URLs + service DID at
+# PROD and lacks the new-code gating vars. We can't fix that with Railway
+# reference variables (they'd break prod's custom domains), so this runs
+# scripts/configure-pr-env.sh to rewrite the clone's vars to its OWN
+# deterministic domains + fill the shared secrets, then redeploys. The script
+# is idempotent (a no-op once configured), so running on every push is cheap.
+#
+# Requires a Railway token with project-wide access as the `RAILWAY_TOKEN`
+# repo secret. Without it (or on fork PRs), the job no-ops — the app build
+# still targets the PR URLs (provider-pr-build.yml), the services just keep
+# their cloned-from-prod values until configured.
+
+name: pr-env-config
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  # Serialize per PR; never cancel a config mid-flight.
+  group: pr-env-config-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    # Fork PRs can't read the token; skip them.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure this PR's Railway env
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::notice::RAILWAY_TOKEN not set — skipping PR-env config (the app build still targets this PR's URLs)."
+            exit 0
+          fi
+          npm i -g @railway/cli >/dev/null 2>&1
+          # Establish project context for the account/team token. The script
+          # targets --environment/--service per command; link just sets the project.
+          railway link --project a46692ef-f462-4801-9a64-0af69ea7143d >/dev/null 2>&1 || true
+          PR_NUMBER="${{ github.event.pull_request.number }}" bash scripts/configure-pr-env.sh
