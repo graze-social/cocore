@@ -323,6 +323,35 @@ final class ModelManager: ObservableObject {
         return total > 0 ? total : nil
     }
 
+    /// A HuggingFace model-search hit.
+    struct CatalogResult: Identifiable, Equatable {
+        let id: String       // the `org/name` NSID
+        let downloads: Int
+    }
+
+    /// Search HuggingFace for MLX models matching `query`, most-downloaded
+    /// first. `filter=mlx` restricts to the MLX library tag so every hit is
+    /// loadable by the agent. Empty on any error (the UI shows "no results").
+    nonisolated static func searchModels(_ query: String) async -> [CatalogResult] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty,
+            let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+            let url = URL(
+                string: "https://huggingface.co/api/models?search=\(encoded)"
+                    + "&filter=mlx&sort=downloads&direction=-1&limit=25")
+        else { return [] }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+            (resp as? HTTPURLResponse)?.statusCode == 200,
+            let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [] }
+        return arr.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            return CatalogResult(id: id, downloads: (item["downloads"] as? NSNumber)?.intValue ?? 0)
+        }
+    }
+
     /// Curated quick-add catalog. `minRamGB` floors mirror the agent's
     /// `pricing::pickable_for_machine`. These are suggestions, not an
     /// allowlist — any MLX-format HuggingFace `org/model` NSID works via
@@ -682,12 +711,38 @@ final class ModelManager: ObservableObject {
 struct ModelsView: View {
     @ObservedObject var manager: ModelManager
     @StateObject private var venv = VenvBootstrapper()
-    @State private var customNSID = ""
     @State private var venvInstalled = VenvBootstrapper.isInstalled
     /// Editor state for per-model schedules; source of truth while editing.
     /// Loaded from UserDefaults on appear, applied (debounced) on change.
     @State private var schedules: [String: ModelManager.Window] = [:]
     @State private var scheduleApplyTask: Task<Void, Never>?
+
+    /// HuggingFace model search (the "Add a model" section).
+    @State private var searchQuery = ""
+    @State private var searchResults: [ModelManager.CatalogResult] = []
+    @State private var searching = false
+    @State private var searchTask: Task<Void, Never>?
+
+    /// Debounced HuggingFace search: the field updates instantly, the network
+    /// query waits ~350ms after the last keystroke.
+    private func runSearch(_ raw: String) {
+        searchTask?.cancel()
+        let query = raw.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else {
+            searchResults = []
+            searching = false
+            return
+        }
+        searching = true
+        searchTask = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if Task.isCancelled { return }
+            let results = await ModelManager.searchModels(query)
+            if Task.isCancelled { return }
+            searchResults = results
+            searching = false
+        }
+    }
 
 
     var body: some View {
@@ -758,26 +813,48 @@ struct ModelsView: View {
             }
 
             Section {
-                ForEach(ModelManager.catalogForDevice, id: \.nsid) { item in
-                    catalogRow(item)
+                HStack(spacing: 8) {
+                    // labelsHidden + prompt: a plain full-width search box with
+                    // an in-field placeholder, not a Form label/value row (which
+                    // would push the typed text to the right and wrap the
+                    // placeholder).
+                    TextField(
+                        "Search", text: $searchQuery,
+                        prompt: Text("Search HuggingFace for MLX models…")
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    if searching { ProgressView().controlSize(.small) }
                 }
-                HStack {
-                    TextField("mlx-community/… (any MLX-format NSID)", text: $customNSID)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Add") {
-                        let n = customNSID.trimmingCharacters(in: .whitespaces)
-                        guard !n.isEmpty else { return }
-                        customNSID = ""
-                        Task { await manager.add(n) }
+
+                if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                    // No query: the curated, device-fit suggestions.
+                    ForEach(ModelManager.catalogForDevice, id: \.nsid) { catalogRow($0) }
+                } else if searchResults.isEmpty && !searching {
+                    Text("No MLX models found for “\(searchQuery.trimmingCharacters(in: .whitespaces))”.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(searchResults) { searchRow($0) }
+                    // Power-user escape hatch: add an exact `org/name` that the
+                    // search didn't surface.
+                    let q = searchQuery.trimmingCharacters(in: .whitespaces)
+                    if q.contains("/"), !searchResults.contains(where: { $0.id == q }) {
+                        HStack {
+                            Text(q)
+                                .font(.system(.callout, design: .monospaced))
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Button("Add exactly") { Task { await manager.add(q) } }
+                                .disabled(manager.busy || manager.models.contains(q))
+                        }
                     }
-                    .disabled(manager.busy || customNSID.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             } header: {
-                Text("Add from catalog")
+                Text("Add a model")
             } footer: {
-                Text("Any MLX-format model works — not just the suggestions above. co/core runs MLX weights (mlx-community/… or another repo with MLX 4-bit weights); stock PyTorch repos won't load. Browse them at [huggingface.co/mlx-community](https://huggingface.co/mlx-community).")
-                    .tint(.accentColor)
+                Text("Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.")
             }
+            .onChange(of: searchQuery) { query in runSearch(query) }
 
             if manager.busy || manager.error != nil || manager.loadStatus != nil {
                 Section {
@@ -920,6 +997,31 @@ struct ModelsView: View {
                 .disabled(manager.busy || manager.models.contains(item.nsid))
         }
         .opacity(fits ? 1 : 0.65)
+    }
+
+    /// One HuggingFace search result: the NSID, its download count, and Add.
+    @ViewBuilder private func searchRow(_ r: ModelManager.CatalogResult) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.id)
+                    .font(.system(.callout, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle)
+                Text("\(Self.formatDownloads(r.downloads)) downloads")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Add") { Task { await manager.add(r.id) } }
+                .disabled(manager.busy || manager.models.contains(r.id))
+        }
+    }
+
+    /// Compact download count, e.g. 1_234_567 → "1.2M", 9_400 → "9.4K".
+    private static func formatDownloads(_ n: Int) -> String {
+        switch n {
+        case 1_000_000...: return String(format: "%.1fM", Double(n) / 1_000_000)
+        case 1_000...: return String(format: "%.1fK", Double(n) / 1_000)
+        default: return "\(n)"
+        }
     }
 
     @ViewBuilder private func scheduleRow(_ m: String) -> some View {
