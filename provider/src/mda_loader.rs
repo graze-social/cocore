@@ -3,7 +3,7 @@
 //! Where `mda.rs` verifies a cert chain, this module *produces* one
 //! to embed in a fresh `dev.cocore.compute.attestation` record.
 //!
-//! Two acquisition strategies, tried in order:
+//! Three acquisition strategies, tried in order:
 //!
 //!   1. **`COCORE_MDA_CERT_CHAIN_PATH`** — path to a PEM file
 //!      containing one or more `-----BEGIN CERTIFICATE-----` blocks.
@@ -14,7 +14,16 @@
 //!      one-shot Swift helper writes the chain to disk and the
 //!      Rust agent picks it up at boot.
 //!
-//!   2. **`COCORE_MDA_ATTEST_BINARY`** — path to an executable. On
+//!   2. **`COCORE_MDA_CHAIN_URL`** — a coordinator URL the Secure
+//!      Mode wizard provisions per device (the device serial baked
+//!      into the query string). At each refresh we `curl` it; the
+//!      response is either a raw PEM chain or JSON
+//!      `{"chain": ["<pem>", …] | null}` (the shape the console's
+//!      `/agent/mdm/attestation-chain` endpoint returns once step-ca
+//!      has captured the device's Apple attestation). A `null`/absent
+//!      chain is "not captured yet" → empty, not an error.
+//!
+//!   3. **`COCORE_MDA_ATTEST_BINARY`** — path to an executable. On
 //!      each attestation refresh we invoke it with no arguments,
 //!      pipe its stdout (expected: PEM-formatted chain), parse the
 //!      blocks. Exit code 0 = success; non-zero or empty stdout =
@@ -81,6 +90,7 @@ use anyhow::{anyhow, bail, Context, Result};
 /// Environment knobs. Lifted to constants so a single grep finds
 /// every consumer.
 pub const ENV_CHAIN_PATH: &str = "COCORE_MDA_CERT_CHAIN_PATH";
+pub const ENV_CHAIN_URL: &str = "COCORE_MDA_CHAIN_URL";
 pub const ENV_ATTEST_BINARY: &str = "COCORE_MDA_ATTEST_BINARY";
 
 /// Max time the attest-binary subprocess may run before we give
@@ -116,6 +126,29 @@ pub fn try_load() -> Vec<Vec<u8>> {
                     path = %path.display(),
                     error = %e,
                     "{ENV_CHAIN_PATH} set but file could not be loaded; falling through",
+                );
+            }
+        }
+    }
+
+    if let Ok(url) = std::env::var(ENV_CHAIN_URL) {
+        match load_from_url(&url) {
+            Ok(chain) if !chain.is_empty() => {
+                tracing::info!(
+                    certs = chain.len(),
+                    "loaded MDA cert chain from coordinator URL",
+                );
+                return chain;
+            }
+            Ok(_) => {
+                tracing::info!(
+                    "{ENV_CHAIN_URL} set but coordinator has no chain captured yet; falling through",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "{ENV_CHAIN_URL} set but fetch failed; falling through",
                 );
             }
         }
@@ -203,6 +236,49 @@ pub fn load_from_binary(binary: &Path) -> Result<Vec<Vec<u8>>> {
     }
     let pem = std::str::from_utf8(&stdout_buf).context("attest binary stdout is not UTF-8")?;
     parse_pem_chain(pem)
+}
+
+/// `curl` the coordinator chain URL and parse the response. We shell out
+/// to curl (rather than pulling in a blocking HTTP client) because
+/// `try_load` runs synchronously at boot and the agent's `reqwest` is
+/// async-only; this mirrors the attest-binary strategy's subprocess shape.
+pub fn load_from_url(url: &str) -> Result<Vec<Vec<u8>>> {
+    use std::process::Command;
+
+    let out = Command::new("curl")
+        .args(["-fsSL", "--max-time", "20", url])
+        .output()
+        .with_context(|| format!("invoking curl for {url}"))?;
+    if !out.status.success() {
+        bail!("curl for MDA chain URL exited with {}", out.status);
+    }
+    let body = String::from_utf8(out.stdout).context("MDA chain URL response is not UTF-8")?;
+    parse_chain_response(&body)
+}
+
+/// Accept either a raw PEM chain or the console's JSON shape
+/// `{"chain": ["<pem>", …] | null, …}`. A null/absent `chain` means the
+/// coordinator hasn't captured this device's attestation yet → empty.
+pub fn parse_chain_response(body: &str) -> Result<Vec<Vec<u8>>> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        let v: serde_json::Value =
+            serde_json::from_str(trimmed).context("MDA chain response looked like JSON but didn't parse")?;
+        match v.get("chain") {
+            Some(serde_json::Value::Array(arr)) => {
+                let joined = arr
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return parse_pem_chain(&joined);
+            }
+            // `chain: null` (not captured yet) or missing → empty, not an error.
+            _ => return Ok(Vec::new()),
+        }
+    }
+    // Raw PEM body.
+    parse_pem_chain(body)
 }
 
 /// Parse one or more PEM CERTIFICATE blocks into their DER bytes.
@@ -295,6 +371,37 @@ mod tests {
         let pem = "\n# just a comment\n";
         let parsed = parse_pem_chain(pem).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_chain_response_accepts_json_chain_array() {
+        let bodies: &[&[u8]] = &[b"leaf bytes", b"intermediate bytes"];
+        let pems: Vec<String> = bodies
+            .iter()
+            .map(|b| synthetic_pem(&[b]))
+            .collect();
+        let json = serde_json::json!({ "status": "ok", "chain": pems }).to_string();
+        let parsed = parse_chain_response(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], bodies[0]);
+        assert_eq!(parsed[1], bodies[1]);
+    }
+
+    #[test]
+    fn parse_chain_response_treats_null_chain_as_empty() {
+        let json = r#"{"status":"pending","chain":null}"#;
+        assert!(parse_chain_response(json).unwrap().is_empty());
+        // missing field too
+        assert!(parse_chain_response(r#"{"status":"pending"}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_chain_response_falls_back_to_raw_pem() {
+        let bodies: &[&[u8]] = &[b"raw-pem-leaf"];
+        let pem = synthetic_pem(bodies);
+        let parsed = parse_chain_response(&pem).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], bodies[0]);
     }
 
     #[test]
