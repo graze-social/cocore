@@ -16,7 +16,7 @@
       <key>PayloadVersion</key><integer>1</integer>
       <key>PayloadIdentifier</key><string>dev.cocore.attestation.acme</string>
       <key>PayloadUUID</key><string>70F86723-D87F-43C2-9ED2-0C3533167C59</string>
-      <key>PayloadDisplayName</key><string>cocore Device Attestation (ACME)</string>
+      <key>PayloadDisplayName</key><string>co/core Device Attestation (ACME)</string>
       <!-- step-ca ACME directory (live: co/core step-ca behind a Railway TCP proxy). -->
       <key>DirectoryURL</key><string>https://reseau.proxy.rlwy.net:43462/acme/cocore-attest/directory</string>
       <!-- PER-DEVICE: ClientIdentifier (the ACME permanent-identifier) AND the
@@ -46,8 +46,8 @@
   <key>PayloadVersion</key><integer>1</integer>
   <key>PayloadIdentifier</key><string>dev.cocore.attestation</string>
   <key>PayloadUUID</key><string>82487B5E-CDD5-46C7-BE3C-511052AA3869</string>
-  <key>PayloadDisplayName</key><string>cocore Provider Attestation</string>
-  <key>PayloadDescription</key><string>Lets this Mac prove to cocore requesters that it is a genuine, securely-booted Apple device.</string>
-  <key>PayloadOrganization</key><string>cocore</string>
+  <key>PayloadDisplayName</key><string>co/core Provider Attestation</string>
+  <key>PayloadDescription</key><string>Lets this Mac prove to co/core requesters that it is a genuine, securely-booted Apple device.</string>
+  <key>PayloadOrganization</key><string>co/core</string>
 </dict>
 </plist>
