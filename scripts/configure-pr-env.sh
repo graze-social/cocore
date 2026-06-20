@@ -28,12 +28,22 @@ CONSOLE_URL="https://console-$ENV.up.railway.app"
 ADVISOR_URL="https://advisor-$ENV.up.railway.app" # HTTP base (server-side /providers, /jobs)
 SERVICES_DID="did:web:services-$ENV.up.railway.app"
 
+# Project the PR envs live in. Passed explicitly on every railway call so this
+# works with no linked project (CI, where only a token is present). Override
+# with RAILWAY_PROJECT_ID.
+PROJECT="${RAILWAY_PROJECT_ID:-a46692ef-f462-4801-9a64-0af69ea7143d}"
+
 note() { printf '  %s\n' "$*"; }
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 
+# Read one variable for a service. Railway's stderr is left visible (so auth /
+# project-context errors surface in CI logs) and non-JSON/empty output is
+# tolerated — the explicit checks below turn an empty result into a clear error.
 get() {
-  railway variables --service "$1" --environment "$ENV" --json 2>/dev/null \
-    | python3 -c "import sys,json;print(json.load(sys.stdin).get('$2') or '')"
+  railway variables --project "$PROJECT" --service "$1" --environment "$ENV" --json \
+    | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('$2') or '')
+except Exception: pass"
 }
 
 bold "==> configuring $ENV"
@@ -59,7 +69,7 @@ SECRET="$(get console COCORE_INTERNAL_SECRET)"
 note "secrets resolved (OAuth key + internal secret)"
 
 # Console: own public URLs + the services DID it service-auths against.
-railway variables --service console --environment "$ENV" --skip-deploys \
+railway variables --project "$PROJECT" --service console --environment "$ENV" --skip-deploys \
   --set "COCORE_ADVISOR_URL=$ADVISOR_URL" \
   --set "COCORE_APPVIEW_DID=$SERVICES_DID" \
   --set "COCORE_APPVIEW_INTERNAL_URL=http://services.railway.internal:8081" \
@@ -70,7 +80,7 @@ railway variables --service console --environment "$ENV" --skip-deploys \
 note "console vars set"
 
 # Services (AppView): own DID, the console it points back at, OAuth key, advisor.
-railway variables --service services --environment "$ENV" --skip-deploys \
+railway variables --project "$PROJECT" --service services --environment "$ENV" --skip-deploys \
   --set "ATPROTO_BASE_URL=$CONSOLE_URL" \
   --set "ATPROTO_PRIVATE_KEY_JWK=$KEY" \
   --set "COCORE_ACCOUNT_DB=/data/account.db" \
@@ -80,9 +90,11 @@ railway variables --service services --environment "$ENV" --skip-deploys \
   --set "CONSOLE_PUBLIC_URL=$CONSOLE_URL" >/dev/null
 note "services vars set"
 
-# Redeploy both from the PR branch source so the new vars take effect.
-railway redeploy --service services --environment "$ENV" --yes >/dev/null 2>&1 || true
-railway redeploy --service console --environment "$ENV" --yes >/dev/null 2>&1 || true
+# Redeploy both so the new vars take effect.
+railway redeploy --project "$PROJECT" --service services --environment "$ENV" --yes >/dev/null \
+  || echo "WARN: services redeploy failed; new vars apply on the next deploy" >&2
+railway redeploy --project "$PROJECT" --service console --environment "$ENV" --yes >/dev/null \
+  || echo "WARN: console redeploy failed; new vars apply on the next deploy" >&2
 bold "==> $ENV configured + redeploying"
 note "console:  $CONSOLE_URL"
 note "advisor:  $ADVISOR_URL"

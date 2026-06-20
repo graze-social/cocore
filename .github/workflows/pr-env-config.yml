@@ -53,7 +53,6 @@ jobs:
             exit 0
           fi
           npm i -g @railway/cli >/dev/null 2>&1
-          # Establish project context for the account/team token. The script
-          # targets --environment/--service per command; link just sets the project.
-          railway link --project a46692ef-f462-4801-9a64-0af69ea7143d >/dev/null 2>&1 || true
+          # No `railway link` needed — configure-pr-env.sh passes --project on
+          # every call, so a token alone (no linked project) is enough in CI.
           PR_NUMBER="${{ github.event.pull_request.number || inputs.pr_number }}" bash scripts/configure-pr-env.sh
