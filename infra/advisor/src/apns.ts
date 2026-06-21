@@ -106,6 +106,20 @@ export interface ApnsSendResult {
 /** How long to wait for the whole APNs round-trip before giving up. */
 const APNS_TIMEOUT_MS = 10_000;
 
+/** Store-and-forward window for the code-identity push (`apns-expiration`).
+ *
+ *  Background pushes (`content-available`, priority 5) are heavily throttled
+ *  per-device; with `apns-expiration: 0` ("deliver this instant or discard")
+ *  a device that's momentarily throttled or asleep drops the challenge outright
+ *  — which is exactly the field symptom (Apple ACKs the push 200, but it's
+ *  never delivered, so no `code-attestation OK` ever comes back). A non-zero
+ *  expiration tells APNs to STORE the push and retry until this deadline, so a
+ *  brief throttle/sleep no longer loses the challenge. Kept comfortably under
+ *  the code re-challenge cadence (~5 min) so a stored push is delivered before
+ *  the next challenge rotates `pendingCodeNonce` and would make a late response
+ *  stale. */
+const CODE_CHALLENGE_EXPIRATION_SECS = 240;
+
 /** Push a sealed code-identity challenge to a provider's device token.
  *
  *  APNs REQUIRES HTTP/2. Node's global `fetch` (undici) is HTTP/1.1 only and
@@ -149,7 +163,10 @@ export async function sendCodeChallenge(
       "apns-topic": cfg.topic,
       "apns-push-type": "background",
       "apns-priority": "5",
-      "apns-expiration": "0",
+      // Store-and-forward (see CODE_CHALLENGE_EXPIRATION_SECS) instead of
+      // deliver-now-or-discard, so a momentarily throttled/asleep device still
+      // gets the challenge.
+      "apns-expiration": String(Math.floor(Date.now() / 1000) + CODE_CHALLENGE_EXPIRATION_SECS),
       "content-type": "application/json",
       "content-length": String(body.length),
     });
