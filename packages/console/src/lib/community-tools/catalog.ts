@@ -23,4 +23,20 @@ export const COMMUNITY_TOOLS_CATALOG: Array<CommunityTool> = [
     ],
     tags: ["pi", "Apple Silicon", "extension"],
   },
+  {
+    id: "cocore-local-gateway",
+    name: "cocore-local-gateway",
+    description:
+      "Exposes locally-running MLX models from a co/core agent as an OpenAI-compatible API endpoint over TCP — bridging the agent's Unix sockets to localhost and overlay networks (ZeroTier, Tailscale) without routing through the co/core network.",
+    repoUrl: "https://github.com/tenorune/cocore-local-gateway",
+    install:
+      "git clone https://github.com/tenorune/cocore-local-gateway\ncd cocore-local-gateway\ncp .env.example .env\n./install.sh",
+    setup: [
+      "Configure .env with the port, bind interfaces, and socket directory.",
+      "Run install.sh to load it as a LaunchAgent (auto-starts on macOS).",
+      "Verify with: curl -s http://127.0.0.1:1234/v1/models | python3 -m json.tool",
+      "Point your OpenAI-compatible clients (OpenCode, pi, OFF GRID) at the gateway endpoint.",
+    ],
+    tags: ["OpenAI API", "MLX", "gateway", "macOS"],
+  },
 ];
