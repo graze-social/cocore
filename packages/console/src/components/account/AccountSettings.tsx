@@ -2,7 +2,7 @@
 
 import * as stylex from "@stylexjs/stylex";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { CircleHelp } from "lucide-react";
 import { useMemo, useState } from "react";
 
@@ -10,9 +10,11 @@ import { highlightCodeQueryOptions } from "@/components/account/account.function
 import {
   deleteMyApiKeyMutationOptions,
   listMyApiKeysQueryOptions,
+  resetConnectionMutationOptions,
   revokeMyApiKeyMutationOptions,
   wipeMyDataMutationOptions,
 } from "@/components/api-keys/api-keys.functions.ts";
+import { clearChatStoreMemory } from "@/components/chat/chat-store.ts";
 import { CreateApiKeyButton } from "@/components/api-keys/CreateApiKeyButton.tsx";
 import { ProfileCard } from "@/components/account/ProfileCard.tsx";
 import { TokenBalanceCard } from "@/components/account/TokenBalanceCard.tsx";
@@ -217,6 +219,7 @@ function statusOf(row: {
 
 export function AccountSettings() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data: session } = useQuery(getSessionQueryOptions);
   const { mode, setMode } = useThemeMode();
 
@@ -224,8 +227,10 @@ export function AccountSettings() {
   const revokeM = useMutation(revokeMyApiKeyMutationOptions);
   const deleteM = useMutation(deleteMyApiKeyMutationOptions);
   const wipeM = useMutation(wipeMyDataMutationOptions);
+  const resetM = useMutation(resetConnectionMutationOptions);
 
   const [wipeOpen, setWipeOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
 
   const onRevoke = (id: string, name: string) => {
     revokeM.mutate(
@@ -267,6 +272,26 @@ export function AccountSettings() {
         queryClient.invalidateQueries({ queryKey: listMyApiKeysQueryOptions.queryKey });
       },
       onError: (e) => showToast(e instanceof Error ? e.message : "Wipe failed"),
+    });
+  };
+
+  const onReset = () => {
+    resetM.mutate(undefined, {
+      onSuccess: async () => {
+        // The server fn cleared the auth cookie, so the browser is now
+        // signed out. Send the user through a fresh login — that OAuth
+        // handshake is what re-establishes a working write session.
+        // Mirror the navbar logout teardown so no stale user-scoped
+        // cache lingers.
+        showToast("Connection reset — sign in again to finish");
+        setResetOpen(false);
+        clearChatStoreMemory();
+        queryClient.setQueryData(getSessionQueryOptions.queryKey, null);
+        await navigate({ to: "/login", search: { redirect: "/account" } });
+        queryClient.clear();
+        queryClient.setQueryData(getSessionQueryOptions.queryKey, null);
+      },
+      onError: (e) => showToast(e instanceof Error ? e.message : "Reset failed"),
     });
   };
 
@@ -511,6 +536,59 @@ export function AccountSettings() {
                 }}
               </TableBody>
             </Table>
+          </Card>
+          <Card size="md">
+            <CardHeader hasBorder>
+              <CardTitle style={styles.cardTitleMono}>Reset connection</CardTitle>
+              <CardDescription style={styles.cardDescription}>
+                Stuck with 401s from your agent? Rebuild your sign-in and keys without touching any
+                of your data.
+              </CardDescription>
+            </CardHeader>
+            <CardBody>
+              <Dialog
+                isOpen={resetOpen}
+                onOpenChange={setResetOpen}
+                trigger={
+                  <Button variant="secondary" size="sm">
+                    Reset connection
+                  </Button>
+                }
+              >
+                <DialogHeader>Reset your co/core connection?</DialogHeader>
+                <DialogBody>
+                  <DialogDescription>
+                    Revokes every API key you&apos;ve minted and drops your stored ATProto write
+                    session, then signs you out so you can sign back in fresh. This fixes a wedged
+                    agent (401 <InlineCode>invalid API key</InlineCode> /{" "}
+                    <InlineCode>AuthRequired</InlineCode>) — none of your{" "}
+                    <InlineCode>dev.cocore.*</InlineCode> PDS records, receipts, or indexed history
+                    are touched. Quit any running co/core agents first, then after you sign back in
+                    run <InlineCode>cocore agent pair</InlineCode> to re-link your machine.
+                  </DialogDescription>
+                </DialogBody>
+                <DialogFooter>
+                  <Flex direction="row" gap="md">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onPress={() => setResetOpen(false)}
+                      isDisabled={resetM.isPending}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      isDisabled={resetM.isPending}
+                      onPress={onReset}
+                    >
+                      {resetM.isPending ? "Resetting…" : "Reset connection"}
+                    </Button>
+                  </Flex>
+                </DialogFooter>
+              </Dialog>
+            </CardBody>
           </Card>
           <Card size="md">
             <CardHeader hasBorder>

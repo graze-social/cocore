@@ -144,6 +144,18 @@ export function deleteKey(input: { id: string; did: string }): boolean {
   return result.changes > 0;
 }
 
+/** Revoke every still-active key for a DID in one shot. Used by the
+ *  "reset connection" repair flow to invalidate a wedged agent key
+ *  without the user hunting through their key list. Revoked rows stay
+ *  with `revoked_at` set so the audit trail survives. Returns the count
+ *  revoked. */
+export function revokeAllKeysForDid(did: string): number {
+  const result = consoleDb()
+    .prepare(`UPDATE api_keys SET revoked_at = ? WHERE did = ? AND revoked_at IS NULL`)
+    .run(new Date().toISOString(), did);
+  return result.changes;
+}
+
 export interface ResolvedKey {
   id: string;
   did: string;

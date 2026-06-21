@@ -638,6 +638,40 @@ export function buildAppviewHandler(store: Store, opts: BuildServerOptions = {})
       const out = accountStore.createKey({ did: body.did, name });
       json(res, 200, { key: out.key, secret: out.secret });
     };
+
+    // Reset a DID's operational auth state: revoke every API key and drop
+    // the stored OAuth session. The console calls this (browser-authed to
+    // the DID) as the AppView half of "reset connection" — the repair flow
+    // that clears a wedged session/key without deleting any PDS records.
+    // Deliberately does NOT touch receipts or the firehose-indexed cache.
+    routes["/internal/account/reset-did"] = async (req, res) => {
+      if (req.method !== "POST") {
+        json(res, 405, { error: "MethodNotAllowed" });
+        return;
+      }
+      const presented = req.headers["x-cocore-internal-secret"];
+      if (typeof presented !== "string" || !secretEquals(presented, secret)) {
+        json(res, 403, { error: "Forbidden" });
+        return;
+      }
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      let body: { did?: unknown };
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as typeof body;
+      } catch {
+        json(res, 400, { error: "InvalidRequest", message: "body must be JSON" });
+        return;
+      }
+      if (typeof body.did !== "string" || !body.did.startsWith("did:")) {
+        json(res, 400, { error: "InvalidRequest", message: "did required" });
+        return;
+      }
+      const keysRevoked = accountStore.revokeAllKeysForDid(body.did);
+      accountStore.deleteOAuthSession(body.did);
+      console.error(`appview: reset auth state for ${body.did} (${keysRevoked} keys revoked)`);
+      json(res, 200, { ok: true, keysRevoked });
+    };
   }
 
   // Device pairing: in-memory pair-store + start/poll (public, agent-facing)

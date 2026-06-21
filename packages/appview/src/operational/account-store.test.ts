@@ -67,6 +67,22 @@ describe("AccountStore api keys", () => {
     expect(mine).toHaveLength(1);
     expect(mine[0]?.name).toBe("a");
   });
+
+  it("revokeAllKeysForDid revokes only the DID's active keys and is idempotent", () => {
+    const s = freshStore();
+    const a = s.createKey({ did: DID, name: "a" });
+    const b = s.createKey({ did: DID, name: "b" });
+    s.createKey({ did: OTHER, name: "c" });
+
+    // Revokes both of DID's keys, leaving OTHER's untouched.
+    expect(s.revokeAllKeysForDid(DID)).toBe(2);
+    expect(s.resolveBearerKey(a.secret)).toBeNull();
+    expect(s.resolveBearerKey(b.secret)).toBeNull();
+    expect(s.listKeysForDid(OTHER)[0]?.revokedAt).toBeNull();
+
+    // Already-revoked keys aren't counted again.
+    expect(s.revokeAllKeysForDid(DID)).toBe(0);
+  });
 });
 
 describe("AccountStore oauth sessions", () => {

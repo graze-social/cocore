@@ -186,6 +186,17 @@ export class AccountStore {
     return result.changes > 0;
   }
 
+  /** Revoke every still-active key for a DID. Used by the "reset
+   *  connection" repair flow: a wedged agent key is invalidated in one
+   *  shot without hunting per-key. Revoked rows stay (with `revoked_at`
+   *  set) so the audit trail survives. Returns the number revoked. */
+  revokeAllKeysForDid(did: string): number {
+    const result = this.db
+      .prepare(`UPDATE api_keys SET revoked_at = ? WHERE did = ? AND revoked_at IS NULL`)
+      .run(new Date().toISOString(), did);
+    return result.changes;
+  }
+
   /** Validate a presented bearer token: format, hash lookup, expiry,
    *  revocation. On success, bumps `last_used_at` and returns the owning
    *  DID. Returns null on any failure (caller should respond 401; the

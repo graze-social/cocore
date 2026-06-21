@@ -51,6 +51,45 @@ export async function handOffSessionToAppview(did: string): Promise<boolean> {
   }
 }
 
+export interface AppviewResetResult {
+  /** Whether the handoff was configured + attempted at all. */
+  attempted: boolean;
+  /** Whether the AppView reported a successful reset. */
+  ok: boolean;
+  /** Keys the AppView revoked in its own store (0 if not attempted). */
+  keysRevoked: number;
+}
+
+/** Reset a DID's auth state on the AppView: revoke its keys + drop its
+ *  stored OAuth session. The AppView half of "reset connection" — needed
+ *  because post-cutover the authoritative write session (and minted keys)
+ *  live in the AppView's account store, not the console's. Best-effort and
+ *  gated on COCORE_APPVIEW_INTERNAL_URL + COCORE_INTERNAL_SECRET; a missing
+ *  config or a failure never throws (the console-side reset still stands). */
+export async function resetConnectionOnAppview(did: string): Promise<AppviewResetResult> {
+  const base = process.env["COCORE_APPVIEW_INTERNAL_URL"]?.replace(/\/$/, "");
+  const secret = process.env["COCORE_INTERNAL_SECRET"];
+  if (!base || !secret) return { attempted: false, ok: false, keysRevoked: 0 };
+
+  try {
+    const res = await fetch(`${base}/internal/account/reset-did`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-cocore-internal-secret": secret },
+      body: JSON.stringify({ did }),
+    });
+    if (!res.ok) {
+      console.warn(`[appview-reset] AppView returned ${res.status} for ${did}`);
+      return { attempted: true, ok: false, keysRevoked: 0 };
+    }
+    const body = (await res.json()) as { keysRevoked?: number };
+    console.log(`[appview-reset] reset auth state for ${did} on AppView`);
+    return { attempted: true, ok: true, keysRevoked: body.keysRevoked ?? 0 };
+  } catch (e) {
+    console.warn(`[appview-reset] reset failed for ${did}:`, (e as Error).message);
+    return { attempted: true, ok: false, keysRevoked: 0 };
+  }
+}
+
 export interface SessionMigrationResult {
   total: number;
   pushed: number;
