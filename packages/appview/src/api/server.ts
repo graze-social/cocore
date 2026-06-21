@@ -25,7 +25,7 @@ import { buildDevicePairRouter } from "../devicepair/routes.ts";
 import { PairStore } from "../devicepair/pair-store.ts";
 import { buildInferenceRouter } from "../inference/routes.ts";
 import { AccountStore } from "../operational/account-store.ts";
-import { buildInternalPdsRouter, buildPdsRouter } from "../pds/write.ts";
+import { buildInternalPdsRouter, buildPdsRouter, buildProxyAliasRouter } from "../pds/write.ts";
 import { Store } from "../store.ts";
 import { buildAccountRouter } from "./account-routes.ts";
 import { buildAgentBugReportRouter } from "./agent-bug-report.ts";
@@ -207,10 +207,16 @@ function buildAppviewRouters(
     const pctx = { accounts: opts.accountStore, oauth, bridgeUrl: opts.bridgeUrl };
     const pds = buildPdsRouter(pctx);
     routers.push(pds, pds.pipe(HttpRouter.prefixAll("/api")));
+    // Deprecated legacy alias: agents still on the pre-cutover
+    // `/api/xrpc/dev.cocore.proxy.*` path point apiBase here and were 404ing.
+    // Same bearer auth + write cores as `/api/pds/*`; remove once usage drains
+    // (watch the `deprecated.proxyAlias` span attribute).
+    const proxyAlias = buildProxyAliasRouter(pctx);
+    routers.push(proxyAlias, proxyAlias.pipe(HttpRouter.prefixAll("/api")));
     if (opts.internalSecret)
       internalRouters.push(buildInternalPdsRouter(pctx, opts.internalSecret));
     console.error(
-      `appview: /pds write endpoints enabled${opts.internalSecret ? " (+ /internal/pds)" : ""}`,
+      `appview: /pds write endpoints enabled${opts.internalSecret ? " (+ /internal/pds)" : ""} (+ deprecated dev.cocore.proxy.* aliases)`,
     );
   }
 

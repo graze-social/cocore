@@ -4,7 +4,7 @@ import { HttpRouter } from "@effect/platform";
 import { AccountStore } from "../operational/account-store.ts";
 import type { AppviewOAuthClient } from "../auth/oauth-client.ts";
 import { withAppviewServer } from "../api/http-app.ts";
-import { buildInternalPdsRouter, buildPdsRouter } from "./write.ts";
+import { buildInternalPdsRouter, buildPdsRouter, buildProxyAliasRouter } from "./write.ts";
 
 const ALICE = "did:plc:alice";
 const INTERNAL_SECRET = "test-internal-secret";
@@ -67,9 +67,13 @@ async function withServer(
   const accounts = new AccountStore(":memory:");
   const { secret } = accounts.createKey({ did: ALICE, name: "agent" });
   const ctx = { accounts, oauth: oauth ?? fakeOauth() };
+  const proxyAlias = buildProxyAliasRouter(ctx);
   const router = HttpRouter.empty.pipe(
     HttpRouter.concat(buildPdsRouter(ctx)),
     HttpRouter.concat(buildInternalPdsRouter(ctx, INTERNAL_SECRET)),
+    // Mirror server.ts: the deprecated proxy alias is served bare and under /api.
+    HttpRouter.concat(proxyAlias),
+    HttpRouter.concat(proxyAlias.pipe(HttpRouter.prefixAll("/api"))),
   );
   await withAppviewServer(router, (base) => fn(base, secret));
 }
@@ -157,6 +161,49 @@ describe("/pds/* write endpoints", () => {
   it("405s on the wrong method", async () => {
     await withServer(undefined, async (base) => {
       expect((await fetch(`${base}/pds/createRecord`)).status).toBe(405);
+    });
+  });
+});
+
+describe("deprecated dev.cocore.proxy.* aliases", () => {
+  // These are the exact paths older agents (apiBase → AppView) still POST to;
+  // they were 404ing before the alias was mounted. Same auth + cores as /pds/*.
+  it("putRecord works at /api/xrpc/dev.cocore.proxy.putRecord (the live 404 path)", async () => {
+    await withServer(undefined, async (base, secret) => {
+      const r = await post(base, "/api/xrpc/dev.cocore.proxy.putRecord", secret, {
+        collection: "dev.cocore.compute.provider",
+        rkey: "self",
+        record: { a: 1 },
+      });
+      expect(r.status).toBe(200);
+      expect(((await r.json()) as { uri: string }).uri).toContain("/self");
+    });
+  });
+
+  it("createRecord + deleteRecord are served under the proxy alias", async () => {
+    await withServer(undefined, async (base, secret) => {
+      const created = await post(base, "/api/xrpc/dev.cocore.proxy.createRecord", secret, {
+        collection: "dev.cocore.compute.receipt",
+        record: { foo: 1 },
+      });
+      expect(created.status).toBe(200);
+
+      const deleted = await post(base, "/api/xrpc/dev.cocore.proxy.deleteRecord", secret, {
+        collection: "dev.cocore.account.profile",
+        rkey: "self",
+      });
+      expect(deleted.status).toBe(200);
+    });
+  });
+
+  it("still enforces bearer auth on the alias", async () => {
+    await withServer(undefined, async (base) => {
+      const r = await post(base, "/api/xrpc/dev.cocore.proxy.putRecord", null, {
+        collection: "dev.cocore.compute.provider",
+        rkey: "self",
+        record: {},
+      });
+      expect(r.status).toBe(401);
     });
   });
 });

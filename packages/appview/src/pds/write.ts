@@ -19,13 +19,15 @@
 // Only `dev.cocore.*` collections are writable.
 //
 // These are an @effect/platform HttpRouter: each route is an Effect that
-// returns an HttpServerResponse. The two builders expose CANONICAL paths
-// only (`/pds/*` and `/internal/pds/*`); the parent re-adds the legacy
-// `/api/*` and `/api/xrpc/dev.cocore.proxy.*` aliases at assembly via
-// `HttpRouter.prefixAll`. Because this is a write proxy, every distinct
-// error path is preserved exactly: 401 (bad bearer / dead session), 400
-// (bad body / args / missing did), 403 (bad internal secret), and the
-// upstream PDS status passed through (5xx collapsed to 502).
+// returns an HttpServerResponse. `buildPdsRouter` exposes the CANONICAL
+// `/pds/*` paths and the parent re-adds the `/api/*` alias via
+// `HttpRouter.prefixAll`. `buildProxyAliasRouter` exposes the DEPRECATED
+// legacy `dev.cocore.proxy.*` XRPC paths (same bearer auth, same write
+// cores) so agents built before the `/api/pds/*` cutover keep writing
+// while they upgrade — see its doc comment. Because this is a write
+// proxy, every distinct error path is preserved exactly: 401 (bad bearer
+// / dead session), 400 (bad body / args / missing did), 403 (bad internal
+// secret), and the upstream PDS status passed through (5xx collapsed to 502).
 
 import type { Did } from "@atcute/lexicons";
 import { timingSafeEqual } from "node:crypto";
@@ -424,6 +426,36 @@ export function buildPdsRouter(ctx: PdsWriteContext): HttpRouter.HttpRouter<neve
     HttpRouter.all("/pds/createRecord", bearerRoute(ctx, "createRecord", parseCreate, doCreate)),
     HttpRouter.all("/pds/putRecord", bearerRoute(ctx, "putRecord", parsePut, doPut)),
     HttpRouter.all("/pds/deleteRecord", bearerRoute(ctx, "deleteRecord", parseDelete, doDelete)),
+  );
+}
+
+/** DEPRECATED legacy aliases: `dev.cocore.proxy.{create,put,delete}Record`.
+ *  Mounted (with the parent's `/api` prefix) at
+ *  `/api/xrpc/dev.cocore.proxy.*` to match the path the console served
+ *  before the `/api/pds/*` cutover. They reuse the same bearer-authed
+ *  write cores as {@link buildPdsRouter}, so behavior is identical — only
+ *  the URL differs. They exist solely so agents still on the old path keep
+ *  writing while they upgrade; the canonical surface is `/api/pds/*`.
+ *
+ *  Removal plan: these stay until usage drains. Watch
+ *  `url.path = /api/xrpc/dev.cocore.proxy.*` (or the `deprecated.proxyAlias`
+ *  span attribute) in Honeycomb; once it hits zero across a release cycle,
+ *  delete this builder and its mount in server.ts. Do NOT add new callers. */
+export function buildProxyAliasRouter(ctx: PdsWriteContext): HttpRouter.HttpRouter<never, never> {
+  const tag = Effect.annotateCurrentSpan("deprecated.proxyAlias", true);
+  return HttpRouter.empty.pipe(
+    HttpRouter.all(
+      "/xrpc/dev.cocore.proxy.createRecord",
+      Effect.zipRight(tag, bearerRoute(ctx, "createRecord", parseCreate, doCreate)),
+    ),
+    HttpRouter.all(
+      "/xrpc/dev.cocore.proxy.putRecord",
+      Effect.zipRight(tag, bearerRoute(ctx, "putRecord", parsePut, doPut)),
+    ),
+    HttpRouter.all(
+      "/xrpc/dev.cocore.proxy.deleteRecord",
+      Effect.zipRight(tag, bearerRoute(ctx, "deleteRecord", parseDelete, doDelete)),
+    ),
   );
 }
 
