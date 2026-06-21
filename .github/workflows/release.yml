@@ -128,10 +128,20 @@ jobs:
             DYLIB="$MLX_DIR/libCoCoreMLX.dylib"
             [ -f "$DYLIB" ] || { echo "::error::native build but $DYLIB missing"; exit 1; }
             cp "$DYLIB" "$STAGE/bin/libCoCoreMLX.dylib"
-            METALLIB="$(find "$MLX_DIR" -name '*.metallib' -print -quit)"
-            [ -n "$METALLIB" ] || { echo "::error::native build but no *.metallib under $MLX_DIR"; exit 1; }
-            cp "$METALLIB" "$STAGE/bin/$(basename "$METALLIB")"
-            echo "staged native engine: libCoCoreMLX.dylib + $(basename "$METALLIB")"
+            # The metallib (GPU kernels) is NOT emitted by `swift build` —
+            # mlx-swift excludes the kernels (PrepareMetalShaders); only
+            # `xcodebuild` compiles them into Cmlx's default.metallib. Build the
+            # engine via xcodebuild purely to obtain it, then colocate it as
+            # mlx.metallib (MLX's first-choice load path) — precompiled + signed,
+            # no runtime JIT. Mirrors scripts/build-mac-app.sh.
+            ( cd provider/mlx-engine && xcodebuild -scheme CoCoreMLX \
+                -destination 'platform=macOS,arch=arm64' -configuration Release \
+                -derivedDataPath .xcbuild-metallib build >/dev/null ) \
+              || { echo "::error::metallib compile (xcodebuild) failed"; exit 1; }
+            METALLIB="$(find provider/mlx-engine/.xcbuild-metallib -path '*Cmlx*' -name 'default.metallib' -print -quit)"
+            [ -n "$METALLIB" ] || { echo "::error::native build but xcodebuild produced no default.metallib"; exit 1; }
+            cp "$METALLIB" "$STAGE/bin/mlx.metallib"
+            echo "staged native engine: libCoCoreMLX.dylib + mlx.metallib"
           fi
       - name: Extract + publish cdHash (secure/native release only)
         # The confidential tier trusts a build by its code-signing cdHash. We

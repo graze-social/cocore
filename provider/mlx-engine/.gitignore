@@ -1,3 +1,5 @@
 .build/
 .swiftpm/
 *.metallib
+.xcbuild/
+.xcbuild-metallib/

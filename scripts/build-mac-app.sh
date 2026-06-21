@@ -188,14 +188,34 @@ if [[ "$COCORE_BUILD_NATIVE" == "1" ]]; then
   [[ -f "$DYLIB" ]] || die "native build: $DYLIB not found (did 'swift build --product CoCoreMLX' run?)"
   install -m 755 "$DYLIB" "$APP/Contents/MacOS/libCoCoreMLX.dylib"
   note "bundled libCoCoreMLX.dylib"
-  # The precompiled mlx.metallib ships beside the dylib (SwiftPM places Cmlx's
-  # metallib under .build; it may live directly in the build dir or inside a
-  # *.bundle). Copy the first match next to the CLI so the engine finds it.
-  METALLIB="$(find "$MLX_BUILD_DIR" -name '*.metallib' -print -quit 2>/dev/null || true)"
+
+  # The precompiled metallib (the GPU kernels that touch plaintext). CRUCIAL:
+  # plain `swift build` (what build.rs runs to make the dylib) does NOT compile
+  # MLX's Metal shaders — mlx-swift's Package.swift excludes the kernels dir
+  # (the `PrepareMetalShaders` exclusion), so no metallib is emitted under
+  # .build. Only `xcodebuild` runs that phase, compiling them into
+  # `mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib`. We therefore
+  # build the engine a second way (xcodebuild) purely to obtain the metallib,
+  # then colocate it next to the agent as `mlx.metallib` — MLX's device.cpp
+  # first-choice load path (see MLXEngine.locateMetallib) — so inference runs
+  # from a PRECOMPILED, signed metallib with no runtime shader JIT
+  # (allow-jit=false holds). Its SHA-256 is pinned into the attestation
+  # (metallibHash) by extract-cdhash.sh.
+  bold "==> compile MLX metallib (xcodebuild PrepareMetalShaders — swift build skips it)"
+  MLX_ENGINE_DIR="$REPO_ROOT/provider/mlx-engine"
+  XCBUILD_DIR="$MLX_ENGINE_DIR/.xcbuild-metallib"
+  ( cd "$MLX_ENGINE_DIR" && xcodebuild -scheme CoCoreMLX \
+      -destination 'platform=macOS,arch=arm64' -configuration Release \
+      -derivedDataPath "$XCBUILD_DIR" build >/dev/null 2>&1 ) \
+    || die "metallib compile failed (xcodebuild -scheme CoCoreMLX). The confidential tier can't load GPU kernels without it."
+  # PrepareMetalShaders emits default.metallib inside the Cmlx resource bundle.
+  METALLIB="$(find "$XCBUILD_DIR" -path '*Cmlx*' -name 'default.metallib' -print -quit 2>/dev/null || true)"
   [[ -n "$METALLIB" && -f "$METALLIB" ]] \
-    || die "native build: no *.metallib under $MLX_BUILD_DIR — the confidential tier can't load GPU kernels without it."
-  install -m 644 "$METALLIB" "$APP/Contents/MacOS/$(basename "$METALLIB")"
-  note "bundled $(basename "$METALLIB")"
+    || METALLIB="$(find "$XCBUILD_DIR" -name 'default.metallib' -print -quit 2>/dev/null || true)"
+  [[ -n "$METALLIB" && -f "$METALLIB" ]] \
+    || die "native build: xcodebuild produced no default.metallib under $XCBUILD_DIR — cannot bundle the confidential GPU kernels."
+  install -m 644 "$METALLIB" "$APP/Contents/MacOS/mlx.metallib"
+  note "bundled mlx.metallib ($(du -h "$METALLIB" | cut -f1), from $(basename "$(dirname "$METALLIB")"))"
 fi
 
 # Bundle the Python-venv bootstrap script so a download-only install can
@@ -247,17 +267,36 @@ else
   # CLI's dylib graph, so they sign FIRST. The dylib is signed with the SAME
   # Developer ID as the CLI so the CLI's enforced library validation
   # (--options runtime,library) accepts it; if the team differs, the loader
-  # refuses it and the confidential tier won't come up. (The .metallib is a
-  # data blob, not Mach-O — codesign treats it as a resource sealed by the app
-  # signature; we hash it separately for the attestation, so no per-file
-  # codesign is needed there.)
+  # refuses it and the confidential tier won't come up.
+  #
+  # The .metallib is NOT a passive resource: `file` reports it as a
+  # "MetalLib executable (MacOS)" (Mach-O-based), and sitting in Contents/MacOS/
+  # codesign treats it as a nested code object — an UNSIGNED one breaks the
+  # app-level sign ("code object is not signed at all / In subcomponent
+  # mlx.metallib"). So we sign it explicitly too (runtime + timestamp; no
+  # library-validation flag — it isn't a linked dylib). Its SHA-256 is still
+  # hashed separately for the attestation (metallibHash); signing doesn't change
+  # the file bytes the hash covers.
   if [[ "$COCORE_BUILD_NATIVE" == "1" ]]; then
     codesign --force --options runtime,library --timestamp \
       --sign "$COCORE_SIGN_ID" "$APP/Contents/MacOS/libCoCoreMLX.dylib" 2>&1 | sed 's/^/  /' \
       || die "codesign (libCoCoreMLX.dylib) failed"
     note "signed native MLX engine dylib (library validation)"
+    codesign --force --options runtime --timestamp \
+      --sign "$COCORE_SIGN_ID" "$APP/Contents/MacOS/mlx.metallib" 2>&1 | sed 's/^/  /' \
+      || die "codesign (mlx.metallib) failed"
+    note "signed mlx.metallib"
   fi
-  codesign --force --options runtime --timestamp \
+  # The agent (cocore) must carry CS_REQUIRE_LV for the confidential tier: its
+  # runtime attestation reports `libraryValidation` from this flag, and the
+  # verifier's confidential gate REQUIRES it true. `--options runtime` alone
+  # leaves it unset → libraryValidation reads false → the tier never qualifies
+  # (S3 spike finding). Add `library` for the native build. Default
+  # (subprocess) builds keep plain `runtime` so their signing is unchanged —
+  # they make no confidential claim and the agent dlopens no third-party code.
+  COCORE_CLI_OPTS="runtime"
+  [[ "$COCORE_BUILD_NATIVE" == "1" ]] && COCORE_CLI_OPTS="runtime,library"
+  codesign --force --options "$COCORE_CLI_OPTS" --timestamp \
     --sign "$COCORE_SIGN_ID" "$APP/Contents/MacOS/cocore" 2>&1 | sed 's/^/  /' \
     || die "codesign (bundled cocore CLI) failed"
   codesign --force --options runtime --timestamp \
