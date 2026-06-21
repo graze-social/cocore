@@ -313,9 +313,8 @@ fn is_swap_conflict(e: &cocore_provider::error::ProviderError) -> bool {
 async fn read_my_desired_tier() -> Option<String> {
     let session = oauth::load_session().ok()??;
     let pds = PdsClient::new(session);
-    let pubkey = secure_enclave::load_or_create_identity()
-        .ok()?
-        .public_key_b64();
+    let signer = secure_enclave::load_or_create_identity().ok()?;
+    let pubkey = signer.public_key_b64();
     let (_rkey, value, _cid) = find_my_provider_record(&pds, &pubkey).await.ok()?;
     value
         .get("desiredTier")
@@ -644,7 +643,8 @@ async fn cmd_serve_entry(advisor: String) -> Result<()> {
     // (The macOS supervisor normally only spawns this binary for confidential
     // machines via `agent tier`; this in-process gate is the backstop so a
     // stale/raced spawn can never silently flip a machine's behaviour.)
-    let confidential = read_my_desired_tier().await.as_deref() == Some("attested-confidential");
+    let desired_tier = read_my_desired_tier().await;
+    let confidential = desired_tier.as_deref() == Some("attested-confidential");
     if !confidential {
         tracing::info!(
             "desiredTier is not attested-confidential — serving best-effort (no push host, subprocess engine)"
@@ -780,14 +780,15 @@ async fn prepare_native_confidential_model() {
 /// `spawn_blocking`.
 #[cfg(all(target_os = "macos", feature = "apns"))]
 fn download_hf_snapshot(venv_python: &std::path::Path, model: &str) -> Option<String> {
-    // `{model:?}` emits a correctly-quoted/escaped Rust string literal, which is
-    // also a valid Python double-quoted literal for HuggingFace model ids.
-    let code = format!(
-        "from huggingface_hub import snapshot_download; print(snapshot_download({model:?}))"
-    );
+    // Pass the model id as argv (sys.argv[1]) instead of interpolating it into
+    // the snippet — no quoting/injection edge cases, and the snippet stays a
+    // plain string literal (which rustfmt never reflows).
+    let code =
+        "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))";
     let out = std::process::Command::new(venv_python)
         .arg("-c")
-        .arg(&code)
+        .arg(code)
+        .arg(model)
         // Accelerated parallel download (hf_transfer is installed by
         // scripts/bootstrap-python-venv.sh alongside vllm-mlx).
         .env("HF_HUB_ENABLE_HF_TRANSFER", "1")
