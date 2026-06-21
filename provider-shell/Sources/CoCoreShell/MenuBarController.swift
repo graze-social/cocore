@@ -49,10 +49,23 @@ final class MenuBarController {
         self.supervisor = supervisor
         self.updater = updater
         self.item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // A stable autosave name gives the item a persistent identity in the
+        // menu bar, so macOS manages its slot instead of handing it a phantom
+        // position (the symptom of an unmanaged item: it never renders).
+        item.autosaveName = "dev.cocore.shell.status"
         item.button?.image = MenuBarController.brandImage()
         item.button?.toolTip = "co/core"
         refreshServing()
         rebuildMenu()
+
+        // Some macOS builds create the item but never lay it into the bar
+        // (it reports a slot but draws nothing). Toggling visibility once the
+        // bar has settled forces a re-layout that lands it in a real slot.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.item.isVisible = false
+            self.item.isVisible = true
+        }
 
         // Apply any Pause done on the website while the app was closed.
         Task { @MainActor in await self.reconcileServeSwitch() }
@@ -498,6 +511,28 @@ final class MenuBarController {
         onUninstall: { [weak self] in self?.confirmUninstall() }
     )
     @objc private func openMainWindow() { mainWindow.show() }
+
+    /// Public entry point so the AppDelegate can surface the main window when
+    /// the app is re-launched (the dock/Finder "reopen" path) — the safety net
+    /// for when the status item never made it onto the menu bar and the tray
+    /// menu (the only other way in) is unreachable.
+    func showMainWindow() { mainWindow.show() }
+
+    /// True once `NSStatusBar` has actually placed our item in the menu bar.
+    /// A stranded item (macOS occasionally fails to assign it a slot) still
+    /// has a button window — it's just parked off-screen — so a nil-window
+    /// check isn't enough. A real placement sits in the menu-bar band at the
+    /// top of a screen; anything else is our cue to fall back to opening the
+    /// main window so this menu-bar-only app stays reachable.
+    var statusItemPlaced: Bool {
+        guard let win = item.button?.window else { return false }
+        let screen = win.screen ?? NSScreen.main
+        guard let frame = screen?.frame else { return false }
+        // AppKit is bottom-left origin: a placed item's window hugs the top of
+        // the screen, so its top edge lands within a menu-bar height of the
+        // screen's top edge. A stranded item is parked far below that.
+        return win.frame.maxY >= frame.maxY - 30 && frame.intersects(win.frame)
+    }
 
     private lazy var welcomeWindow: WelcomeWindowController = {
         let c = WelcomeWindowController(state: state, supervisor: supervisor)

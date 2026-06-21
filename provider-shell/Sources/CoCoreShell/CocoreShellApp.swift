@@ -48,6 +48,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 60 * 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.updater.check() }
         }
+        // Safety net for a stranded status item: macOS occasionally creates
+        // the NSStatusItem but never assigns it a visible menu-bar slot, which
+        // leaves this menu-bar-only app with no way in (the tray menu is the
+        // sole entry point). Placement is async, so give the bar a moment to
+        // settle before judging; if we still never landed, open the main window
+        // (which promotes to .regular) so the app is reachable via Dock/Cmd-Tab.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, let menu = self.menu, !menu.statusItemPlaced else { return }
+            NSLog("cocore: status item not placed on menu bar; opening main window as fallback")
+            menu.showMainWindow()
+        }
         Task { @MainActor in
             await state.refreshSession()
             // First-run onboarding: walk a not-yet-paired user through
@@ -62,6 +73,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await supervisor.start()
             }
         }
+    }
+
+    /// Re-launching the app (double-clicking it in Finder while it's already
+    /// running, or clicking a Dock icon) routes here. As a menu-bar-only app
+    /// the default is a silent no-op — which reads as "it won't launch" when
+    /// the tray icon is missing. Surface the main window instead so there's
+    /// always a way in.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows { menu?.showMainWindow() }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
