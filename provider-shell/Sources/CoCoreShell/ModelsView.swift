@@ -323,22 +323,67 @@ final class ModelManager: ObservableObject {
         return total > 0 ? total : nil
     }
 
-    /// A HuggingFace model-search hit.
+    /// A HuggingFace model-search hit, enriched with the size + descriptor we
+    /// fetch per-model so the row can show RAM needs and what the model is.
     struct CatalogResult: Identifiable, Equatable {
         let id: String       // the `org/name` NSID
         let downloads: Int
+        let weightBytes: UInt64?  // exact weight size (HF tree LFS sum); nil if unknown
+        let pipelineTag: String?  // raw HF pipeline tag (e.g. "text-generation")
+        let quant: String?        // e.g. "4-bit" / "8-bit", parsed from tags
+
+        /// The model's resident weight footprint in GB — the deterministic,
+        /// dominant term of its memory use (exact LFS bytes from the HF tree,
+        /// no fudge factor). The KV cache rides on top of this at serve time
+        /// and scales with context length. nil when the size is unknown (we
+        /// don't guess). Rounded up so we never under-report.
+        var weightGB: Int? {
+            guard let b = weightBytes, b > 0 else { return nil }
+            return max(1, Int((Double(b) / 1_073_741_824.0).rounded(.up)))
+        }
+
+        /// True when this model's weights fit the resource budget — or when its
+        /// size is unknown (we can't prove it won't, so we don't disable it).
+        var fitsBudget: Bool {
+            guard ModelManager.budgetGB > 0, let w = weightGB else { return true }
+            return w <= ModelManager.budgetGB
+        }
+
+        /// A short human descriptor from the model's HF metadata: the friendly
+        /// task name plus the quantization (e.g. "Text generation · 4-bit").
+        var subtitle: String? {
+            let parts = [pipelineTag.map(ModelManager.friendlyTask), quant].compactMap { $0 }
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        }
+    }
+
+    /// Map an HF `pipeline_tag` to friendlier prose for the search row.
+    nonisolated static func friendlyTask(_ tag: String) -> String {
+        switch tag {
+        case "text-generation": return "Text generation"
+        case "text2text-generation": return "Text-to-text"
+        case "image-text-to-text": return "Vision + text"
+        case "image-to-text": return "Image captioning"
+        case "automatic-speech-recognition": return "Speech-to-text"
+        case "feature-extraction": return "Embeddings"
+        default: return tag.replacingOccurrences(of: "-", with: " ").capitalized
+        }
     }
 
     /// Search HuggingFace for MLX models matching `query`, most-downloaded
     /// first. `filter=mlx` restricts to the MLX library tag so every hit is
-    /// loadable by the agent. Empty on any error (the UI shows "no results").
+    /// loadable by the agent. Each hit is then enriched (concurrently) with
+    /// its exact weight size (`fetchRepoSize`, the HF tree LFS sum) so the row
+    /// can show a real weight footprint; results whose weights exceed the
+    /// resource budget are sorted to the bottom (the UI disables them) rather
+    /// than dropped. Empty on any error (the UI shows "no results").
     nonisolated static func searchModels(_ query: String) async -> [CatalogResult] {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty,
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
             let url = URL(
                 string: "https://huggingface.co/api/models?search=\(encoded)"
-                    + "&filter=mlx&sort=downloads&direction=-1&limit=25")
+                    + "&filter=mlx&sort=downloads&direction=-1&limit=20")
         else { return [] }
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
@@ -346,9 +391,42 @@ final class ModelManager: ObservableObject {
             (resp as? HTTPURLResponse)?.statusCode == 200,
             let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else { return [] }
-        return arr.compactMap { item in
+
+        // Base hits, preserving HF's download-desc order.
+        struct Hit { let id: String; let downloads: Int; let pipelineTag: String?; let quant: String? }
+        let bitWidths = ["2-bit", "3-bit", "4-bit", "5-bit", "6-bit", "8-bit", "16-bit"]
+        let hits: [Hit] = arr.compactMap { item in
             guard let id = item["id"] as? String else { return nil }
-            return CatalogResult(id: id, downloads: (item["downloads"] as? NSNumber)?.intValue ?? 0)
+            let tags = (item["tags"] as? [String]) ?? []
+            return Hit(
+                id: id,
+                downloads: (item["downloads"] as? NSNumber)?.intValue ?? 0,
+                pipelineTag: item["pipeline_tag"] as? String,
+                quant: bitWidths.first { tags.contains($0) })
+        }
+
+        // Enrich each hit with its exact weight size concurrently (one extra
+        // tree call per model). Order is non-deterministic from the group, so
+        // we re-sort.
+        let enriched: [CatalogResult] = await withTaskGroup(of: CatalogResult.self) { group in
+            for h in hits {
+                group.addTask {
+                    let bytes = await fetchRepoSize(h.id)
+                    return CatalogResult(
+                        id: h.id, downloads: h.downloads, weightBytes: bytes,
+                        pipelineTag: h.pipelineTag, quant: h.quant)
+                }
+            }
+            var out: [CatalogResult] = []
+            for await r in group { out.append(r) }
+            return out
+        }
+
+        // Runnable hits first (by downloads), then the over-budget ones at the
+        // bottom — also by downloads. The UI renders the tail disabled.
+        return enriched.sorted { a, b in
+            if a.fitsBudget != b.fitsBudget { return a.fitsBudget }
+            return a.downloads > b.downloads
         }
     }
 
@@ -396,7 +474,7 @@ final class ModelManager: ObservableObject {
     /// This Mac's physical RAM in GB (rounded), via sysctl `hw.memsize`.
     /// 0 if the probe fails, in which case the picker degrades to showing
     /// every model without a fit judgment.
-    static let deviceRamGB: Int = {
+    nonisolated static let deviceRamGB: Int = {
         var bytes: UInt64 = 0
         var size = MemoryLayout<UInt64>.size
         guard sysctlbyname("hw.memsize", &bytes, &size, nil, 0) == 0, bytes > 0 else { return 0 }
@@ -407,27 +485,49 @@ final class ModelManager: ObservableObject {
         deviceRamGB == 0 || minRamGB <= deviceRamGB
     }
 
-    /// The biggest *recommended* catalog model that fits this Mac — the
-    /// suggested default. Prefers the latest-&-greatest rotation; falls back
-    /// to any fitting catalog model if no recommended one fits. nil when RAM
-    /// is unknown or nothing fits.
+    /// Whether a model with this RAM floor fits the resource budget — i.e.
+    /// runs comfortably without eating the user reserve. This is the gate
+    /// the lists use to decide "runnable on this Mac" (a model can be ≤ total
+    /// RAM yet still over budget). True when RAM is unknown.
+    static func fitsBudget(_ minRamGB: Int) -> Bool {
+        budgetGB == 0 || minRamGB <= budgetGB
+    }
+
+    /// RAM (GB) actually available to serve models, after holding back the
+    /// user reserve the agent reserves for the OS + the owner's own apps.
+    /// This — not raw `deviceRamGB` — is the threshold a model must fit under
+    /// to run *comfortably* (the green band in `budgetReport`). 0 when RAM is
+    /// unknown.
+    nonisolated static var budgetGB: Int {
+        guard deviceRamGB > 0 else { return 0 }
+        return deviceRamGB - userReserveGB(deviceRamGB)
+    }
+
+    /// The biggest *recommended* catalog model that fits this Mac's resource
+    /// budget — the suggested default. "Fits" here means it lands in the
+    /// comfortable band (`minRamGB <= budgetGB`), i.e. it leaves the reserve
+    /// intact rather than consuming all of RAM; this mirrors what
+    /// `budgetReport` would classify green. Prefers the latest-&-greatest
+    /// rotation; falls back to any budget-fitting catalog model if no
+    /// recommended one fits. nil when RAM is unknown or nothing fits.
     static var recommendedNSID: String? {
-        guard deviceRamGB > 0 else { return nil }
-        let fitting = catalog.filter { $0.minRamGB <= deviceRamGB }
+        guard budgetGB > 0 else { return nil }
+        let fitting = catalog.filter { $0.minRamGB <= budgetGB }
         if let best = fitting.filter({ $0.recommended }).max(by: { $0.minRamGB < $1.minRamGB }) {
             return best.nsid
         }
         return fitting.max(by: { $0.minRamGB < $1.minRamGB })?.nsid
     }
 
-    /// Catalog ordered best-for-this-device first: fitting models by
-    /// descending size (recommended on top), then the ones that need more
-    /// RAM than this Mac has. Falls back to declaration order when RAM is
-    /// unknown.
+    /// Catalog ordered best-for-this-device first: budget-fitting models by
+    /// descending size (the biggest comfortable pick on top), then the ones
+    /// that need more RAM than this Mac's budget — those trail at the bottom
+    /// and the UI renders them disabled. Falls back to declaration order when
+    /// RAM is unknown.
     static var catalogForDevice: [CatalogEntry] {
-        guard deviceRamGB > 0 else { return catalog }
-        let fits = catalog.filter { $0.minRamGB <= deviceRamGB }.sorted { $0.minRamGB > $1.minRamGB }
-        let tooBig = catalog.filter { $0.minRamGB > deviceRamGB }.sorted { $0.minRamGB < $1.minRamGB }
+        guard budgetGB > 0 else { return catalog }
+        let fits = catalog.filter { fitsBudget($0.minRamGB) }.sorted { $0.minRamGB > $1.minRamGB }
+        let tooBig = catalog.filter { !fitsBudget($0.minRamGB) }.sorted { $0.minRamGB < $1.minRamGB }
         return fits + tooBig
     }
 
@@ -491,7 +591,7 @@ final class ModelManager: ObservableObject {
     /// RAM (GB) to hold back for the OS + the owner's own apps so a personal
     /// Mac stays usable while it serves. `ceil(total/5)` (20%), clamped to
     /// [2, 12]. Byte-for-byte the same as Rust `pricing::user_reserve_gb`.
-    static func userReserveGB(_ total: Int) -> Int {
+    nonisolated static func userReserveGB(_ total: Int) -> Int {
         guard total > 0 else { return 0 }
         return min(max(Int(ceil(Double(total) / 5.0)), 2), 12)
     }
@@ -978,13 +1078,19 @@ struct ModelsView: View {
                 }
 
                 if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                    // No query: the curated, device-fit suggestions.
-                    ForEach(ModelManager.catalogForDevice, id: \.nsid) { catalogRow($0) }
+                    // No query: the curated, device-fit suggestions. Already-added
+                    // models are dropped — they live in "Active models" above.
+                    let suggestions = ModelManager.catalogForDevice.filter {
+                        !manager.models.contains($0.nsid)
+                    }
+                    ForEach(suggestions, id: \.nsid) { catalogRow($0) }
                 } else if searchResults.isEmpty && !searching {
                     Text("No MLX models found for “\(searchQuery.trimmingCharacters(in: .whitespaces))”.")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(searchResults) { searchRow($0) }
+                    // Already-added models are dropped (shown in "Active models").
+                    let hits = searchResults.filter { !manager.models.contains($0.id) }
+                    ForEach(hits) { searchRow($0) }
                     // Power-user escape hatch: add an exact `org/name` that the
                     // search didn't surface.
                     let q = searchQuery.trimmingCharacters(in: .whitespaces)
@@ -1051,10 +1157,24 @@ struct ModelsView: View {
     /// `busy` disable — removal is optimistic (the row vanishes on click), so
     /// the other trashes stay live.
     @ViewBuilder private func activeRow(_ m: String) -> some View {
+        let ram = ModelManager.minRamGB(for: m)
         HStack {
             Text(m)
                 .font(.system(.callout, design: .monospaced))
                 .lineLimit(1).truncationMode(.middle)
+            // Small neutral pill with this model's RAM footprint (the same
+            // per-model figure the budget meter sums). Omitted for off-catalog
+            // models whose floor we don't know.
+            if ram > 0 {
+                Text("~\(ram) GB")
+                    .font(.caption2)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15))
+                    .foregroundStyle(.secondary)
+                    .clipShape(Capsule())
+                    .help("Approximate RAM this model needs while serving")
+            }
             Spacer()
             Button(role: .destructive) {
                 Task { await manager.remove(m) }
@@ -1137,12 +1257,12 @@ struct ModelsView: View {
             case .tight:
                 return (
                     .orange, "Tight",
-                    "Your pinned models fit, but leave little for you — this Mac may get "
+                    "Your in-use models fit, but leave little for you — this Mac may get "
                         + "sluggish while you work. Drop one or stagger their hours.")
             case .oversubscribed:
                 return (
                     .red, "Oversubscribed",
-                    "Your pinned models need more RAM than this Mac has. The agent will drop "
+                    "Your in-use models need more RAM than this Mac has. The agent will drop "
                         + "the largest to fit; remove one or schedule them at different hours.")
             }
         }()
@@ -1171,7 +1291,7 @@ struct ModelsView: View {
             .frame(height: 14)
 
             Text(
-                "Pinned \(used) GB · Reserved for you \(reserve) GB · This Mac \(total) GB"
+                "In use \(used) GB · Reserved for you \(reserve) GB · This Mac \(total) GB"
             )
             .font(.caption).foregroundStyle(.secondary)
 
@@ -1199,7 +1319,7 @@ struct ModelsView: View {
     /// Mac" accent tag for the best fit), the monospaced NSID, the RAM-fit
     /// line, and a standard Add button. The model's blurb sits under the name.
     @ViewBuilder private func catalogRow(_ item: ModelManager.CatalogEntry) -> some View {
-        let fits = ModelManager.fitsDevice(item.minRamGB)
+        let fits = ModelManager.fitsBudget(item.minRamGB)
         let suggested = item.nsid == ModelManager.recommendedNSID
         let isLatest = recommendedNSIDs.contains(item.nsid)
         HStack {
@@ -1237,32 +1357,45 @@ struct ModelsView: View {
                         ? "needs ~\(item.minRamGB)GB"
                         : (fits
                             ? "needs ~\(item.minRamGB)GB · fits this Mac (\(ModelManager.deviceRamGB)GB)"
-                            : "needs ~\(item.minRamGB)GB — more than this Mac's \(ModelManager.deviceRamGB)GB")
+                            : "needs ~\(item.minRamGB)GB — over this Mac's \(ModelManager.budgetGB)GB budget")
                 )
                 .font(.footnote)
                 .foregroundStyle(fits ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
             }
             Spacer()
             Button("Add") { Task { await manager.add(item.nsid) } }
-                .disabled(manager.busy || manager.models.contains(item.nsid))
+                .disabled(manager.busy || !fits || manager.models.contains(item.nsid))
         }
         .opacity(fits ? 1 : 0.65)
     }
 
     /// One HuggingFace search result: the NSID, its download count, and Add.
     @ViewBuilder private func searchRow(_ r: ModelManager.CatalogResult) -> some View {
+        let fits = r.fitsBudget
+        // "needs ~14 GB (weights) · 12.3K downloads" — weight footprint omitted
+        // when the size is unknown. KV cache rides on top at serve time.
+        let ram: String? = r.weightGB.map { "needs ~\($0) GB (weights)" }
+        let stats = [ram, "\(Self.formatDownloads(r.downloads)) downloads"]
+            .compactMap { $0 }.joined(separator: " · ")
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text(r.id)
                     .font(.system(.callout, design: .monospaced))
                     .lineLimit(1).truncationMode(.middle)
-                Text("\(Self.formatDownloads(r.downloads)) downloads")
-                    .font(.footnote).foregroundStyle(.secondary)
+                if let subtitle = r.subtitle {
+                    Text(subtitle)
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+                Text(stats)
+                    .font(.footnote)
+                    .foregroundStyle(fits ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
             }
             Spacer()
             Button("Add") { Task { await manager.add(r.id) } }
-                .disabled(manager.busy || manager.models.contains(r.id))
+                .disabled(manager.busy || !fits || manager.models.contains(r.id))
         }
+        .opacity(fits ? 1 : 0.65)
     }
 
     /// Compact download count, e.g. 1_234_567 → "1.2M", 9_400 → "9.4K".
