@@ -248,6 +248,22 @@ mod software {
     }
 }
 
+/// Crate-wide test serialization for any test that creates/loads a software
+/// identity. They all resolve their key path from the process-global
+/// `COCORE_SOFTWARE_KEY_PATH` (or the shared default `~/.cocore/identity.pem`),
+/// so two running in parallel race on the same file — interleaved writes corrupt
+/// the PEM (NUL padding) and the readback panics. The `attestation` and
+/// `receipt` tests call `load_or_create_identity()` too (it falls to the
+/// software path when the Secure Enclave isn't compiled in), so this lock is
+/// crate-visible and they take it as well. Recovers from a poisoned lock so a
+/// single failing test doesn't cascade into every later one panicking on `lock()`.
+#[cfg(test)]
+pub(crate) fn identity_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static IDENTITY_GUARD: Mutex<()> = Mutex::new(());
+    IDENTITY_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +272,7 @@ mod tests {
 
     #[test]
     fn software_signature_round_trips() {
+        let _g = identity_lock();
         let id = load_or_create_identity().unwrap();
         let sig = id.sign(b"hello cocore").unwrap();
 
@@ -274,6 +291,7 @@ mod tests {
 
     #[test]
     fn signature_is_der_encoded() {
+        let _g = identity_lock();
         let id = load_or_create_identity().unwrap();
         let sig = id.sign(b"x").unwrap();
         // DER ECDSA: SEQUENCE ( INTEGER r, INTEGER s ).
@@ -285,6 +303,7 @@ mod tests {
 
     #[test]
     fn wrong_message_fails_verification() {
+        let _g = identity_lock();
         let id = load_or_create_identity().unwrap();
         let sig = id.sign(b"hello").unwrap();
         let pub_bytes = id.public_key_bytes();
@@ -299,6 +318,7 @@ mod tests {
 
     #[test]
     fn public_key_is_64_bytes() {
+        let _g = identity_lock();
         let id = load_or_create_identity().unwrap();
         assert_eq!(id.public_key_bytes().len(), 64);
     }
@@ -312,24 +332,24 @@ mod tests {
         // same key twice. The production default uses
         // ~/.cocore/identity.pem; this test scopes to a tempfile so
         // it stays hermetic regardless of the dev's home dir.
+        let _g = identity_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("id.pem");
-        // Set + unset around the call so parallel tests don't see
-        // our env. We synchronize via a local mutex so two callers
-        // in the same process never trample each other.
-        use std::sync::Mutex;
-        static GUARD: Mutex<()> = Mutex::new(());
-        let _g = GUARD.lock().unwrap();
-        // SAFETY: env::set_var is unsafe in 2024+ Rust; this test
-        // module owns the env-var window via GUARD.
+        // SAFETY: env::set_var is unsafe in 2024+ Rust; identity_lock()
+        // gives this test exclusive ownership of the env-var window. We
+        // capture the results and ALWAYS remove the var BEFORE any unwrap,
+        // so a failed generate() can't leak the var (pointing at a tempdir
+        // we're about to drop) into a later test.
         unsafe {
             std::env::set_var("COCORE_SOFTWARE_KEY_PATH", &path);
         }
-        let first = software::SoftwareIdentity::generate().unwrap();
-        let second = software::SoftwareIdentity::generate().unwrap();
+        let first = software::SoftwareIdentity::generate();
+        let second = software::SoftwareIdentity::generate();
         unsafe {
             std::env::remove_var("COCORE_SOFTWARE_KEY_PATH");
         }
+        let first = first.expect("first software identity generate");
+        let second = second.expect("second software identity generate");
         assert_eq!(
             first.public_key_bytes(),
             second.public_key_bytes(),

@@ -358,10 +358,11 @@ fn hash_file(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_enclave::load_or_create_identity;
+    use crate::secure_enclave::{identity_lock, load_or_create_identity};
 
     #[test]
     fn attestation_round_trips() {
+        let _g = identity_lock();
         let signer = load_or_create_identity().unwrap();
         let inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),
@@ -406,6 +407,7 @@ mod tests {
         // a "hardware" claim taken on faith. Synthetic DER (not a real
         // Apple-rooted, signer-bound chain) is dropped; the record stays
         // self-attested with an empty mdaCertChain.
+        let _g = identity_lock();
         let signer = load_or_create_identity().unwrap();
         let inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),

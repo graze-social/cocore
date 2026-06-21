@@ -204,7 +204,7 @@ fn rfc3339(t: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_enclave::load_or_create_identity;
+    use crate::secure_enclave::{identity_lock, load_or_create_identity};
     use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
     use p256::EncodedPoint;
 
@@ -238,6 +238,7 @@ mod tests {
 
     #[test]
     fn signature_verifies_against_published_public_key() {
+        let _g = identity_lock();
         let signer = load_or_create_identity().unwrap();
         let (rec, canonical) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
 
@@ -256,6 +257,7 @@ mod tests {
 
     #[test]
     fn output_cipher_url_omitted_when_none() {
+        let _g = identity_lock();
         let signer = load_or_create_identity().unwrap();
         let (rec, _) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
         // Roundtrip the typed record through serde_json and assert
