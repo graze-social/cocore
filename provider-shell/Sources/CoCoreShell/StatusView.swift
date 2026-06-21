@@ -66,7 +66,12 @@ struct StatusRows: View {
             if let exp = state.attestationExpiresAt {
                 LabeledContent("Attestation expires", value: exp.formatted(.dateTime))
             }
-            if state.trustLevel != .hardwareAttested, let enable = onEnableSecureMode {
+            // Gated on a paired session: the wizard's MDM coordinator calls
+            // need this agent's bearer key (session.apiKey/apiBase), so there's
+            // nothing to enable until pairing completes. Mirrors the Identity
+            // section's signed-in / "Not signed in" split above.
+            if state.trustLevel != .hardwareAttested, state.session != nil,
+                let enable = onEnableSecureMode {
                 Button("Enable Secure Mode…", action: enable)
             }
 
