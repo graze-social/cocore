@@ -225,7 +225,7 @@ final class AgentSupervisor {
         // A fresh deliberate start clears the stop latch so a later
         // unexpected exit is treated as a crash and respawned.
         intentionalStop = false
-        guard let bin = Self.locateBinary() else {
+        guard let bin = Self.serveBinary() else {
             NSLog("cocore: provider binary not found")
             return
         }
@@ -362,7 +362,10 @@ final class AgentSupervisor {
     private static func killStrayAgents() {
         let pgrep = Process()
         pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        pgrep.arguments = ["-f", "cocore agent serve"]
+        // Match both the default CLI (`cocore agent serve`) and the nested
+        // confidential worker (`cocore-provider agent serve`) — a confidential
+        // machine runs the latter, and an orphan of either kind must be reaped.
+        pgrep.arguments = ["-f", "cocore(-provider)? agent serve"]
         let pipe = Pipe()
         pgrep.standardOutput = pipe
         pgrep.standardError = FileHandle.nullDevice
@@ -641,5 +644,55 @@ final class AgentSupervisor {
             candidate = candidate.deletingLastPathComponent()
         }
         return nil
+    }
+
+    /// This machine's owner-chosen trust tier, read by running the bundled
+    /// CLI's `agent tier` (which consults the PDS provider record). Returns
+    /// `"best-effort"` on any error — the safe default that runs the
+    /// non-entitled default binary. Synchronous + called once per spawn (the
+    /// same pattern as the other CLI shell-outs in this type).
+    nonisolated static func probeTier() -> String {
+        guard let bin = locateBinary() else { return "best-effort" }
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["agent", "tier"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let out = (String(data: data, encoding: .utf8) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return out == "attested-confidential" ? "attested-confidential" : "best-effort"
+        } catch {
+            return "best-effort"
+        }
+    }
+
+    /// The binary to run for `agent serve`. On a machine the owner opted into
+    /// attested-confidential we spawn the nested, measured push-receiver bundle
+    /// `Contents/CoCoreProvider.app/Contents/MacOS/cocore-provider` — it holds
+    /// the embedded provisioning profile + aps-environment entitlement that lets
+    /// it answer the advisor's APNs code-identity challenge, and it runs the
+    /// in-process MLX engine so plaintext never leaves the measured binary.
+    /// Every other machine runs the default `cocore`: no provisioning profile
+    /// to expire, behaviour identical to a normal release. Falls back to the
+    /// default binary when the worker bundle isn't present (a non-apns build).
+    nonisolated static func serveBinary() -> URL? {
+        if probeTier() == "attested-confidential" {
+            let worker = Bundle.main.bundleURL
+                .appendingPathComponent(
+                    "Contents/CoCoreProvider.app/Contents/MacOS/cocore-provider")
+            if FileManager.default.isExecutableFile(atPath: worker.path) {
+                NSLog("cocore: confidential tier — spawning nested worker %@", worker.path)
+                return worker
+            }
+            NSLog(
+                "cocore: confidential tier requested but nested worker bundle missing; using default binary"
+            )
+        }
+        return locateBinary()
     }
 }

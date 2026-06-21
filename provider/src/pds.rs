@@ -413,21 +413,24 @@ impl PdsClient {
         rec.value.get("active").and_then(|v| v.as_bool())
     }
 
-    /// Read both owner-set controls — the `active` start/stop switch and the
-    /// `desiredModels` list — from this DID's provider record at `rkey` in
-    /// one list. Defaults: `active` true (serving) when absent, `desired`
-    /// empty when absent. On any read error returns the serving default with
-    /// an empty list so a transient blip never looks like a stop or a model
-    /// change. The agent polls this to honour remote pause + model changes.
-    pub async fn get_provider_control(&self, rkey: &str) -> (bool, Vec<String>) {
+    /// Read the owner-set controls — the `active` start/stop switch, the
+    /// `desiredModels` list, and the `desiredTier` intent — from this DID's
+    /// provider record at `rkey` in one list. Defaults: `active` true
+    /// (serving) when absent, `desired` empty when absent, `desiredTier` None
+    /// when absent. On any read error returns the serving default with an
+    /// empty list and no tier so a transient blip never looks like a stop, a
+    /// model change, or a tier change. The agent polls this to honour remote
+    /// pause + model changes; the serve loop also restarts on a `desiredTier`
+    /// change so the supervisor can re-select the confidential worker binary.
+    pub async fn get_provider_control(&self, rkey: &str) -> (bool, Vec<String>, Option<String>) {
         let Ok(listed) = self.list_my_records("dev.cocore.compute.provider").await else {
-            return (true, Vec::new());
+            return (true, Vec::new(), None);
         };
         let Some(rec) = listed
             .iter()
             .find(|r| r.uri.rsplit('/').next() == Some(rkey))
         else {
-            return (true, Vec::new());
+            return (true, Vec::new(), None);
         };
         let active = rec
             .value
@@ -444,7 +447,12 @@ impl PdsClient {
                     .collect()
             })
             .unwrap_or_default();
-        (active, desired)
+        let desired_tier = rec
+            .value
+            .get("desiredTier")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        (active, desired, desired_tier)
     }
 
     /// Walk the DID PLC directory to find this DID's PDS host. The

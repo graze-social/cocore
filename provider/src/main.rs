@@ -64,6 +64,13 @@ enum AgentCmd {
     },
     /// Print the active session's identity for debugging.
     Whoami,
+    /// Print this machine's owner-chosen trust tier from its PDS provider
+    /// record: `attested-confidential` or `best-effort`. The macOS tray's
+    /// agent supervisor runs this to decide which worker binary to spawn (the
+    /// measured confidential push-receiver bundle vs. the default best-effort
+    /// CLI). Prints `best-effort` when not paired / no record yet / on a read
+    /// error — the safe default.
+    Tier,
     /// Diagnose this install end-to-end: LaunchAgent state,
     /// session.json, API key validity, and the console's view of
     /// whether the advisor sees us + a fresh provider record is
@@ -184,6 +191,7 @@ async fn main() -> Result<()> {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
         Cmd::Agent(AgentCmd::Serve { advisor }) => cmd_serve_entry(advisor).await,
         Cmd::Agent(AgentCmd::Whoami) => cmd_whoami(),
+        Cmd::Agent(AgentCmd::Tier) => cmd_print_tier().await,
         Cmd::Agent(AgentCmd::Doctor { console, fix }) => doctor::run(&console, fix).await,
         Cmd::Agent(AgentCmd::Update { console, check }) => update::run(&console, check).await,
         Cmd::Agent(AgentCmd::Models(cmd)) => models_cli::run(cmd),
@@ -295,6 +303,36 @@ async fn cmd_set_active(active: bool) -> Result<()> {
 /// fresh CID is the correct response.
 fn is_swap_conflict(e: &cocore_provider::error::ProviderError) -> bool {
     matches!(e, cocore_provider::error::ProviderError::Pds(msg) if msg.contains("InvalidSwap"))
+}
+
+/// Read this machine's owner-chosen `desiredTier` from its PDS provider
+/// record. Returns `None` when not paired, when this machine has no record yet
+/// (never served), or on any read error — all of which the caller treats as
+/// best-effort. Backs both the confidential entry gate and the `agent tier`
+/// probe the macOS supervisor runs to pick a worker binary.
+async fn read_my_desired_tier() -> Option<String> {
+    let session = oauth::load_session().ok()??;
+    let pds = PdsClient::new(session);
+    let signer = secure_enclave::load_or_create_identity().ok()?;
+    let pubkey = signer.public_key_b64();
+    let (_rkey, value, _cid) = find_my_provider_record(&pds, &pubkey).await.ok()?;
+    value
+        .get("desiredTier")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// `cocore agent tier`: print this machine's owner-chosen trust tier
+/// (`attested-confidential` or `best-effort`). Normalises an absent/unknown
+/// value to `best-effort` so the caller (the macOS supervisor) always gets one
+/// of the two binary-selection answers.
+async fn cmd_print_tier() -> Result<()> {
+    let tier = match read_my_desired_tier().await.as_deref() {
+        Some("attested-confidential") => "attested-confidential",
+        _ => "best-effort",
+    };
+    println!("{tier}");
+    Ok(())
 }
 
 /// `cocore agent active`: print `serving` or `paused` from the shared switch.
@@ -596,6 +634,33 @@ async fn wait_until_active(pds: &cocore_provider::pds::PdsClient, rkey: Option<&
 #[cfg(all(target_os = "macos", feature = "apns"))]
 async fn cmd_serve_entry(advisor: String) -> Result<()> {
     use tokio::sync::mpsc::unbounded_channel;
+    // Runtime tier gate (fleet-safety keystone). This apns worker binary holds
+    // the AppKit push host + the in-process MLX engine, but it must only take
+    // the confidential process shape when the owner actually opted THIS machine
+    // in (desiredTier=attested-confidential). On every other machine it behaves
+    // byte-for-byte like the default best-effort build: serve directly on the
+    // main runtime, no push receiver, no AppKit, subprocess engine, same model.
+    // (The macOS supervisor normally only spawns this binary for confidential
+    // machines via `agent tier`; this in-process gate is the backstop so a
+    // stale/raced spawn can never silently flip a machine's behaviour.)
+    let desired_tier = read_my_desired_tier().await;
+    let confidential = desired_tier.as_deref() == Some("attested-confidential");
+    if !confidential {
+        tracing::info!(
+            "desiredTier is not attested-confidential — serving best-effort (no push host, subprocess engine)"
+        );
+        return cmd_serve(&advisor, None).await;
+    }
+    tracing::info!(
+        "desiredTier=attested-confidential — confidential path (push host + in-process MLX engine)"
+    );
+    // Make sure the confidential model's weights are present and point the
+    // native engine at the resolved Hugging Face snapshot dir BEFORE the serve
+    // thread builds engines. Non-fatal: on failure `build_engines` publishes an
+    // honest engineFault and the machine serves `stub` until the owner picks a
+    // confidential-compatible model from the console.
+    prepare_native_confidential_model().await;
+
     // The push host (main thread) forwards `E_K(nonce)` challenges on this
     // channel; the serve loop (worker thread) drains it. Unbounded so the
     // Cocoa-thread callback never blocks.
@@ -626,6 +691,152 @@ async fn cmd_serve_entry(advisor: String) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("spawn serve thread: {e}"))?;
     // Hand the main thread to the push host. Never returns.
     cocore_provider::push_host::run_blocking(push_tx)
+}
+
+/// Confidential tier (apns build): make sure the in-process MLX engine's model
+/// is downloaded and pointed at its local Hugging Face snapshot before engines
+/// are built. Public model weights aren't security-sensitive — only *serving*
+/// must stay inside the measured binary — so we reuse the venv's
+/// `huggingface_hub` as a download-only step, then resolve the snapshot dir it
+/// returns and export the two env vars `build_engines` reads
+/// (`COCORE_NATIVE_MLX_MODEL` + `COCORE_NATIVE_MLX_MODEL_DIR`). The native
+/// engine serves exactly ONE model — the owner's first non-`stub`
+/// `desiredModels`, else a small default. An incompatible pick (a non
+/// Qwen2/Llama/Gemma/Phi arch, e.g. `qwen3_5`) downloads fine but fails native
+/// load, which `build_engines` turns into an honest engineFault.
+#[cfg(all(target_os = "macos", feature = "apns"))]
+async fn prepare_native_confidential_model() {
+    const DEFAULT_MODEL: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
+    // Already wired by the environment (e.g. a LaunchAgent that pre-set both
+    // vars, like the canary) — respect it and skip the download probe.
+    if std::env::var_os("COCORE_NATIVE_MLX_MODEL").is_some()
+        && std::env::var_os("COCORE_NATIVE_MLX_MODEL_DIR").is_some()
+    {
+        tracing::info!("native MLX model already configured via env; skipping download probe");
+        return;
+    }
+    // Choose the model: the owner's first non-`stub` desiredModels, else the
+    // small default. The native engine serves a single model.
+    let model = read_my_desired_models()
+        .await
+        .into_iter()
+        .find(|m| m != "stub")
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+
+    // Resolve the venv interpreter the install script bootstrapped.
+    let venv_python = std::env::var("COCORE_PYTHON_VENV")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cocore/python")))
+        .map(|venv| venv.join("bin/python"));
+    let Some(venv_python) = venv_python.filter(|p| p.exists()) else {
+        tracing::warn!(
+            "no venv python to download the confidential model; build_engines will publish a fault"
+        );
+        // Flag the intended model (without a dir) so build_engines faults honestly.
+        std::env::set_var("COCORE_NATIVE_MLX_MODEL", &model);
+        return;
+    };
+
+    tracing::info!(
+        model = %model,
+        "downloading confidential model weights (download-only; serving stays in the measured binary)"
+    );
+    // Surface progress in the tray while the (potentially multi-GB, multi-minute)
+    // download runs; the serve loop's own monitor takes over once engines build.
+    write_provision_status(
+        "provisioning",
+        std::slice::from_ref(&model),
+        model_download_bytes(std::slice::from_ref(&model)),
+        None,
+    );
+
+    let dir = tokio::task::spawn_blocking({
+        let model = model.clone();
+        let venv_python = venv_python.clone();
+        move || download_hf_snapshot(&venv_python, &model)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    std::env::set_var("COCORE_NATIVE_MLX_MODEL", &model);
+    match dir {
+        Some(dir) => {
+            tracing::info!(model = %model, dir = %dir, "confidential model ready");
+            std::env::set_var("COCORE_NATIVE_MLX_MODEL_DIR", dir);
+        }
+        None => tracing::warn!(
+            model = %model,
+            "confidential model download failed; build_engines will publish a fault"
+        ),
+    }
+}
+
+/// Run the venv's `huggingface_hub.snapshot_download` as a download-only step
+/// and return the resolved local snapshot directory (which is exactly what the
+/// native engine needs). Blocking — spawns the venv python and waits for the
+/// weight download; a no-op when the weights are already cached. Call from
+/// `spawn_blocking`.
+#[cfg(all(target_os = "macos", feature = "apns"))]
+fn download_hf_snapshot(venv_python: &std::path::Path, model: &str) -> Option<String> {
+    // Pass the model id as argv (sys.argv[1]) instead of interpolating it into
+    // the snippet — no quoting/injection edge cases, and the snippet stays a
+    // plain string literal (which rustfmt never reflows).
+    let code =
+        "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))";
+    let out = std::process::Command::new(venv_python)
+        .arg("-c")
+        .arg(code)
+        .arg(model)
+        // Accelerated parallel download (hf_transfer is installed by
+        // scripts/bootstrap-python-venv.sh alongside vllm-mlx).
+        .env("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::warn!(
+            model = %model,
+            stderr = %String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default(),
+            "huggingface snapshot_download failed"
+        );
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .map(|l| l.trim().to_string())?;
+    if dir.is_empty() {
+        None
+    } else {
+        Some(dir)
+    }
+}
+
+/// Read this machine's owner-chosen `desiredModels` from its PDS provider
+/// record (empty when not paired / no record / read error). Used to pick the
+/// confidential native model.
+#[cfg(all(target_os = "macos", feature = "apns"))]
+async fn read_my_desired_models() -> Vec<String> {
+    let Some(session) = oauth::load_session().ok().flatten() else {
+        return Vec::new();
+    };
+    let pds = PdsClient::new(session);
+    let Ok(signer) = secure_enclave::load_or_create_identity() else {
+        return Vec::new();
+    };
+    match find_my_provider_record(&pds, &signer.public_key_b64()).await {
+        Ok((_, value, _)) => value
+            .get("desiredModels")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Non-confidential builds: no push host, serve directly on the main runtime.
@@ -775,20 +986,36 @@ async fn cmd_serve(
     // local default. `build_engines` reads `COCORE_INFERENCE_MODELS`, so we
     // point it there before building. We remember the set we started from so
     // a later change (owner edits the list on the site) triggers a reload.
-    let desired_at_start: Vec<String> =
+    // This serve's confidential standing. `push_rx.is_some()` is the
+    // process-shape signal: only the confidential entry path (the apns worker)
+    // hands us a push receiver, so it doubles as "this is the confidential
+    // worker". On a confidential machine inference must stay inside the
+    // measured binary — the native in-process MLX engine — so we DON'T point
+    // the subprocess engine at the owner's models (that would serve them out
+    // of an unmeasured Python child, defeating the tier). We still read
+    // `desiredModels` below so a change still triggers a reload restart.
+    let confidential = push_rx.is_some();
+    let (desired_at_start, desired_tier_at_start): (Vec<String>, Option<String>) =
         match find_my_provider_record(&pds, &attestation_pub_key).await {
-            Ok((_, value, _)) => value
-                .get("desiredModels")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|m| m.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok((_, value, _)) => {
+                let models = value
+                    .get("desiredModels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tier = value
+                    .get("desiredTier")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                (models, tier)
+            }
+            Err(_) => (Vec::new(), None),
         };
-    if !desired_at_start.is_empty() {
+    if !desired_at_start.is_empty() && !confidential {
         tracing::info!(models = ?desired_at_start, "loading owner-selected models from the console");
         std::env::set_var("COCORE_INFERENCE_MODELS", desired_at_start.join(","));
     }
@@ -1125,6 +1352,7 @@ async fn cmd_serve(
                             &engines,
                             provider_rkey.as_deref(),
                             &desired_at_start,
+                            desired_tier_at_start.as_deref(),
                             &model_schedules,
                             &configured_models,
                             push_rx.as_mut(),
@@ -1187,7 +1415,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start, &model_schedules, &configured_models, push_rx.as_mut()) => {
+                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut()) => {
                                 if let Err(e) = res {
                                     tracing::warn!(error = %e, "advisor run ended; reconnecting within window in 5s");
                                 }
@@ -1428,28 +1656,77 @@ fn build_engines(
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
 
+    // A confidential machine's native engine failed to come up. Surfaced as
+    // the serve's engineFault so the console shows an honest "couldn't serve
+    // confidentially" instead of a green machine that silently only runs
+    // `stub`. Stays `None` on best-effort builds/machines (no native env set),
+    // so their behaviour is unchanged.
+    #[cfg_attr(not(feature = "native_mlx"), allow(unused_mut, unused_assignments))]
+    let mut native_fault: Option<EngineFault> = None;
+
     // WS-ENGINE: the native in-process MLX engine (confidential tier). Opt-in
     // and feature-gated so it never disrupts the subprocess path. Configure a
     // model id + its local snapshot dir; the prompt is then served entirely
     // inside the measured binary (flips inProcessBackend + metallibHash true).
     #[cfg(feature = "native_mlx")]
-    if let (Ok(model), Ok(dir)) = (
-        std::env::var("COCORE_NATIVE_MLX_MODEL"),
-        std::env::var("COCORE_NATIVE_MLX_MODEL_DIR"),
-    ) {
+    if let Ok(model) = std::env::var("COCORE_NATIVE_MLX_MODEL") {
         use cocore_provider::engines::native_mlx::NativeMlxEngine;
         use cocore_provider::engines::Engine;
-        match NativeMlxEngine::load(std::path::PathBuf::from(dir), None) {
-            Ok(engine) if engine.ready() => {
-                tracing::info!(model = %model, "loaded native in-process MLX engine (confidential-capable)");
-                registry.register(model, std::sync::Arc::new(engine));
-            }
-            Ok(_) => tracing::warn!(
-                model = %model,
-                "native MLX engine loaded but metallib not located; not registering (confidential tier unavailable)"
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, model = %model, "failed to load native MLX engine")
+        match std::env::var("COCORE_NATIVE_MLX_MODEL_DIR") {
+            Ok(dir) => match NativeMlxEngine::load(std::path::PathBuf::from(dir), None) {
+                Ok(engine) if engine.ready() => {
+                    tracing::info!(model = %model, "loaded native in-process MLX engine (confidential-capable)");
+                    registry.register(model, std::sync::Arc::new(engine));
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        model = %model,
+                        "native MLX engine loaded but metallib not located; not registering (confidential tier unavailable)"
+                    );
+                    native_fault = Some(EngineFault {
+                        code: "native-metallib-missing".to_string(),
+                        message: format!(
+                            "The confidential (in-process MLX) engine for `{model}` loaded but its \
+                             signed Metal kernel library couldn't be located, so it won't serve. \
+                             This is a packaging problem on this build, not your configuration. \
+                             The machine is online but only serving the no-op `stub` engine."
+                        ),
+                        models: vec![model.clone()],
+                        at: chrono::Utc::now(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, model = %model, "failed to load native MLX engine");
+                    native_fault = Some(EngineFault {
+                        code: "native-load-failed".to_string(),
+                        message: format!(
+                            "The confidential (in-process MLX) engine couldn't load `{model}`. The \
+                             native engine supports Qwen2/Llama/Gemma/Phi-family MLX models; a \
+                             different architecture (e.g. a Qwen3 model) won't load in-process. \
+                             Pick a confidential-compatible model in the console. The machine is \
+                             online but only serving the no-op `stub` engine. ({e})"
+                        ),
+                        models: vec![model.clone()],
+                        at: chrono::Utc::now(),
+                    });
+                }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    model = %model,
+                    "confidential model selected but weights not downloaded yet; serving stub until provisioned"
+                );
+                native_fault = Some(EngineFault {
+                    code: "native-model-missing".to_string(),
+                    message: format!(
+                        "The confidential model `{model}` isn't downloaded on this machine yet, so \
+                         the in-process engine can't serve it. The machine is online but only \
+                         serving the no-op `stub` engine; it will recover once the weights finish \
+                         downloading and it restarts."
+                    ),
+                    models: vec![model.clone()],
+                    at: chrono::Utc::now(),
+                });
             }
         }
     }
@@ -1461,7 +1738,10 @@ fn build_engines(
         tracing::info!(
             "no inference models configured (set COCORE_INFERENCE_MODELS to enable real inference; this agent will serve `stub` only)"
         );
-        return (registry, None);
+        // On a confidential machine the subprocess set is intentionally empty
+        // (inference runs in-process), so a native failure is the fault to
+        // surface here. On best-effort machines `native_fault` is `None`.
+        return (registry, native_fault);
     }
 
     // Resolve the venv interpreter once. The install script writes it

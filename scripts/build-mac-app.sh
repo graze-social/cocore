@@ -45,6 +45,17 @@ OPEN="${OPEN:-0}"
 # Opt-in secure/native build (WS-A). When 1, the bundled cocore CLI is built
 # with the in-process MLX engine so it can serve the confidential tier.
 COCORE_BUILD_NATIVE="${COCORE_BUILD_NATIVE:-0}"
+# Fleet confidential build. When 1, the outer cocore.app stays the DEFAULT
+# (best-effort, subprocess engine) build — so best-effort machines are
+# byte-identical to a normal release and never depend on the (expiring)
+# provisioning profile — and we ADD a nested, measured push-receiver bundle
+# `Contents/CoCoreProvider.app` (the `--features apns` worker, built by
+# scripts/build-confidential-worker.sh). The tray's AgentSupervisor spawns the
+# nested worker only on machines the owner opted into attested-confidential
+# (desiredTier), via `cocore agent tier`. One notarytool submit of the outer
+# app covers the nested bundle. Requires a Developer ID identity + the
+# provisioning profile (COCORE_PROVISION_PROFILE).
+COCORE_BUILD_APNS="${COCORE_BUILD_APNS:-0}"
 # DEV=1 builds a side-by-side dev identity: a distinct bundle id, app name,
 # and display name so the local build never collides with a prod cocore.app
 # already installed in /Applications (same bundle id = they fight over the one
@@ -237,6 +248,7 @@ if [[ -z "$COCORE_SIGN_ID" ]]; then
 fi
 
 if [[ "$COCORE_SIGN_ID" == "-" ]]; then
+  [[ "$COCORE_BUILD_APNS" == "1" ]] && die "COCORE_BUILD_APNS=1 needs a Developer ID identity (the confidential worker can't be ad-hoc signed). Install a Developer ID cert or unset COCORE_BUILD_APNS."
   bold "==> ad-hoc codesign (no Developer ID identity)"
   note "Gatekeeper will warn on other Macs; install a Developer ID cert for distribution."
   codesign --force --deep --sign - "$APP" 2>&1 | sed 's/^/  /' || die "codesign failed"
@@ -299,6 +311,30 @@ else
   codesign --force --options "$COCORE_CLI_OPTS" --timestamp \
     --sign "$COCORE_SIGN_ID" "$APP/Contents/MacOS/cocore" 2>&1 | sed 's/^/  /' \
     || die "codesign (bundled cocore CLI) failed"
+
+  # Fleet confidential build: nest the measured push-receiver worker bundle.
+  # build-confidential-worker.sh builds `--features apns` and produces a fully
+  # signed CoCoreProvider.app (inside-out: dylib + metallib + worker exe with
+  # the embedded provisioning profile + aps-environment entitlement, worker +
+  # bundle both signed runtime,library so CS_REQUIRE_LV survives → the
+  # attestation reports libraryValidation=true). We build it AFTER the outer
+  # cocore CLI is already installed into the bundle (its `cargo build --features
+  # apns` overwrites target/release/cocore, which we no longer read), then nest
+  # it under Contents/. The final outer `codesign "$APP"` below runs WITHOUT
+  # --deep, so it seals this already-signed nested bundle by reference — it does
+  # NOT re-sign the worker exe, so the worker keeps its runtime,library flags.
+  if [[ "$COCORE_BUILD_APNS" == "1" ]]; then
+    bold "==> build + nest the confidential worker (CoCoreProvider.app)"
+    COCORE_SIGN_ID="$COCORE_SIGN_ID" \
+      "$REPO_ROOT/scripts/build-confidential-worker.sh" 2>&1 | sed 's/^/  /' \
+      || die "confidential worker build failed"
+    WORKER_SRC="$SHELL_DIR/build/CoCoreProvider.app"
+    [[ -d "$WORKER_SRC" ]] || die "confidential worker bundle not found at $WORKER_SRC"
+    rm -rf "$APP/Contents/CoCoreProvider.app"
+    cp -R "$WORKER_SRC" "$APP/Contents/CoCoreProvider.app"
+    note "nested $APP/Contents/CoCoreProvider.app"
+  fi
+
   codesign --force --options runtime --timestamp \
     --entitlements "$ENTITLEMENTS" \
     --sign "$COCORE_SIGN_ID" "$APP" 2>&1 | sed 's/^/  /' || die "codesign failed"

@@ -36,10 +36,25 @@ die()  { printf '\033[31m  error:\033[0m %s\n' "$*" >&2; exit 1; }
 [[ -f "$PROFILE" ]] || die "provisioning profile not found at $PROFILE (set COCORE_PROVISION_PROFILE)"
 xcodebuild -version >/dev/null 2>&1 || die "needs full Xcode (Metal toolchain) for the native engine + metallib"
 
-SIGN_ID="$(security find-identity -p codesigning -v 2>/dev/null \
-  | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
-[[ -n "$SIGN_ID" ]] || die "no Developer ID Application identity in the keychain"
+# Version comes from provider/Cargo.toml so the worker bundle never drifts from
+# the agent it wraps (one version source, not a 4th place to bump). CFBundleVersion
+# mirrors the outer app's scheme: 0.MINOR.PATCH → MINOR*100+PATCH (0.9.20 → 920).
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$PROVIDER/Cargo.toml" | head -1)"
+[[ -n "$VERSION" ]] || die "could not read version from $PROVIDER/Cargo.toml"
+BUNDLE_VERSION="$(printf '%s' "$VERSION" | awk -F. '{printf "%d", $2*100 + $3}')"
+
+# Signing identity. The outer build (build-mac-app.sh) passes COCORE_SIGN_ID so
+# the worker is signed by the SAME Developer ID as the app that nests it;
+# standalone, we auto-detect. A real Developer ID is REQUIRED — the confidential
+# tier's code-identity leg depends on it (an ad-hoc/forked sign is AMFI-rejected).
+SIGN_ID="${COCORE_SIGN_ID:-}"
+if [[ -z "$SIGN_ID" || "$SIGN_ID" == "-" ]]; then
+  SIGN_ID="$(security find-identity -p codesigning -v 2>/dev/null \
+    | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+fi
+[[ -n "$SIGN_ID" && "$SIGN_ID" != "-" ]] || die "no Developer ID Application identity (set COCORE_SIGN_ID or install one)"
 note "signing identity: $SIGN_ID"
+note "version: $VERSION (CFBundleVersion $BUNDLE_VERSION)"
 
 bold "==> build the apns (native + push host) agent binary"
 ( cd "$PROVIDER" && cargo build --release --locked --features apns )
@@ -80,8 +95,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>co/core provider</string>
     <key>CFBundleExecutable</key><string>cocore-provider</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.9.19</string>
-    <key>CFBundleVersion</key><string>919</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+    <key>CFBundleVersion</key><string>${BUNDLE_VERSION}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
 </dict>

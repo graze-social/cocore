@@ -110,6 +110,12 @@ impl AdvisorClient {
         // reload — compared to THIS set (not what loaded) so a model that
         // won't fit RAM doesn't look like a perpetual change.
         desired_at_start: &[String],
+        // The `desiredTier` this serve loaded against (`None` == best-effort).
+        // If the owner flips it on the console (opt in to / out of
+        // attested-confidential) we detect the change here and restart, so the
+        // supervisor re-selects the right worker binary on the next spawn (the
+        // confidential push-receiver bundle vs. the default best-effort CLI).
+        desired_tier_at_start: Option<&str>,
         // Per-model schedules + the full configured set they apply to. The
         // serve loop watches for a window boundary (a model's active state
         // flipping) and restarts to reload the new active set.
@@ -318,12 +324,26 @@ impl AdvisorClient {
                 }
                 // A control re-read finished. Honour two owner changes: a
                 // stop (disconnect) and a model-set edit (restart to reload).
-                Some((next_active, desired)) = active_reads.next(), if !active_reads.is_empty() => {
+                Some((next_active, desired, desired_tier)) = active_reads.next(), if !active_reads.is_empty() => {
                     if !next_active {
                         // Owner stopped us — disconnect and let the outer loop
                         // hold us out of the registry until they start us again.
                         tracing::info!("owner stopped this machine from the console; disconnecting");
                         return Ok(());
+                    }
+                    if tier_changed(desired_tier.as_deref(), desired_tier_at_start) {
+                        // Owner changed this machine's trust tier on the console
+                        // (opted in to / out of attested-confidential). The
+                        // confidential path needs a different process shape — the
+                        // measured push-receiver bundle vs. the default CLI — which
+                        // only the supervisor can select at spawn. Exit non-zero so
+                        // launchd / the app supervisor respawns; the fresh boot reads
+                        // the new tier and the supervisor picks the right binary.
+                        tracing::info!(
+                            from = ?desired_tier_at_start, to = ?desired_tier,
+                            "owner changed this machine's trust tier from the console; restarting to re-select the worker"
+                        );
+                        std::process::exit(3);
                     }
                     if models_changed(&desired, desired_at_start) {
                         // Owner edited the model set on the website. Engines
@@ -581,8 +601,21 @@ impl AdvisorClient {
 /// PDS. A free fn (rather than two inline `async` blocks) so both
 /// `active_reads.push` sites produce the SAME future type — `FuturesUnordered`
 /// holds one anonymous type.
-async fn read_provider_control(pds: &PdsClient, rkey: &str) -> (bool, Vec<String>) {
+async fn read_provider_control(pds: &PdsClient, rkey: &str) -> (bool, Vec<String>, Option<String>) {
     pds.get_provider_control(rkey).await
+}
+
+/// Whether two `desiredTier` values differ, normalising `None` to the
+/// best-effort default so an absent field and an explicit `"best-effort"` are
+/// the same thing (no spurious restart). A real change — e.g. the owner opting
+/// into `attested-confidential` from the console, or back out — returns true,
+/// which restarts the agent so the supervisor re-selects the right binary.
+fn tier_changed(a: Option<&str>, b: Option<&str>) -> bool {
+    let norm = |t: Option<&str>| match t {
+        Some("attested-confidential") => "attested-confidential",
+        _ => "best-effort",
+    };
+    norm(a) != norm(b)
 }
 
 /// Whether two model sets differ, ignoring order and duplicates — so a
@@ -1419,6 +1452,29 @@ mod tests {
         assert!(models_changed(&a(&["x", "y"]), &a(&["x"]))); // removed
         assert!(models_changed(&a(&["x"]), &[])); // cleared → local default
         assert!(models_changed(&[], &a(&["x"]))); // newly pinned
+    }
+
+    #[test]
+    fn tier_changed_normalises_default_and_catches_opt_in_out() {
+        // Absent and explicit best-effort are the same → no restart.
+        assert!(!tier_changed(None, None));
+        assert!(!tier_changed(None, Some("best-effort")));
+        assert!(!tier_changed(Some("best-effort"), None));
+        assert!(!tier_changed(Some("best-effort"), Some("best-effort")));
+        // An unknown/garbage tier normalises to best-effort, not a restart loop.
+        assert!(!tier_changed(Some("wat"), None));
+        // Staying confidential → no restart.
+        assert!(!tier_changed(
+            Some("attested-confidential"),
+            Some("attested-confidential")
+        ));
+        // Opting in and opting back out → a real change (restart to re-select).
+        assert!(tier_changed(Some("attested-confidential"), None));
+        assert!(tier_changed(None, Some("attested-confidential")));
+        assert!(tier_changed(
+            Some("attested-confidential"),
+            Some("best-effort")
+        ));
     }
 
     use crate::engines::stub::StubEngine;
