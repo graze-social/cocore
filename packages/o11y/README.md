@@ -18,13 +18,13 @@ These are the **standard OTLP env vars** read by the OTel SDKs themselves, so an
 OTLP backend works. Set them on every deployed process (each appview / services /
 advisor / console instance, and the Rust provider).
 
-| Var | Required | Notes |
-|---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | **yes** (turns o11y on) | Base URL; the SDK appends `/v1/traces`, `/v1/metrics`, `/v1/logs`. |
-| `OTEL_EXPORTER_OTLP_HEADERS` | for authed backends | Comma-separated `key=value` pairs (e.g. an ingest key). |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no | Override the traces endpoint only. |
-| `OTEL_SERVICE_NAME` | no | Overrides the per-service name baked into code. |
-| `OTEL_SERVICE_VERSION` | no | Tag a build/release. |
+| Var                                  | Required                | Notes                                                              |
+| ------------------------------------ | ----------------------- | ------------------------------------------------------------------ |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`        | **yes** (turns o11y on) | Base URL; the SDK appends `/v1/traces`, `/v1/metrics`, `/v1/logs`. |
+| `OTEL_EXPORTER_OTLP_HEADERS`         | for authed backends     | Comma-separated `key=value` pairs (e.g. an ingest key).            |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no                      | Override the traces endpoint only.                                 |
+| `OTEL_SERVICE_NAME`                  | no                      | Overrides the per-service name baked into code.                    |
+| `OTEL_SERVICE_VERSION`               | no                      | Tag a build/release.                                               |
 
 Do **not** set `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` — the exporters are OTLP/HTTP
 (protobuf) on both the TS (`exporter-*-otlp-http`) and Rust (`http-proto`) sides.
@@ -62,11 +62,11 @@ environment of the same name, and put that environment's Ingest key in the
 matching Railway environment's `OTEL_EXPORTER_OTLP_HEADERS`. PR/preview
 environments are intentionally left uninstrumented (no key → hard no-op).
 
-| Railway env | Honeycomb env | Where the key goes |
-|---|---|---|
-| `production` | `production` | `OTEL_EXPORTER_OTLP_HEADERS` on the prod AppView/Advisor/Client services |
-| `dev` | `dev` | same, on the dev services |
-| `cocore-pr-*` | — | unset (telemetry stays off) |
+| Railway env   | Honeycomb env | Where the key goes                                                       |
+| ------------- | ------------- | ------------------------------------------------------------------------ |
+| `production`  | `production`  | `OTEL_EXPORTER_OTLP_HEADERS` on the prod AppView/Advisor/Client services |
+| `dev`         | `dev`         | same, on the dev services                                                |
+| `cocore-pr-*` | —             | unset (telemetry stays off)                                              |
 
 ## Privacy invariant
 

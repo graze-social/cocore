@@ -413,7 +413,13 @@ class MailboxSink implements SseResponse {
   statusCode = 200;
   private readonly encoder = new TextEncoder();
   private ended = false;
-  constructor(private readonly mailbox: Mailbox.Mailbox<Uint8Array>) {}
+  // NB: explicit field + assignment, not a TS parameter property. The advisor
+  // runs under `node --experimental-strip-types`, which rejects parameter
+  // properties (they emit code) with ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX.
+  private readonly mailbox: Mailbox.Mailbox<Uint8Array>;
+  constructor(mailbox: Mailbox.Mailbox<Uint8Array>) {
+    this.mailbox = mailbox;
+  }
   setHeader(): void {
     /* headers are set on the HttpServerResponse, not here */
   }
