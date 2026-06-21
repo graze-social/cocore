@@ -26,14 +26,6 @@ function annotate<A, E, R>(effect: Effect.Effect<A, E, R>, fields?: LogFields) {
   return Effect.annotateLogs(effect, clean);
 }
 
-export function logInfo(message: string, fields?: LogFields): Effect.Effect<void> {
-  return annotate(Effect.logInfo(message), fields);
-}
-
 export function logWarn(message: string, fields?: LogFields): Effect.Effect<void> {
   return annotate(Effect.logWarning(message), fields);
-}
-
-export function logError(message: string, fields?: LogFields): Effect.Effect<void> {
-  return annotate(Effect.logError(message), fields);
 }

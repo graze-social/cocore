@@ -5,16 +5,12 @@
 // the service name ("cocore-appview") is bound here.
 
 import type { HttpRouter } from "@effect/platform";
-import { makeNodeHandler, serveLayer, withServer } from "@cocore/o11y/http";
+import { makeNodeHandler, withServer } from "@cocore/o11y/http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 export { bearer, err, header, jsonBody, ok, searchParams } from "@cocore/o11y/http";
 
 const SERVICE = { serviceName: "cocore-appview" };
-
-/** Serve `Layer` for the AppView app on `port` (standalone / embedded). */
-export const serveAppview = (app: HttpRouter.HttpRouter<never, never>, port: number) =>
-  serveLayer(app, SERVICE, port);
 
 /** Launch the app on an ephemeral port for a single callback (tests). */
 export const withAppviewServer = <A>(

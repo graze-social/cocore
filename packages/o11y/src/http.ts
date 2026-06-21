@@ -2,7 +2,8 @@
 //
 // Services author routes as an `HttpRouter` (handlers are Effects returning
 // `HttpServerResponse`) and turn the app into a traced Node request listener
-// with `makeNodeHandler`, or launch it on a port with `serveLayer`. Either
+// with `makeNodeHandler`, or launch it on an ephemeral port for a callback
+// with `withServer`. Either
 // way a span per request is emitted to the service's o11y runtime and
 // exported to Honeycomb when OTLP is configured (a no-op otherwise).
 //
@@ -81,19 +82,6 @@ export function makeNodeHandler(
   const runtime = makeRuntime(config);
   return runtime.runPromise(
     NodeHttpServer.makeHandler(app).pipe(Effect.provide(NodeHttpServer.layerContext)),
-  );
-}
-
-/** Serve `Layer` for an app on `port`, with tracing. Launch with
- *  `Layer.launch` or provide within a larger program. */
-export function serveLayer(
-  app: HttpRouter.HttpRouter<never, never>,
-  config: O11yConfig,
-  port: number,
-) {
-  return HttpServer.serve(app).pipe(
-    Layer.provide(NodeHttpServer.layer(() => createServer(), { port })),
-    Layer.provide(tracingLayer(config)),
   );
 }
 

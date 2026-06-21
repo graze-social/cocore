@@ -98,12 +98,6 @@ function resolveDidDocument(
   return runtime.runPromise(didDocCache.get(did));
 }
 
-/** Test seam — flush the DID-document cache so cached resolutions don't
- *  leak across tests. */
-export function __resetIdentityCacheForTests(): void {
-  runtime.runSync(didDocCache.invalidateAll);
-}
-
 function readBearer(request: Request): string | null {
   const h = request.headers.get("authorization");
   if (!h) return null;
