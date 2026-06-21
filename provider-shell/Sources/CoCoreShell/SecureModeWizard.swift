@@ -181,8 +181,6 @@ struct SecureModeWizardView: View {
     /// Active poll task, cancelled when the user skips/closes a step.
     @State private var pollTask: Task<Void, Never>?
 
-    private var consoleURL: String { Endpoints.consoleURL }
-
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -514,15 +512,29 @@ struct SecureModeWizardView: View {
         }
     }
 
-    /// POST {consoleURL}/api/agent/mdm/enroll-profile {serial,udid} → returns the
+    /// The paired service's base URL + bearer key. Every /api/agent/* call —
+    /// including the MDM coordinator endpoints — must target the service that
+    /// paired us (`session.apiBase`) and carry our key, or it 401s. Using the
+    /// baked console URL or omitting the header is the classic failure mode;
+    /// see AppState.refreshStatus / AgentSupervisor for the same posture.
+    private func agentAuth() throws -> (base: String, apiKey: String) {
+        guard let s = state.session, let key = s.apiKey, let base = s.apiBase else {
+            throw WizardError.notPaired
+        }
+        return (base, key)
+    }
+
+    /// POST {apiBase}/api/agent/mdm/enroll-profile {serial,udid} → returns the
     /// .mobileconfig bytes + an enrollmentId.
     private func fetchEnrollProfile() async throws -> (Data, String?) {
-        guard let url = URL(string: "\(consoleURL)/api/agent/mdm/enroll-profile") else {
+        let (base, apiKey) = try agentAuth()
+        guard let url = URL(string: "\(base)/api/agent/mdm/enroll-profile") else {
             throw WizardError.badURL
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 20
         let body = ["serial": serial, "udid": udid]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -585,14 +597,16 @@ struct SecureModeWizardView: View {
         }
     }
 
-    /// POST {consoleURL}/api/agent/mdm/push-attestation {serial,enrollmentId}.
+    /// POST {apiBase}/api/agent/mdm/push-attestation {serial,enrollmentId}.
     private func pushAttestation() async throws {
-        guard let url = URL(string: "\(consoleURL)/api/agent/mdm/push-attestation") else {
+        let (base, apiKey) = try agentAuth()
+        guard let url = URL(string: "\(base)/api/agent/mdm/push-attestation") else {
             throw WizardError.badURL
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 20
         var body: [String: String] = ["serial": serial]
         if let id = enrollmentId { body["enrollmentId"] = id }
@@ -603,16 +617,17 @@ struct SecureModeWizardView: View {
         }
     }
 
-    /// Poll GET {consoleURL}/api/agent/mdm/attestation-chain?serial=... until a
+    /// Poll GET {apiBase}/api/agent/mdm/attestation-chain?serial=... until a
     /// chain returns (or timeout).
     private func pollForAttestationChain() {
         pollTask?.cancel()
         pollTask = Task {
             let deadline = Date().addingTimeInterval(180)
             guard
+                let auth = try? agentAuth(),
                 let serialEnc = serial.addingPercentEncoding(
                     withAllowedCharacters: .urlQueryAllowed),
-                let url = URL(string: "\(consoleURL)/api/agent/mdm/attestation-chain?serial=\(serialEnc)")
+                let url = URL(string: "\(auth.base)/api/agent/mdm/attestation-chain?serial=\(serialEnc)")
             else {
                 working = false
                 stepError = "We couldn't build the attestation-chain request."
@@ -620,6 +635,7 @@ struct SecureModeWizardView: View {
             }
             while !Task.isCancelled, Date() < deadline {
                 var req = URLRequest(url: url)
+                req.setValue("Bearer \(auth.apiKey)", forHTTPHeaderField: "Authorization")
                 req.timeoutInterval = 15
                 if let (data, resp) = try? await URLSession.shared.data(for: req),
                     (resp as? HTTPURLResponse)?.statusCode == 200,
@@ -685,10 +701,12 @@ struct SecureModeWizardView: View {
     private enum WizardError: LocalizedError {
         case badURL
         case http(Int)
+        case notPaired
         var errorDescription: String? {
             switch self {
             case .badURL: return "bad URL"
             case .http(let c): return "HTTP \(c)"
+            case .notPaired: return "this Mac isn't paired with co/core yet — finish pairing first"
             }
         }
     }
