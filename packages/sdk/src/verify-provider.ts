@@ -33,6 +33,7 @@
 
 import { canonicalBytes } from "./canonical.ts";
 import { type MdaResult, verifyChain, verifyChainAgainst } from "./mda.ts";
+import { verifyAppAttestB64, APP_ATTEST_APP_ID } from "./appattest.ts";
 import { verifyAttestationSignature, verifyP256, SignatureVerifyError } from "./p256.ts";
 import type { AttestationRecord, Tier } from "./types.ts";
 import type { Finding, Severity, ValidationReport } from "./validate.ts";
@@ -115,6 +116,13 @@ export interface VerifyProviderOptions {
    *  cross-language fixture sets it to a synthetic root. Mirrors mda.ts's
    *  `verifyChainAgainst`. */
   trustAnchorDer?: Uint8Array;
+  /** ADVANCED / TEST ONLY. Verify the App Attest object against this DER trust
+   *  anchor instead of the embedded Apple App Attest Root. Production callers
+   *  leave this unset; the cross-language fixture sets a synthetic root. */
+  appAttestTrustAnchorDer?: Uint8Array;
+  /** Accept the development App Attest AAGUID in addition to production.
+   *  Default false (production only). Test/dev seam. */
+  allowDevelopmentAppAttest?: boolean;
 }
 
 export interface ProviderVerifyResult extends ValidationReport {
@@ -211,10 +219,34 @@ export async function verifyProviderForSeal(
     }
   }
 
-  // --- 1+2. MDA chain present, verifies, and is bound to the signing key. ---
+  // --- 1+2. Hardware attestation: a bound App Attest object OR a bound MDA
+  // chain. Either proves genuine Apple hardware tied to the signing key.
+  //
+  // App Attest (attestation.appAttest) is the MDM-free path: the helper set
+  // clientDataHash = sha256(publicKey), so a verifying object is bound to the
+  // signing key by construction (verifyAppAttestB64 checks the credCert nonce
+  // extension). If a bound App Attest object is present it SATISFIES the
+  // hardware-attestation requirement and the MDA gate is skipped; otherwise we
+  // fall back to the MDA chain exactly as before.
   let mda: MdaResult | undefined;
-  if (!mdaChain || mdaChain.length === 0) {
-    block("no-mda-chain", "attestation carries no MDA certificate chain");
+  const aa = attestation.appAttest;
+  const appAttestBinds =
+    !!aa &&
+    !!aa.object &&
+    !!aa.keyId &&
+    verifyAppAttestB64(aa.object, aa.keyId, attestation.publicKey, APP_ATTEST_APP_ID, {
+      trustAnchorDer: opts.appAttestTrustAnchorDer,
+      allowDevelopment: opts.allowDevelopmentAppAttest,
+      now,
+    });
+
+  if (appAttestBinds) {
+    // Hardware-attested via App Attest; no MDA chain required.
+  } else if (!mdaChain || mdaChain.length === 0) {
+    block(
+      "no-mda-chain",
+      "attestation carries no MDA certificate chain and no valid bound App Attest object",
+    );
   } else {
     try {
       const chainDer = mdaChain.map((b64) => base64ToBytes(b64));

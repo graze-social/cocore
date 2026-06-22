@@ -404,6 +404,62 @@ const CONF_FIXTURE = join(
   "confidential-attestation-fixture.json",
 );
 
+const CONF_APPATTEST_FIXTURE = join(
+  new URL(".", import.meta.url).pathname,
+  "..",
+  "..",
+  "..",
+  "target",
+  "confidential-appattest-fixture.json",
+);
+
+// The MDM-free parity test: a confidential attestation whose hardware
+// attestation is an App Attest object (no MDA chain) must ALSO verify as
+// attested-confidential, with the App Attest object bound to the signing key.
+test.skipIf(!existsSync(CONF_APPATTEST_FIXTURE))(
+  "cross-language: a Rust App-Attest confidential attestation verifies as attested-confidential",
+  async () => {
+    const f = JSON.parse(readFileSync(CONF_APPATTEST_FIXTURE, "utf-8"));
+    const appAttestRootDer = Uint8Array.from(Buffer.from(f.appAttestRootDerB64, "base64"));
+    const att = f.attestation as AttestationRecord;
+
+    // No MDA chain at all — hardware attestation comes solely from att.appAttest.
+    const noKey = await verifyProviderForSeal(att, undefined, {
+      requireConfidential: true,
+      requireCodeAttested: false,
+      knownGoodCdHashes: [f.knownGoodCdHash],
+      knownGoodMetallibHashes: [f.knownGoodMetallibHash],
+      knownGoodEngineLibHashes: [f.knownGoodEngineLibHash],
+      osFloor: f.osFloor,
+      appAttestTrustAnchorDer: appAttestRootDer,
+      now: () => new Date(),
+    });
+    assert.equal(
+      noKey.tier,
+      "attested-confidential",
+      `unexpected findings: ${JSON.stringify(noKey.findings)}`,
+    );
+    assert.equal(noKey.ok, true);
+    assert.equal(noKey.sealToKey, att.encryptionPubKey);
+
+    // App Attest is load-bearing: verify the SAME (untampered) attestation but
+    // against the real Apple App Attest root, which did not sign the synthetic
+    // object → it fails to verify, doesn't bind, and with no MDA fallback the
+    // result drops to best-effort. selfSignature still passes (publicKey is
+    // unchanged), so the only blocker is the missing hardware attestation.
+    const downgraded = await verifyProviderForSeal(att, undefined, {
+      requireConfidential: false, // observe the downgrade rather than throw
+      requireCodeAttested: false,
+      knownGoodCdHashes: [f.knownGoodCdHash],
+      // omit appAttestTrustAnchorDer → uses the embedded real Apple root
+      now: () => new Date(),
+    });
+    assert.equal(downgraded.tier, "best-effort");
+    assert.ok(codes(downgraded.findings).includes("no-mda-chain"));
+    assert.ok(!codes(downgraded.findings).includes("attestation-signature-invalid"));
+  },
+);
+
 test.skipIf(!existsSync(CONF_FIXTURE))(
   "cross-language: a Rust confidential attestation verifies as attested-confidential",
   async () => {
