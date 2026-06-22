@@ -151,7 +151,7 @@ export type DispatchEvent =
       providerDid: string;
       sessionId: string;
     }
-  | { kind: "chunk"; seq: number; text: string }
+  | { kind: "chunk"; seq: number; channel: "content" | "reasoning"; text: string }
   | {
       kind: "complete";
       tokensIn: number;
@@ -548,7 +548,11 @@ export async function* runDispatch(
     for await (const ev of readSse(advisorBody)) {
       if (ev.event === "open") continue;
       if (ev.event === "chunk") {
-        let parsed: { seq: number; ciphertext: number[] | string };
+        let parsed: {
+          seq: number;
+          channel?: "content" | "reasoning";
+          ciphertext: number[] | string;
+        };
         try {
           parsed = JSON.parse(ev.data);
         } catch {
@@ -563,7 +567,12 @@ export async function* runDispatch(
           yield { kind: "error", reason: "chunk decrypt failed", code: "chunk-decrypt-failed" };
           continue;
         }
-        yield { kind: "chunk", seq: parsed.seq, text: new TextDecoder().decode(opened) };
+        yield {
+          kind: "chunk",
+          seq: parsed.seq,
+          channel: parsed.channel ?? "content",
+          text: new TextDecoder().decode(opened),
+        };
         continue;
       }
       if (ev.event === "complete") {

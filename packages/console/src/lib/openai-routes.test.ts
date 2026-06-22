@@ -62,7 +62,7 @@ const baseBody = {
 describe("handleChatCompletions wire contract", () => {
   test("stream:true happy path returns text/event-stream, not JSON", async () => {
     state.events = [
-      { kind: "chunk", seq: 0, text: "hello" },
+      { kind: "chunk", seq: 0, channel: "content", text: "hello" },
       { kind: "complete", tokensIn: 1, tokensOut: 1, receiptUri: "at://x" },
     ];
     const res = await handleChatCompletions(streamRequest(baseBody));

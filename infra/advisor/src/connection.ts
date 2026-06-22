@@ -452,6 +452,7 @@ export function handleConnection(
           type: "chunk",
           sessionId: msg.session_id,
           seq: msg.seq,
+          ...(msg.channel ? { channel: msg.channel } : {}),
           ciphertext: msg.ciphertext,
         });
         return;

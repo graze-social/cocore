@@ -161,6 +161,110 @@ pub struct GenerateResponse {
     pub tokens_out: u64,
 }
 
+/// Which logical channel a streamed delta belongs to. Thinking-capable
+/// models produce reasoning ("thinking") text that we keep distinct from
+/// the answer the requester acts on, so it can be committed, transported,
+/// and rendered separately. Defaults to [`Content`](DeltaChannel::Content)
+/// so engines and peers that know nothing about reasoning behave exactly
+/// as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaChannel {
+    #[default]
+    Content,
+    Reasoning,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Splits a plaintext content stream into [`Content`](DeltaChannel::Content)
+/// and [`Reasoning`](DeltaChannel::Reasoning) fragments by recognizing inline
+/// `<think>` / `</think>` markers. Local MLX models (Qwen, R1-distills) emit
+/// these tags directly in their token stream rather than on a separate field.
+///
+/// State is carried across [`push`](ThinkTagSplitter::push) calls so a marker
+/// split across two deltas (`"<thi"` then `"nk>"`) still parses: the splitter
+/// holds back any trailing bytes that could begin the marker it is currently
+/// hunting for, and emits them once the next delta resolves the ambiguity.
+/// Call [`finish`](ThinkTagSplitter::finish) at end of stream to flush a
+/// dangling partial marker as literal text.
+#[derive(Default)]
+pub struct ThinkTagSplitter {
+    inside: bool,
+    /// Bytes withheld because they might be the start of a marker that
+    /// completes in a later delta. Always valid UTF-8 (each delta is).
+    pending: String,
+}
+
+impl ThinkTagSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one raw content delta. Emits zero or more channel-tagged
+    /// fragments through `sink`.
+    pub fn push(
+        &mut self,
+        text: &str,
+        sink: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
+    ) -> Result<()> {
+        self.pending.push_str(text);
+        loop {
+            let (marker, channel) = if self.inside {
+                (THINK_CLOSE, DeltaChannel::Reasoning)
+            } else {
+                (THINK_OPEN, DeltaChannel::Content)
+            };
+            if let Some(idx) = self.pending.find(marker) {
+                if idx > 0 {
+                    sink(channel, &self.pending[..idx])?;
+                }
+                self.pending.drain(..idx + marker.len());
+                self.inside = !self.inside;
+                continue;
+            }
+            // No complete marker. Emit everything that cannot be the start
+            // of one; hold back the longest suffix that is a marker prefix.
+            let hold = longest_marker_prefix_suffix(&self.pending, marker);
+            let emit_len = self.pending.len() - hold;
+            if emit_len > 0 {
+                sink(channel, &self.pending[..emit_len])?;
+                self.pending.drain(..emit_len);
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// Flush any buffered tail at end of stream. A dangling partial marker
+    /// is surfaced as literal text on the current channel.
+    pub fn finish(&mut self, sink: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>) -> Result<()> {
+        if !self.pending.is_empty() {
+            let channel = if self.inside {
+                DeltaChannel::Reasoning
+            } else {
+                DeltaChannel::Content
+            };
+            sink(channel, &self.pending)?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Length (in bytes) of the longest suffix of `buf` that is a prefix of
+/// `marker`. Markers are ASCII, so a matching suffix is ASCII too and the
+/// returned offset always lands on a char boundary.
+fn longest_marker_prefix_suffix(buf: &str, marker: &str) -> usize {
+    let buf = buf.as_bytes();
+    let marker = marker.as_bytes();
+    let max = marker.len().min(buf.len());
+    (1..=max)
+        .rev()
+        .find(|&n| buf[buf.len() - n..] == marker[..n])
+        .unwrap_or(0)
+}
+
 /// Anything that can answer an inference request. Implementations may
 /// be expensive to construct (a vllm-mlx engine takes several seconds
 /// to warm a model into MLX-managed Metal buffers); the advisor is
@@ -192,8 +296,12 @@ pub trait Engine: Send + Sync {
     /// response when the engine only implements token deltas.
     fn generate(&self, request: &GenerateRequest) -> Result<GenerateResponse> {
         let mut text = String::new();
-        let resp = self.generate_stream(request, &mut |delta| {
-            text.push_str(delta);
+        let resp = self.generate_stream(request, &mut |channel, delta| {
+            // The buffered convenience result is the answer only; reasoning
+            // is dropped here (callers that want it use the streaming path).
+            if channel == DeltaChannel::Content {
+                text.push_str(delta);
+            }
             Ok(())
         })?;
         Ok(GenerateResponse {
@@ -210,10 +318,10 @@ pub trait Engine: Send + Sync {
     fn generate_stream(
         &self,
         request: &GenerateRequest,
-        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+        on_delta: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
     ) -> Result<GenerateResponse> {
         let resp = self.generate_once(request)?;
-        on_delta(&resp.text)?;
+        on_delta(DeltaChannel::Content, &resp.text)?;
         Ok(resp)
     }
 
@@ -257,6 +365,81 @@ pub trait Engine: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Drive a splitter over a sequence of deltas and collect the
+    /// channel-tagged fragments it emits (including the end-of-stream flush).
+    fn split(deltas: &[&str]) -> Vec<(DeltaChannel, String)> {
+        let mut splitter = ThinkTagSplitter::new();
+        let mut out: Vec<(DeltaChannel, String)> = Vec::new();
+        let mut sink = |ch: DeltaChannel, s: &str| {
+            out.push((ch, s.to_string()));
+            Ok(())
+        };
+        for d in deltas {
+            splitter.push(d, &mut sink).unwrap();
+        }
+        splitter.finish(&mut sink).unwrap();
+        out
+    }
+
+    /// Concatenate the fragments emitted on one channel.
+    fn channel_text(frags: &[(DeltaChannel, String)], want: DeltaChannel) -> String {
+        frags
+            .iter()
+            .filter(|(ch, _)| *ch == want)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn splitter_separates_inline_think_block() {
+        let frags = split(&["<think>reasoning here</think>the answer"]);
+        assert_eq!(
+            channel_text(&frags, DeltaChannel::Reasoning),
+            "reasoning here"
+        );
+        assert_eq!(channel_text(&frags, DeltaChannel::Content), "the answer");
+    }
+
+    #[test]
+    fn splitter_handles_marker_split_across_deltas() {
+        // The opening and closing markers are each split mid-tag across delta
+        // boundaries — the splitter must buffer and still recognize them.
+        let frags = split(&["<thi", "nk>deep ", "thoughts</th", "ink>done"]);
+        assert_eq!(
+            channel_text(&frags, DeltaChannel::Reasoning),
+            "deep thoughts"
+        );
+        assert_eq!(channel_text(&frags, DeltaChannel::Content), "done");
+    }
+
+    #[test]
+    fn splitter_passes_through_plain_content() {
+        let frags = split(&["just ", "an answer"]);
+        assert_eq!(
+            channel_text(&frags, DeltaChannel::Content),
+            "just an answer"
+        );
+        assert_eq!(channel_text(&frags, DeltaChannel::Reasoning), "");
+    }
+
+    #[test]
+    fn splitter_flushes_dangling_partial_marker_as_literal() {
+        // A `<` that never completes into `<think>` is real content, surfaced
+        // by `finish` rather than swallowed.
+        let frags = split(&["answer <"]);
+        assert_eq!(channel_text(&frags, DeltaChannel::Content), "answer <");
+    }
+
+    #[test]
+    fn splitter_treats_unclosed_think_as_reasoning() {
+        let frags = split(&["<think>still thinking"]);
+        assert_eq!(
+            channel_text(&frags, DeltaChannel::Reasoning),
+            "still thinking"
+        );
+        assert_eq!(channel_text(&frags, DeltaChannel::Content), "");
+    }
 
     /// Engine whose readiness is flippable, standing in for a subprocess
     /// engine whose Python child dies mid-serve.

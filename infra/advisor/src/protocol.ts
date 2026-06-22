@@ -126,6 +126,9 @@ export interface InferenceRequest {
 interface InferenceChunk {
   session_id: string;
   seq: number;
+  /** Which channel this chunk's plaintext belongs to. Absent (older
+   *  providers) means the answer. The advisor relays it opaquely. */
+  channel?: "content" | "reasoning";
   ciphertext: number[] | string;
 }
 

@@ -148,7 +148,7 @@ export function readBearer(request: Request): string | null {
 
 interface OpenAiChunkChoice {
   index: 0;
-  delta: { role?: "assistant"; content?: string };
+  delta: { role?: "assistant"; content?: string; reasoning_content?: string };
   finish_reason: null | "stop";
 }
 
@@ -286,7 +286,11 @@ export function streamingResponse(
       try {
         for await (const ev of events) {
           if (ev.kind === "chunk") {
-            send(chunkPayload(id, model, { content: ev.text }, null));
+            // Reasoning ("thinking") rides delta.reasoning_content, the
+            // vLLM/DeepSeek convention; the answer rides delta.content.
+            const delta =
+              ev.channel === "reasoning" ? { reasoning_content: ev.text } : { content: ev.text };
+            send(chunkPayload(id, model, delta, null));
           } else if (ev.kind === "complete") {
             // The final `stop` chunk carries the x_cocore credit so a
             // streaming client gets the same "who ran it" metadata the
@@ -345,6 +349,7 @@ export async function bufferedResponse(
   events: AsyncIterable<DispatchEvent>,
 ): Promise<Response> {
   let content = "";
+  let reasoning = "";
   let tokensIn = 0;
   let tokensOut = 0;
   let providerCredit: ProviderCredit | undefined;
@@ -352,8 +357,10 @@ export async function bufferedResponse(
   let errored: { reason: string; code: DispatchErrorCode } | null = null;
 
   for await (const ev of events) {
-    if (ev.kind === "chunk") content += ev.text;
-    else if (ev.kind === "complete") {
+    if (ev.kind === "chunk") {
+      if (ev.channel === "reasoning") reasoning += ev.text;
+      else content += ev.text;
+    } else if (ev.kind === "complete") {
       tokensIn = ev.tokensIn;
       tokensOut = ev.tokensOut;
       providerCredit = ev.providerCredit;
@@ -378,7 +385,11 @@ export async function bufferedResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content },
+          message: {
+            role: "assistant",
+            content,
+            ...(reasoning ? { reasoning_content: reasoning } : {}),
+          },
           finish_reason: "stop",
         },
       ],

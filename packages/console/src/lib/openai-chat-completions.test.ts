@@ -111,8 +111,8 @@ describe("bufferedResponse error mapping", () => {
       "chatcmpl-id",
       "stub",
       yieldEvents([
-        { kind: "chunk", seq: 0, text: "hello " },
-        { kind: "chunk", seq: 1, text: "world" },
+        { kind: "chunk", seq: 0, channel: "content", text: "hello " },
+        { kind: "chunk", seq: 1, channel: "content", text: "world" },
         { kind: "complete", tokensIn: 3, tokensOut: 2, receiptUri: "at://x" },
       ]),
     );
@@ -127,12 +127,45 @@ describe("bufferedResponse error mapping", () => {
     assert.equal(body.usage.total_tokens, 5);
   });
 
+  test("reasoning chunks surface as message.reasoning_content, separate from content", async () => {
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([
+        { kind: "chunk", seq: 0, channel: "reasoning", text: "let me think… " },
+        { kind: "chunk", seq: 1, channel: "reasoning", text: "2+2=4" },
+        { kind: "chunk", seq: 2, channel: "content", text: "The answer is 4." },
+        { kind: "complete", tokensIn: 3, tokensOut: 6, receiptUri: "at://x" },
+      ]),
+    );
+    const body = (await res.json()) as {
+      choices: Array<{ message: { content: string; reasoning_content?: string } }>;
+    };
+    assert.equal(body.choices[0]!.message.content, "The answer is 4.");
+    assert.equal(body.choices[0]!.message.reasoning_content, "let me think… 2+2=4");
+  });
+
+  test("no reasoning_content field when the model emitted no reasoning", async () => {
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([
+        { kind: "chunk", seq: 0, channel: "content", text: "hi" },
+        { kind: "complete", tokensIn: 1, tokensOut: 1, receiptUri: "" },
+      ]),
+    );
+    const body = (await res.json()) as {
+      choices: Array<{ message: { reasoning_content?: string } }>;
+    };
+    assert.equal(body.choices[0]!.message.reasoning_content, undefined);
+  });
+
   test("provider credit surfaces as an x_cocore block on the completion", async () => {
     const res = await bufferedResponse(
       "chatcmpl-id",
       "stub",
       yieldEvents([
-        { kind: "chunk", seq: 0, text: "hi" },
+        { kind: "chunk", seq: 0, channel: "content", text: "hi" },
         {
           kind: "complete",
           tokensIn: 1,
@@ -167,7 +200,7 @@ describe("bufferedResponse error mapping", () => {
       "chatcmpl-id",
       "stub",
       yieldEvents([
-        { kind: "chunk", seq: 0, text: "hi" },
+        { kind: "chunk", seq: 0, channel: "content", text: "hi" },
         { kind: "complete", tokensIn: 1, tokensOut: 1, receiptUri: "" },
       ]),
     );
@@ -242,7 +275,7 @@ describe("bufferedResponse error mapping", () => {
       "chatcmpl-id",
       "stub",
       yieldEvents([
-        { kind: "chunk", seq: 0, text: "partial" },
+        { kind: "chunk", seq: 0, channel: "content", text: "partial" },
         { kind: "error", reason: "boom", code: "advisor-rejected" },
       ]),
     );
@@ -272,7 +305,7 @@ describe("streamingResponse is an SSE stream", () => {
       "chatcmpl-id",
       "stub",
       yieldEvents([
-        { kind: "chunk", seq: 0, text: "hello world" },
+        { kind: "chunk", seq: 0, channel: "content", text: "hello world" },
         { kind: "complete", tokensIn: 3, tokensOut: 2, receiptUri: "at://x" },
       ]),
     );
@@ -301,6 +334,27 @@ describe("streamingResponse is an SSE stream", () => {
       .map((c) => c.choices[0]!.delta.content ?? "")
       .join("");
     assert.equal(contents, "hello world");
+  });
+
+  test("reasoning chunks ride delta.reasoning_content, content rides delta.content", async () => {
+    const res = streamingResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([
+        { kind: "chunk", seq: 0, channel: "reasoning", text: "thinking… " },
+        { kind: "chunk", seq: 1, channel: "content", text: "answer" },
+        { kind: "complete", tokensIn: 1, tokensOut: 2, receiptUri: "at://x" },
+      ]),
+    );
+    const data = await readSseData(res);
+    const deltas = data
+      .slice(0, -1)
+      .map((d) => JSON.parse(d) as { choices: Array<{ delta: Record<string, unknown> }> })
+      .map((c) => c.choices[0]!.delta);
+    const reasoning = deltas.map((d) => (d.reasoning_content as string) ?? "").join("");
+    const content = deltas.map((d) => (d.content as string) ?? "").join("");
+    assert.equal(reasoning, "thinking… ");
+    assert.equal(content, "answer");
   });
 
   test("an error-first dispatch streams the error on the DEFAULT event (OpenAI shape)", async () => {

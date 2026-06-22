@@ -135,7 +135,10 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
                   );
                 } else if (ev.kind === "chunk") {
                   controller.enqueue(
-                    sseFrame("chunk", JSON.stringify({ seq: ev.seq, text: ev.text })),
+                    sseFrame(
+                      "chunk",
+                      JSON.stringify({ seq: ev.seq, channel: ev.channel, text: ev.text }),
+                    ),
                   );
                 } else if (ev.kind === "complete") {
                   controller.enqueue(

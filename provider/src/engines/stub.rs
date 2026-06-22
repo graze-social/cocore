@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 
-use crate::engines::{Engine, GenerateRequest, GenerateResponse};
+use crate::engines::{DeltaChannel, Engine, GenerateRequest, GenerateResponse};
 use crate::pricing;
 
 pub struct StubEngine;
@@ -64,7 +64,7 @@ impl Engine for StubEngine {
     fn generate_stream(
         &self,
         request: &GenerateRequest,
-        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+        on_delta: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
     ) -> Result<GenerateResponse> {
         let resp = self.generate_once(request)?;
         // Slice the stub reply so local/dev runs exercise multi-chunk
@@ -72,7 +72,7 @@ impl Engine for StubEngine {
         for chunk in resp.text.as_bytes().chunks(32) {
             let piece = std::str::from_utf8(chunk).unwrap_or("");
             if !piece.is_empty() {
-                on_delta(piece)?;
+                on_delta(DeltaChannel::Content, piece)?;
             }
         }
         Ok(resp)

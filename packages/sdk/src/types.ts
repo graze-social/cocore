@@ -145,6 +145,10 @@ export interface ReceiptRecord {
   outputCommitment: string;
   /** Optional SHA-256 hex over the exact encrypted bytes delivered. */
   outputCipherCommitment?: string;
+  /** Optional SHA-256 hex over the plaintext reasoning ('thinking') output,
+   *  separate from outputCommitment. Present only when the model emitted
+   *  reasoning on a distinct channel. */
+  reasoningCommitment?: string;
   /** Optional SHA-256 hex over (ephemeralPubKey || sessionNonce) — proof the
    *  input was sealed to a fresh, enclave-bound ephemeral key for this job. */
   sessionKeyCommitment?: string;

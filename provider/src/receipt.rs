@@ -42,6 +42,10 @@ pub struct ReceiptInputs {
     /// requester. Lets a requester confirm the ciphertext they received
     /// is the one this receipt's signature commits to.
     pub output_cipher_commitment: Option<String>,
+    /// SHA-256 hex over the plaintext reasoning ('thinking') output the
+    /// provider produced, separate from `output_commitment`. `None` when
+    /// the model emitted no reasoning channel.
+    pub reasoning_commitment: Option<String>,
     /// Sampling parameters the provider committed to for this job.
     pub params: Option<GenerationParams>,
     pub output_cipher_url: Option<String>,
@@ -80,6 +84,8 @@ pub struct ReceiptRecord {
     pub outputCommitment: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputCipherCommitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoningCommitment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<GenerationParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +151,12 @@ pub fn build(
             .unwrap()
             .insert("outputCipherCommitment".into(), Value::String(c.clone()));
     }
+    if let Some(c) = &inputs.reasoning_commitment {
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("reasoningCommitment".into(), Value::String(c.clone()));
+    }
     if let Some(p) = &inputs.params {
         // Serialize through serde so only the present sub-fields appear,
         // byte-identical to how the typed record emits `params`.
@@ -175,6 +187,7 @@ pub fn build(
             inputCommitment: inputs.input_commitment,
             outputCommitment: inputs.output_commitment,
             outputCipherCommitment: inputs.output_cipher_commitment,
+            reasoningCommitment: inputs.reasoning_commitment,
             params: inputs.params,
             outputCipherURL: inputs.output_cipher_url,
             tokens: TokenCounts {
@@ -219,6 +232,7 @@ mod tests {
             input_commitment: "a".repeat(64),
             output_commitment: "b".repeat(64),
             output_cipher_commitment: None,
+            reasoning_commitment: None,
             params: None,
             output_cipher_url: None,
             tokens_in: 32,
@@ -264,6 +278,37 @@ mod tests {
         // `outputCipherURL` is absent (skip_serializing_if = None).
         let body = serde_json::to_value(&rec).unwrap();
         assert!(body.get("outputCipherURL").is_none());
+    }
+
+    #[test]
+    fn reasoning_commitment_present_only_when_set() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+
+        // Absent by default — a job with no reasoning omits the field.
+        let (rec, _) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
+        let body = serde_json::to_value(&rec).unwrap();
+        assert!(body.get("reasoningCommitment").is_none());
+
+        // Present (and signed) when the model produced reasoning.
+        let mut inputs = fixture(chrono::Utc::now());
+        inputs.reasoning_commitment = Some("d".repeat(64));
+        let (rec, _) = build(inputs, &*signer).unwrap();
+        let mut signed = serde_json::to_value(&rec).unwrap();
+        assert_eq!(signed["reasoningCommitment"], json!("d".repeat(64)));
+        // It is covered by the signature (verifies against record minus sig).
+        signed.as_object_mut().unwrap().remove("enclaveSignature");
+        let message = to_canonical_bytes(&signed).unwrap();
+        let sig_der = B64.decode(rec.enclaveSignature.as_bytes()).unwrap();
+        let pub_raw = B64.decode(signer.public_key_b64()).unwrap();
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        uncompressed[1..].copy_from_slice(&pub_raw);
+        let point = EncodedPoint::from_bytes(uncompressed).unwrap();
+        let vk = VerifyingKey::from_encoded_point(&point).unwrap();
+        let sig = Signature::from_der(&sig_der).unwrap();
+        vk.verify(&message, &sig)
+            .expect("signature must verify with reasoningCommitment present");
     }
 
     #[test]

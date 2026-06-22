@@ -51,6 +51,12 @@
             "maxLength": 64,
             "description": "Optional SHA-256 hex over the EXACT encrypted bytes delivered to the requester (the sealed reply). Lets a requester confirm the ciphertext they received is the one the provider's enclaveSignature commits to — defends against an intermediary swapping the delivered bytes. Covered by enclaveSignature like every other field."
           },
+          "reasoningCommitment": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "Optional SHA-256 hex over the plaintext reasoning ('thinking') output bytes the provider produced for this job, separate from outputCommitment which covers only the answer the requester acts on. Present only when the model emitted reasoning on a distinct channel (a sibling reasoning_content field, or inline <think>...</think> tags the provider split out). Lets a requester independently verify the reasoning trace without it perturbing the answer's commitment. Covered by enclaveSignature."
+          },
           "sessionKeyCommitment": {
             "type": "string",
             "minLength": 64,

@@ -35,6 +35,7 @@ import {
   titleFromText,
 } from "@/components/chat/chat-store.ts";
 import { ChatMarkdown } from "@/components/chat/chat-markdown.tsx";
+import { ThinkingDisclosure } from "@/components/chat/chat-thinking.tsx";
 import { modelDirectoryRouteQueryOptions } from "@/components/models/models.functions.ts";
 import { formatTokensCompact } from "@/lib/token-display.ts";
 import type { ModelDirectoryEntry } from "@/lib/model-directory.server.ts";
@@ -1312,6 +1313,7 @@ export function ChatPage(): ReactElement {
       id: newSessionId(),
       role: "assistant",
       text: "",
+      reasoning: "",
       modelId,
       createdAt: now,
     };
@@ -1345,6 +1347,12 @@ export function ChatPage(): ReactElement {
         },
         onChunk: (chunk) => {
           patchMessage(sessionId, assistantMsg.id, (m) => ({ ...m, text: m.text + chunk }));
+        },
+        onReasoning: (chunk) => {
+          patchMessage(sessionId, assistantMsg.id, (m) => ({
+            ...m,
+            reasoning: (m.reasoning ?? "") + chunk,
+          }));
         },
       });
       patchMessage(sessionId, assistantMsg.id, (m) => ({
@@ -1599,6 +1607,12 @@ export function ChatPage(): ReactElement {
                         ) : null}
                       </div>
                       <div {...stylex.props(styles.msgBody)}>
+                        {m.reasoning ? (
+                          <ThinkingDisclosure
+                            reasoning={m.reasoning}
+                            streaming={m.id === streamingId}
+                          />
+                        ) : null}
                         <ChatMarkdown streaming={m.id === streamingId} text={m.text} />
                       </div>
                       {m.meta ? (

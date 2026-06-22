@@ -28,6 +28,9 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
+  /** Assistant turns: the model's reasoning ("thinking") trace, streamed
+   *  on a separate channel from `text`. Rendered in a collapsible block. */
+  reasoning?: string;
   /** Assistant turns: model + provider that actually served the
    *  reply (the session's settings may have changed since). */
   modelId?: string;

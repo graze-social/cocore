@@ -232,7 +232,10 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
             }
             if (ev.kind === "chunk") {
               return encoder.encode(
-                sseFrame("chunk", JSON.stringify({ seq: ev.seq, text: ev.text })),
+                sseFrame(
+                  "chunk",
+                  JSON.stringify({ seq: ev.seq, channel: ev.channel, text: ev.text }),
+                ),
               );
             }
             if (ev.kind === "complete") {

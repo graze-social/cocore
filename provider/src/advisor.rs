@@ -21,15 +21,15 @@
 
 use crate::canonical::to_canonical_bytes;
 use crate::crypto::ProviderKeypair;
-use crate::engines::{Engine, EngineRegistry};
+use crate::engines::{DeltaChannel, Engine, EngineRegistry};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
 use crate::pds::PdsClient;
 use crate::pricing;
 use crate::protocol::{
-    AdvisorMessage, AttestationChallenge, AttestationResponse, CodeAttestationResponse,
-    HealthStanding, Heartbeat, InferenceChunk, InferenceComplete, InferenceRequest, Pong, Register,
-    SessionKey,
+    AdvisorMessage, AttestationChallenge, AttestationResponse, ChunkChannel,
+    CodeAttestationResponse, HealthStanding, Heartbeat, InferenceChunk, InferenceComplete,
+    InferenceRequest, Pong, Register, SessionKey,
 };
 use crate::receipt::{self, Money, ReceiptInputs, StrongRef};
 use crate::secure_enclave::SigningIdentity;
@@ -920,6 +920,7 @@ async fn handle_inference_request_inner(
                 AdvisorMessage::InferenceChunk(InferenceChunk {
                     session_id: session_id.clone(),
                     seq: 0,
+                    channel: ChunkChannel::Content,
                     ciphertext: err_ct,
                 }),
             );
@@ -951,24 +952,32 @@ async fn handle_inference_request_inner(
     // thread and bridge plaintext deltas back to this async task,
     // which seals each delta and forwards it to the advisor
     // immediately (live path) or collects frames for tests.
-    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel::<String>();
+    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel::<(DeltaChannel, String)>();
     let engine_for_blocking = engine.clone();
     let engine_handle = tokio::task::spawn_blocking(move || {
         let guard = ZeroizeOnDrop(request);
-        engine_for_blocking.generate_stream(&guard.0, &mut |delta| {
+        engine_for_blocking.generate_stream(&guard.0, &mut |channel, delta| {
             plain_tx
-                .send(delta.to_string())
+                .send((channel, delta.to_string()))
                 .map_err(|_| anyhow::anyhow!("stream bridge closed"))?;
             Ok(())
         })
     });
 
+    // The answer and the reasoning ("thinking") trace are sealed into the same
+    // ordered ciphertext stream (so outputCipherCommitment still covers every
+    // delivered byte) but accumulated separately so each gets its own plaintext
+    // commitment, and each chunk is tagged with its channel for the requester.
     let mut reply = Zeroizing::new(String::new());
+    let mut reasoning = Zeroizing::new(String::new());
     let mut all_ciphertext = Vec::new();
     let mut seq = 0u32;
 
-    while let Some(delta) = plain_rx.recv().await {
-        reply.push_str(&delta);
+    while let Some((channel, delta)) = plain_rx.recv().await {
+        match channel {
+            DeltaChannel::Content => reply.push_str(&delta),
+            DeltaChannel::Reasoning => reasoning.push_str(&delta),
+        }
         let ct = match ctx
             .encryption
             .seal_to(&req.requester_pub_key, delta.as_bytes())
@@ -984,12 +993,17 @@ async fn handle_inference_request_inner(
             }
         };
         all_ciphertext.extend_from_slice(&ct);
+        let chunk_channel = match channel {
+            DeltaChannel::Content => ChunkChannel::Content,
+            DeltaChannel::Reasoning => ChunkChannel::Reasoning,
+        };
         push_frame(
             live_tx.as_ref(),
             &mut collected,
             AdvisorMessage::InferenceChunk(InferenceChunk {
                 session_id: session_id.clone(),
                 seq,
+                channel: chunk_channel,
                 ciphertext: ct,
             }),
         );
@@ -1023,6 +1037,7 @@ async fn handle_inference_request_inner(
                         AdvisorMessage::InferenceChunk(InferenceChunk {
                             session_id: session_id.clone(),
                             seq: 0,
+                            channel: ChunkChannel::Content,
                             ciphertext: ct,
                         }),
                     );
@@ -1035,6 +1050,10 @@ async fn handle_inference_request_inner(
     let completed_at = Utc::now();
     let input_commitment = sha256_hex(&plaintext);
     let output_commitment = sha256_hex(reply.as_bytes());
+    // The reasoning trace gets its own commitment, present only when the model
+    // actually produced reasoning — keeps the answer's commitment independent
+    // of thinking output.
+    let reasoning_commitment = (!reasoning.is_empty()).then(|| sha256_hex(reasoning.as_bytes()));
     // Commit to the concatenation of every sealed chunk we handed
     // back, in order, so the requester can prove the ciphertext they
     // received matches the receipt.
@@ -1068,6 +1087,7 @@ async fn handle_inference_request_inner(
             input_commitment,
             output_commitment,
             Some(output_cipher_commitment),
+            reasoning_commitment,
             Some(params),
             started_at,
             completed_at,
@@ -1172,6 +1192,7 @@ async fn publish_stub_receipt(
     input_commitment: String,
     output_commitment: String,
     output_cipher_commitment: Option<String>,
+    reasoning_commitment: Option<String>,
     params: Option<receipt::GenerationParams>,
     started_at: chrono::DateTime<Utc>,
     completed_at: chrono::DateTime<Utc>,
@@ -1189,6 +1210,7 @@ async fn publish_stub_receipt(
         input_commitment,
         output_commitment,
         output_cipher_commitment,
+        reasoning_commitment,
         params,
         output_cipher_url: None,
         tokens_in,

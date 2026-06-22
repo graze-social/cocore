@@ -20,7 +20,7 @@
 //! It is loaded under ENFORCED library validation, so the owner cannot swap in a
 //! different dylib, and its hash is pinned like the metallib's.
 
-use super::{Engine, GenerateRequest, GenerateResponse};
+use super::{DeltaChannel, Engine, GenerateRequest, GenerateResponse, ThinkTagSplitter};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -171,7 +171,7 @@ impl Engine for NativeMlxEngine {
     fn generate_stream(
         &self,
         request: &GenerateRequest,
-        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+        on_delta: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
     ) -> Result<GenerateResponse> {
         use std::os::raw::{c_char, c_void};
 
@@ -185,10 +185,13 @@ impl Engine for NativeMlxEngine {
             .join("\n");
 
         // Trampoline: the C callback forwards each decoded delta to the Rust
-        // closure. We stash any closure error and stop forwarding (MLX still
+        // closure. Decoded tokens may carry inline <think>...</think> markers,
+        // so each delta is fed through a splitter that separates reasoning from
+        // the answer. We stash any closure error and stop forwarding (MLX still
         // finishes, but we report the error and never fabricate output).
         struct Ctx<'a> {
-            cb: &'a mut dyn FnMut(&str) -> Result<()>,
+            splitter: ThinkTagSplitter,
+            on_delta: &'a mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
             err: Option<anyhow::Error>,
         }
         extern "C" fn trampoline(delta: *const c_char, len: usize, ctx: *mut c_void) {
@@ -201,14 +204,17 @@ impl Engine for NativeMlxEngine {
             }
             let bytes = unsafe { std::slice::from_raw_parts(delta as *const u8, len) };
             if let Ok(s) = std::str::from_utf8(bytes) {
-                if let Err(e) = (ctx.cb)(s) {
+                // Disjoint field borrows: splitter is `&mut self`, on_delta is
+                // the sink.
+                if let Err(e) = ctx.splitter.push(s, &mut *ctx.on_delta) {
                     ctx.err = Some(e);
                 }
             }
         }
 
         let mut ctx = Ctx {
-            cb: on_delta,
+            splitter: ThinkTagSplitter::new(),
+            on_delta,
             err: None,
         };
         let mut tin: i32 = 0;
@@ -230,6 +236,15 @@ impl Engine for NativeMlxEngine {
             )
         };
         drop(guard);
+        // Flush any partial <think> marker buffered at end of stream.
+        if ctx.err.is_none() {
+            let Ctx {
+                splitter, on_delta, ..
+            } = &mut ctx;
+            if let Err(e) = splitter.finish(&mut **on_delta) {
+                ctx.err = Some(e);
+            }
+        }
         if let Some(e) = ctx.err {
             return Err(e);
         }
@@ -245,8 +260,10 @@ impl Engine for NativeMlxEngine {
 
     fn generate_once(&self, request: &GenerateRequest) -> Result<GenerateResponse> {
         let mut text = String::new();
-        let resp = self.generate_stream(request, &mut |delta| {
-            text.push_str(delta);
+        let resp = self.generate_stream(request, &mut |channel, delta| {
+            if channel == DeltaChannel::Content {
+                text.push_str(delta);
+            }
             Ok(())
         })?;
         Ok(GenerateResponse {
@@ -293,7 +310,7 @@ mod tests {
         };
         let mut streamed = String::new();
         let resp = eng
-            .generate_stream(&req, &mut |d| {
+            .generate_stream(&req, &mut |_channel, d| {
                 streamed.push_str(d);
                 Ok(())
             })

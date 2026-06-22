@@ -209,6 +209,7 @@ export interface ReceiptRecord {
   inputCommitment: string;
   outputCommitment: string;
   outputCipherCommitment?: string;
+  reasoningCommitment?: string;
   sessionKeyCommitment?: string;
   sessionNonce?: string;
   params?: Record<string, unknown>;

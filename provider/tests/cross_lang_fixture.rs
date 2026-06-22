@@ -40,6 +40,7 @@ fn writes_cross_lang_fixture() {
         // (and the cross-language golden fixture) are unchanged — both are
         // skip-serialized when absent.
         output_cipher_commitment: None,
+        reasoning_commitment: None,
         params: None,
         output_cipher_url: None,
         tokens_in: 32,

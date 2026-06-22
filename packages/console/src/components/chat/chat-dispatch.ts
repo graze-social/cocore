@@ -16,10 +16,14 @@ export interface ChatDispatchInputs {
   signal?: AbortSignal;
   onMeta?: (meta: { providerDid: string; jobUri: string }) => void;
   onChunk?: (text: string) => void;
+  /** Reasoning ("thinking") deltas, streamed on a separate channel from
+   *  the answer so the UI can render them in a collapsible block. */
+  onReasoning?: (text: string) => void;
 }
 
 export interface ChatDispatchResult {
   text: string;
+  reasoning: string;
   tokensIn: number;
   tokensOut: number;
   receiptUri: string | null;
@@ -111,6 +115,7 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
   }
 
   let text = "";
+  let reasoning = "";
   let providerDid: string | null = null;
 
   for await (const frame of readSse(res.body, inputs.signal)) {
@@ -124,9 +129,17 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
       }
     } else if (frame.event === "chunk") {
       try {
-        const chunk = JSON.parse(frame.data) as { text: string };
-        text += chunk.text;
-        inputs.onChunk?.(chunk.text);
+        const chunk = JSON.parse(frame.data) as {
+          text: string;
+          channel?: "content" | "reasoning";
+        };
+        if (chunk.channel === "reasoning") {
+          reasoning += chunk.text;
+          inputs.onReasoning?.(chunk.text);
+        } else {
+          text += chunk.text;
+          inputs.onChunk?.(chunk.text);
+        }
       } catch {
         // skip malformed chunk
       }
@@ -138,6 +151,7 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
       };
       return {
         text,
+        reasoning,
         tokensIn: parsed.tokensIn,
         tokensOut: parsed.tokensOut,
         receiptUri: parsed.receiptUri ?? null,

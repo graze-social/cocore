@@ -249,11 +249,31 @@ pub struct CodeAttestationResponse {
     pub signature: Vec<u8>,
 }
 
+/// Which logical channel a streamed chunk's plaintext belongs to. Lets a
+/// requester separate a thinking model's reasoning from the answer. Absent
+/// on the wire (old providers) deserializes to [`Content`](ChunkChannel::Content),
+/// so the field is purely additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkChannel {
+    #[default]
+    Content,
+    Reasoning,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceChunk {
     pub session_id: String,
     pub seq: u32,
+    #[serde(default, skip_serializing_if = "is_content_channel")]
+    pub channel: ChunkChannel,
     pub ciphertext: Vec<u8>,
+}
+
+/// Skip serializing the default `content` channel so existing wire bytes for
+/// answer chunks are unchanged; only `reasoning` chunks carry the field.
+fn is_content_channel(c: &ChunkChannel) -> bool {
+    matches!(c, ChunkChannel::Content)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,4 +315,43 @@ pub struct AttestationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hypervisor_present: Option<bool>,
     pub signature: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inference_chunk_channel_defaults_to_content_when_absent() {
+        // An old provider sends no `channel` field; it must deserialize as the
+        // answer channel so existing peers keep working.
+        let json = r#"{"session_id":"s","seq":0,"ciphertext":[1,2,3]}"#;
+        let chunk: InferenceChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.channel, ChunkChannel::Content);
+    }
+
+    #[test]
+    fn content_channel_is_omitted_but_reasoning_is_serialized() {
+        let content = InferenceChunk {
+            session_id: "s".into(),
+            seq: 0,
+            channel: ChunkChannel::Content,
+            ciphertext: vec![1],
+        };
+        let s = serde_json::to_string(&content).unwrap();
+        assert!(
+            !s.contains("channel"),
+            "content channel should be omitted: {s}"
+        );
+
+        let reasoning = InferenceChunk {
+            channel: ChunkChannel::Reasoning,
+            ..content
+        };
+        let s = serde_json::to_string(&reasoning).unwrap();
+        assert!(s.contains("\"channel\":\"reasoning\""), "got: {s}");
+        // And it round-trips back.
+        let back: InferenceChunk = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.channel, ChunkChannel::Reasoning);
+    }
 }
