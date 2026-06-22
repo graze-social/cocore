@@ -9,7 +9,6 @@
 // the dispatch generator) but keep the REAL `authenticate` /
 // `runTraced` path, since the effect/o11y conversion is what touched it.
 
-import assert from "node:assert/strict";
 import { describe, expect, test, vi } from "vitest";
 
 import type { DispatchEvent } from "./inference-dispatch.server.ts";
@@ -77,9 +76,7 @@ describe("handleChatCompletions wire contract", () => {
     // The regression guard: a dispatch failure must keep the SSE
     // content-type so the client renders the error rather than throwing
     // "not a stream" on a JSON body.
-    state.events = [
-      { kind: "error", reason: "no providers", code: "no-providers-connected" },
-    ];
+    state.events = [{ kind: "error", reason: "no providers", code: "no-providers-connected" }];
     const res = await handleChatCompletions(streamRequest(baseBody));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type") ?? "").toMatch(/^text\/event-stream/);

@@ -297,7 +297,7 @@ describe("streamingResponse is an SSE stream", () => {
     // The content chunk carries the streamed text.
     const contents = data
       .slice(0, -1)
-      .map((d) => (JSON.parse(d) as { choices: Array<{ delta: { content?: string } }> }))
+      .map((d) => JSON.parse(d) as { choices: Array<{ delta: { content?: string } }> })
       .map((c) => c.choices[0]!.delta.content ?? "")
       .join("");
     assert.equal(contents, "hello world");

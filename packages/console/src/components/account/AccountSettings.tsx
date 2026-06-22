@@ -120,6 +120,7 @@ const styles = stylex.create({
   },
   cardDescription: {
     fontSize: fontSize.xs,
+    lineHeight: lineHeight.base,
     color: uiColor.text1,
     fontWeight: fontWeight.normal,
   },
