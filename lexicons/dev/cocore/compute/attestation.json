@@ -114,7 +114,24 @@
             "type": "array",
             "items": { "type": "bytes", "maxLength": 8192 },
             "maxLength": 8,
-            "description": "Optional Apple Managed Device Attestation certificate chain (DER), leaf first. Present when trustLevel is 'hardware-attested'. Verifiers MUST: (1) verify every adjacent link to the embedded Apple Enterprise Attestation Root CA, enforcing BasicConstraints (non-leaf certs are CAs, the leaf is an end-entity); and (2) require the leaf's P-256 public key to EQUAL this record's `publicKey` — i.e. the chain is BOUND to the receipt-signing key. Without (2) a valid Apple chain for one device could be stapled onto an unrelated signing key, so a chain that verifies but isn't bound MUST NOT earn 'hardware-attested'. Producers (the MDA provisioning tool) MUST therefore attest the signing key itself."
+            "description": "Optional Apple Managed Device Attestation certificate chain (DER), leaf first. One of two paths to trustLevel 'hardware-attested' (the other is `appAttest`). Verifiers MUST: (1) verify every adjacent link to the embedded Apple Enterprise Attestation Root CA, enforcing BasicConstraints (non-leaf certs are CAs, the leaf is an end-entity); and (2) BIND the chain to this record's `publicKey` by EITHER the leaf's P-256 public key EQUALLING `publicKey`, OR the Apple freshness extension (OID 1.2.840.113635.100.8.11.1) committing to it as `freshnessCode == sha256(publicKey)`. Without a binding a valid Apple chain for one device could be stapled onto an unrelated signing key, so a chain that verifies but isn't bound MUST NOT earn 'hardware-attested'."
+          },
+          "appAttest": {
+            "type": "object",
+            "description": "Optional Apple App Attest evidence — the second, MDM-free path to trustLevel 'hardware-attested'. The provider's signed helper calls DCAppAttestService with `clientDataHash = sha256(publicKey)` (this record's receipt-signing key), so Apple's attestation commits to the signing key by construction. Verifiers MUST, offline: (1) CBOR-decode `object`, requiring fmt 'apple-appattest'; (2) verify the attStmt x5c chain to the embedded Apple App Attest Root CA; (3) recompute `nonce = sha256(authData || sha256(publicKey))` and require it to equal the credential certificate's nonce extension (OID 1.2.840.113635.100.8.2) — THIS is the binding to the signing key; (4) check authData's rpIdHash == sha256(App ID 'TEAMID.dev.cocore.provider'), the AAGUID is the genuine-hardware appattest value, and credentialId == sha256(attested public key) == `keyId`. A bound, valid App Attest object earns 'hardware-attested' exactly as a bound mdaCertChain does. It proves genuine, un-tampered Apple hardware holds a Secure-Enclave key bound to the signing key; it does NOT by itself prove the signing key is SE-resident nor that the running binary is honest (those are carried by the SE-backed signing identity + hardened-runtime + cdHash known-good gate, same self-measurement ceiling as the MDA path).",
+            "required": ["object", "keyId"],
+            "properties": {
+              "object": {
+                "type": "bytes",
+                "maxLength": 16384,
+                "description": "The CBOR App Attest attestation object returned by DCAppAttestService.attestKey, as produced for `clientDataHash = sha256(publicKey)`. Contains fmt, attStmt (x5c + receipt), and authData."
+              },
+              "keyId": {
+                "type": "bytes",
+                "maxLength": 64,
+                "description": "The App Attest key identifier (the SHA-256 of the attested public key) DCAppAttestService.generateKey returned. Verifiers cross-check this equals the credentialId in authData."
+              }
+            }
           },
           "selfSignature": {
             "type": "bytes",

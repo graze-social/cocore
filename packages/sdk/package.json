@@ -11,6 +11,8 @@
     "./firehose": "./src/firehose.ts",
     "./lex": "./src/lex-runtime.ts",
     "./mda": "./src/mda.ts",
+    "./appattest": "./src/appattest.ts",
+    "./verify-provider": "./src/verify-provider.ts",
     "./oauth-scope": "./src/oauth-scope.ts",
     "./p256": "./src/p256.ts",
     "./publish": "./src/publish.ts",

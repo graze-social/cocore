@@ -1,6 +1,7 @@
 export * from "./canonical.ts";
 export * from "./firehose.ts";
 export * from "./mda.ts";
+export * from "./appattest.ts";
 export * from "./p256.ts";
 export * from "./publish.ts";
 export * from "./seal.ts";

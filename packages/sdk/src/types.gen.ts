@@ -101,6 +101,7 @@ export interface AttestationRecord {
   authenticatedRootEnabled: boolean;
   rdmaDisabled?: boolean;
   mdaCertChain?: string[];
+  appAttest?: { object: string; keyId: string };
   selfSignature: string;
   attestedAt: string;
   expiresAt: string;

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
+from .appattest import APP_ATTEST_APP_ID, verify_app_attest_b64
 from .canonical import canonical_bytes
 from .mda import MdaError, verify_chain, verify_chain_against
 from .p256 import verify_attestation_signature, verify_p256
@@ -69,6 +70,8 @@ def verify_provider_for_seal(
     # AMFI-gated push is the one leg an operator can't forge). Mirrors the TS SDK.
     require_code_attested: bool = True,
     trust_anchor_der: Optional[bytes] = None,
+    app_attest_trust_anchor_der: Optional[bytes] = None,
+    allow_development_app_attest: bool = False,
     now: Optional[datetime] = None,
 ) -> VerifyResult:
     now = now or datetime.now(timezone.utc)
@@ -88,10 +91,36 @@ def verify_provider_for_seal(
             "attestation.selfSignature did not verify against attestation.publicKey",
         )
 
-    # 1+2. MDA chain present, verifies, bound to the signing key.
+    # 1+2. Hardware attestation: a bound App Attest object OR a bound MDA chain.
+    # App Attest (attestation["appAttest"]) is the MDM-free path: a verifying
+    # object is bound to the signing key by construction (clientDataHash =
+    # sha256(publicKey)). If present and bound it SATISFIES the requirement and
+    # the MDA gate is skipped; otherwise we fall back to the MDA chain as before.
     mda = None
-    if not mda_chain:
-        block("no-mda-chain", "attestation carries no MDA certificate chain")
+    pub_b64 = attestation.get("publicKey", "")
+    aa = attestation.get("appAttest")
+    app_attest_binds = bool(
+        aa
+        and aa.get("object")
+        and aa.get("keyId")
+        and verify_app_attest_b64(
+            aa["object"],
+            aa["keyId"],
+            pub_b64,
+            APP_ATTEST_APP_ID,
+            trust_anchor_der=app_attest_trust_anchor_der,
+            allow_development=allow_development_app_attest,
+            now=now,
+        )
+    )
+
+    if app_attest_binds:
+        pass  # hardware-attested via App Attest; no MDA chain required
+    elif not mda_chain:
+        block(
+            "no-mda-chain",
+            "attestation carries no MDA certificate chain and no valid bound App Attest object",
+        )
     else:
         chain_der = [base64.b64decode(c) for c in mda_chain]
         try:
@@ -108,7 +137,6 @@ def verify_provider_for_seal(
             # BINDING (parity with verify-provider.ts): bind to the signing key
             # via (A) leaf == publicKey, OR (B) freshness-code commits to it
             # (freshness == sha256(publicKey)). Fail-closed if neither holds.
-            pub_b64 = attestation.get("publicKey")
             leaf_binds = bool(mda.leaf_public_key) and mda.leaf_public_key == pub_b64
             fresh_binds = _freshness_binds_key(mda.freshness_code, pub_b64)
             if not leaf_binds and not fresh_binds:

@@ -15,6 +15,8 @@ import { HttpRouter } from "@effect/platform";
 import { Effect } from "effect";
 
 import { MdaError, verifyChain } from "@cocore/sdk/mda";
+import { verifyAppAttestB64, APP_ATTEST_APP_ID } from "@cocore/sdk/appattest";
+import { freshnessBindsKey } from "@cocore/sdk/verify-provider";
 import { verifyReceiptSignature } from "@cocore/sdk/p256";
 import { ids, lexicons } from "@cocore/sdk/lex";
 import type {
@@ -324,7 +326,31 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
           });
         }
         let trustLevel: "self-attested" | "hardware-attested" = "self-attested";
-        if (att.mdaCertChain && att.mdaCertChain.length > 0) {
+
+        // Hardware attestation via App Attest (the MDM-free path): present AND
+        // bound to attestation.publicKey by construction (clientDataHash =
+        // sha256(publicKey), checked through the credCert nonce extension).
+        const aa = att.appAttest;
+        let appAttestBound = false;
+        if (aa && aa.object && aa.keyId) {
+          appAttestBound = verifyAppAttestB64(
+            aa.object,
+            aa.keyId,
+            att.publicKey,
+            APP_ATTEST_APP_ID,
+          );
+          if (!appAttestBound) {
+            findings.push({
+              severity: "error",
+              code: "appattest-not-bound",
+              message: "App Attest object did not verify or is not bound to attestation.publicKey",
+            });
+          }
+        }
+
+        if (appAttestBound) {
+          trustLevel = "hardware-attested";
+        } else if (att.mdaCertChain && att.mdaCertChain.length > 0) {
           try {
             const chain = att.mdaCertChain.map((b64: string) =>
               Uint8Array.from(Buffer.from(b64, "base64")),
@@ -336,16 +362,27 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
                 code: "mda-invalid",
                 message: mda.error ?? "MDA chain validation failed",
               });
-            } else if (mda.leafPublicKey !== att.publicKey) {
-              findings.push({
-                severity: "error",
-                code: "mda-not-bound",
-                message:
-                  "MDA leaf does not certify attestation.publicKey " +
-                  "(chain not bound to the receipt-signing key)",
-              });
             } else {
-              trustLevel = "hardware-attested";
+              // Bind by EITHER the leaf key being the signing key (option A) OR
+              // the freshness-code commitment sha256(publicKey) (option B) —
+              // matching the SDK verifier (verify-provider.ts) and mda.rs.
+              // Previously only option A was checked, so an option-B (freshness)
+              // chain was wrongly reported self-attested here.
+              const leafBinds = mda.leafPublicKey === att.publicKey;
+              const freshBinds = yield* Effect.promise(() =>
+                freshnessBindsKey(mda.freshnessCode, att.publicKey),
+              );
+              if (!leafBinds && !freshBinds) {
+                findings.push({
+                  severity: "error",
+                  code: "mda-not-bound",
+                  message:
+                    "MDA chain is not bound to attestation.publicKey " +
+                    "(neither leaf-key nor freshness-code binding holds)",
+                });
+              } else {
+                trustLevel = "hardware-attested";
+              }
             }
           } catch (e) {
             const code = e instanceof MdaError ? `mda-${e.code}` : "mda-error";
@@ -357,6 +394,7 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
             structural.ok &&
             sigOk &&
             !findings.some((f) => f.code.startsWith("mda-")) &&
+            !findings.some((f) => f.code.startsWith("appattest-")) &&
             !findings.some((f) => f.code === "lexicon-invalid"),
           trustLevel,
           findings,

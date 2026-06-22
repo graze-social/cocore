@@ -17,6 +17,15 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+/// Apple App Attest evidence as it rides in the record. Field names match the
+/// lexicon's `appAttest` object (`{ object, keyId }`), both base64.
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Serialize)]
+pub struct AppAttestEvidence {
+    pub object: String,
+    pub keyId: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttestationInputs {
     pub provider_did: String,
@@ -32,6 +41,11 @@ pub struct AttestationInputs {
     pub authenticated_root_enabled: bool,
     pub rdma_disabled: bool,
     pub mda_cert_chain: Vec<Vec<u8>>,
+    /// Optional Apple App Attest evidence (base64 CBOR `object` + `keyId`),
+    /// acquired via [`crate::mda_loader::load_appattest`]. Embedded only if it
+    /// verifies Apple-App-Attest-rooted AND binds to this signer; the
+    /// MDM-free path to hardware-attested.
+    pub app_attest: Option<AppAttestEvidence>,
     // --- WS-CDHASH: OS-enforced measured identity + hardened-runtime posture
     // (read live via `codesign::read_self`). ---
     pub cd_hash: Option<String>,
@@ -73,6 +87,8 @@ pub struct AttestationRecord {
     pub rdmaDisabled: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mdaCertChain: Vec<String>, // base64
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appAttest: Option<AppAttestEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cdHash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,6 +182,7 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
         authenticated_root_enabled: false,
         rdma_disabled: true,
         mda_cert_chain: Vec::new(),
+        app_attest: None,
         cd_hash: cs.cd_hash,
         team_id: cs.team_id,
         hardened_runtime: cs.hardened_runtime,
@@ -255,6 +272,31 @@ pub fn build(
     };
     let mda_chain_b64: Vec<String> = mda_chain.iter().map(|c| B64.encode(c)).collect();
 
+    // App Attest evidence — the MDM-free path to hardware-attested. Same
+    // discipline as the MDA chain: embed it ONLY if it verifies
+    // Apple-App-Attest-rooted AND binds to this signing key (its credCert nonce
+    // commits to sha256(signing pubkey)). An object that doesn't bind is a
+    // hardware claim for the wrong key, so drop it and stay self-attested.
+    let app_attest: Option<AppAttestEvidence> = match &inputs.app_attest {
+        None => None,
+        Some(ev) => {
+            if crate::appattest::verify_b64(
+                &ev.object,
+                &ev.keyId,
+                &public_key_b64,
+                crate::appattest::APP_ATTEST_APP_ID,
+            ) {
+                Some(ev.clone())
+            } else {
+                tracing::warn!(
+                    "App Attest evidence failed verification or is not bound to our signing key; \
+                     dropping it and staying self-attested on the App Attest path"
+                );
+                None
+            }
+        }
+    };
+
     // Producer's HONEST self-asserted tier. `attested-confidential` is the
     // CONFIDENTIALITY axis — "the prompt is handled only inside this measured,
     // signed binary, and the operator can't read it." It is ORTHOGONAL to
@@ -328,6 +370,12 @@ pub fn build(
         if let Some(eh) = &inputs.engine_lib_hash {
             map.insert("engineLibHash".into(), Value::String(eh.clone()));
         }
+        if let Some(ev) = &app_attest {
+            map.insert(
+                "appAttest".into(),
+                json!({ "object": ev.object, "keyId": ev.keyId }),
+            );
+        }
     }
     let canonical = to_canonical_bytes(&unsigned)?;
     let sig = signer
@@ -348,6 +396,7 @@ pub fn build(
         authenticatedRootEnabled: inputs.authenticated_root_enabled,
         rdmaDisabled: inputs.rdma_disabled,
         mdaCertChain: mda_chain_b64,
+        appAttest: app_attest,
         cdHash: inputs.cd_hash,
         teamId: inputs.team_id,
         hardenedRuntime: inputs.hardened_runtime,
@@ -415,6 +464,7 @@ mod tests {
             authenticated_root_enabled: true,
             rdma_disabled: true,
             mda_cert_chain: vec![],
+            app_attest: None,
             cd_hash: Some("ab".repeat(20)),
             team_id: Some("TEAM123456".into()),
             hardened_runtime: true,
@@ -461,6 +511,7 @@ mod tests {
             authenticated_root_enabled: true,
             rdma_disabled: true,
             mda_cert_chain: vec![b"leaf-cert-der".to_vec(), b"intermediate-cert-der".to_vec()],
+            app_attest: None,
             cd_hash: Some("cd".repeat(20)),
             team_id: None,
             hardened_runtime: true,
@@ -486,6 +537,53 @@ mod tests {
         assert_eq!(
             rec.tier, "attested-confidential",
             "a full confidential posture earns the tier regardless of the MDA chain"
+        );
+    }
+
+    #[test]
+    fn unverifiable_app_attest_is_dropped_not_embedded() {
+        // Same discipline as the MDA chain: bogus App Attest evidence (not an
+        // Apple-App-Attest-rooted, signer-bound object) must be dropped, leaving
+        // the record self-attested with no `appAttest`. The positive embed path
+        // needs a real Apple-rooted object (real device / cross-lang fixture).
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let mut inputs = AttestationInputs {
+            provider_did: "did:plc:test".into(),
+            encryption_pub_key_b64: "abc".into(),
+            chip_name: "Apple M4".into(),
+            hardware_model: "Mac15,12".into(),
+            serial_number: "AA-TEST".into(),
+            os_version: "26.0".into(),
+            binary_path: std::path::PathBuf::from("/nonexistent"),
+            sip_enabled: true,
+            secure_boot_enabled: true,
+            secure_enclave_available: true,
+            authenticated_root_enabled: true,
+            rdma_disabled: true,
+            mda_cert_chain: vec![],
+            app_attest: None,
+            cd_hash: Some("cd".repeat(20)),
+            team_id: None,
+            hardened_runtime: true,
+            library_validation: true,
+            get_task_allow: false,
+            metallib_hash: None,
+            engine_lib_hash: None,
+            in_process_backend: true,
+            anti_debug: true,
+            core_dumps_disabled: true,
+            env_scrubbed: true,
+        };
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        inputs.app_attest = Some(AppAttestEvidence {
+            object: B64.encode(b"not-a-real-cbor-attestation-object"),
+            keyId: B64.encode([0u8; 32]),
+        });
+        let rec = build(inputs, &*signer).unwrap();
+        assert!(
+            rec.appAttest.is_none(),
+            "unverifiable App Attest evidence must be dropped, not embedded"
         );
     }
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The App Attest entitlement. AMFI/DeviceCheck only let
+         DCAppAttestService produce a genuine attestation when this is present
+         AND authorized by the embedded provisioning profile. For a Developer
+         ID (non-App-Store) build the value is "production", which attests
+         against Apple's production App Attest servers and yields the
+         production AAGUID ("appattest\0\0\0\0\0\0\0") in authData.
+
+         To get a profile that authorizes this you MUST, in the Apple Developer
+         portal: edit the dev.cocore.provider App ID, enable the "App Attest"
+         capability (App Attest has no separate toggle in some portal versions;
+         it rides under DeviceCheck), and regenerate the provisioning profile.
+         See ../README.md. Until the profile carries it, codesign will succeed
+         but DCAppAttestService.attestKey returns an error at runtime. -->
+    <key>com.apple.developer.devicecheck.appattest-environment</key>
+    <string>production</string>
+
+    <!-- These three MUST match the embedded provisioning profile exactly. -->
+    <key>com.apple.application-identifier</key>
+    <string>4L45P7CP9M.dev.cocore.provider</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>4L45P7CP9M</string>
+</dict>
+</plist>

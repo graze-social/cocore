@@ -248,14 +248,16 @@ function pemToDer(pem: string): Uint8Array {
   return Uint8Array.from(Buffer.from(stripped, "base64"));
 }
 
-interface DerExtension {
+export interface DerExtension {
   oid: string;
   value: Uint8Array;
 }
 
 /** Walk an X.509 certificate's DER and yield every extension. We
- *  only need OID + value, which lets us keep the parser minimal. */
-function parseExtensions(certDer: Uint8Array): DerExtension[] {
+ *  only need OID + value, which lets us keep the parser minimal.
+ *  Exported so the App Attest verifier (`appattest.ts`) can reuse the
+ *  same scanner to pull Apple's nonce extension from the credCert. */
+export function parseExtensions(certDer: Uint8Array): DerExtension[] {
   // X.509 layout (RFC 5280 §4.1):
   //   Certificate := SEQUENCE { tbs, sigAlg, sigValue }
   //   tbs := SEQUENCE { version, serial, sigAlg, issuer, validity,

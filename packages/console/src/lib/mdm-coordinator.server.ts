@@ -57,6 +57,8 @@
 //                              webhook presents to POST captured chains.
 //   COCORE_MDM_SIGNING_CERT_PEM / _KEY_PEM  CMS-sign the profile (TODO).
 
+import { createHash } from "node:crypto";
+
 import { resolveBearerKey, type ResolvedKey } from "@/lib/api-keys.server.ts";
 import { getAttestationChain, putAttestationChain } from "@/lib/mdm-chain-store.server.ts";
 
@@ -638,4 +640,254 @@ export async function fetchAttestationChain(serial: string): Promise<Attestation
       detail: `chain store request error: ${(e as Error).message}`,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Option-B (freshness-code) hardware attestation via MDM DeviceInformation.
+//
+// The ACME path above attests an OS-managed P-384 key whose leaf can't bind to
+// the agent's P-256 receipt key (see the option-A analysis in
+// infra/mdm/RUNBOOK.md). The DeviceInformation path lets US choose the
+// attestation's freshness: Apple sets the leaf's freshness OID
+// (1.2.840.113635.100.8.11.1) to the `DeviceAttestationNonce` the MDM sends
+// (Apple security guide: "the freshness code is the value of the
+// DeviceAttestationNonce specified in the request"). Setting
+//
+//     DeviceAttestationNonce = sha256(agent P-256 pubkey)
+//
+// makes the freshness commit to the receipt-signing key — exactly the option-B
+// binding the verifiers (mda.rs `freshness_binds`, verify-provider
+// `freshnessBindsKey`, py `_freshness_binds_key`) already check. No App Attest,
+// no forked step-ca.
+//
+// Apple rate-limits DeviceInformation attestation to ~1 per device / 7 days, so
+// this is a weekly (re)bind, not per-refresh; the captured chain is reused
+// across the 24h attestation publishes while the signing key is stable.
+//
+// ⚠️ ENCODING TO CONFIRM ON FIRST LIVE CAPTURE: we carry the 32-byte nonce as a
+// base64 <string> (the MDM-compatible form). The verifier expects the freshness
+// OID to contain the raw 32 bytes of sha256(pubkey). If Apple stores the nonce
+// string verbatim (rather than its decoded bytes), the freshness normalizer is
+// the single one-line place to adjust — use scripts/inspect-mda-freshness.sh on
+// the first captured leaf to confirm. See infra/mdm/RUNBOOK.md "Option-B".
+// ---------------------------------------------------------------------------
+
+/** The `DeviceAttestationNonce` that binds an attestation to `publicKeyB64`
+ *  (the agent's raw 64-byte P-256 X‖Y key, base64). The bytes are
+ *  `sha256(pubkey)` — what the leaf's freshness OID must equal for the
+ *  verifiers' `freshness == sha256(publicKey)` check to hold. */
+export function attestationNonceBytes(publicKeyB64: string): Buffer {
+  const raw = Buffer.from(publicKeyB64, "base64");
+  return createHash("sha256").update(raw).digest(); // 32 bytes
+}
+
+/** Build the MDM `DeviceInformation` command that requests a fresh hardware
+ *  attestation bound to `nonceBytes`. `Queries: [DevicePropertiesAttestation]`
+ *  asks for the attestation; `DeviceAttestationNonce` forces a fresh one whose
+ *  freshness OID equals the nonce. */
+export function buildDeviceInformationAttestationCommand(
+  commandUuid: string,
+  nonceBytes: Buffer,
+): string {
+  const nonceB64 = nonceBytes.toString("base64");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CommandUUID</key>
+  <string>${commandUuid}</string>
+  <key>Command</key>
+  <dict>
+    <key>RequestType</key>
+    <string>DeviceInformation</string>
+    <key>Queries</key>
+    <array>
+      <string>DevicePropertiesAttestation</string>
+    </array>
+    <key>DeviceAttestationNonce</key>
+    <string>${nonceB64}</string>
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+/** Enqueue + push a DeviceInformation attestation command, binding the
+ *  resulting Apple attestation to `publicKeyB64` via the nonce. `target` is the
+ *  device's NanoMDM enrollment id (UDID). Mirrors `pushAttestationCommand`. */
+export async function requestDeviceInformationAttestation(
+  serial: string,
+  target: string | null,
+  publicKeyB64: string,
+): Promise<PushAttestationResult> {
+  const base = env("COCORE_NANOMDM_URL");
+  const apiKey = env("COCORE_NANOMDM_API_KEY");
+
+  if (!target) {
+    return {
+      queued: false,
+      commandUuid: null,
+      status: "error",
+      stubbed: true,
+      detail: "DeviceInformation attestation requires an MDM target (device UDID)",
+    };
+  }
+  if (!base || !apiKey) {
+    return {
+      queued: true,
+      commandUuid: null,
+      status: "queued",
+      stubbed: true,
+      detail: "NanoMDM not configured (COCORE_NANOMDM_URL/API_KEY unset); enqueue stubbed",
+    };
+  }
+
+  const root = base.replace(/\/$/, "");
+  const authHeader = `Basic ${Buffer.from(`nanomdm:${apiKey}`).toString("base64")}`;
+  const enc = encodeURIComponent(target);
+  const commandUuid = crypto.randomUUID().toUpperCase();
+  const enqueueBody = buildDeviceInformationAttestationCommand(
+    commandUuid,
+    attestationNonceBytes(publicKeyB64),
+  );
+
+  try {
+    const enqueueResp = await fetch(`${root}/v1/enqueue/${enc}`, {
+      method: "POST",
+      headers: { authorization: authHeader, "content-type": "application/xml" },
+      body: enqueueBody,
+    });
+    if (!enqueueResp.ok) {
+      const text = await enqueueResp.text().catch(() => "");
+      return {
+        queued: false,
+        commandUuid,
+        status: "error",
+        stubbed: false,
+        detail: `NanoMDM enqueue failed (${enqueueResp.status}): ${text.slice(0, 200)}`,
+      };
+    }
+    const pushResp = await fetch(`${root}/v1/push/${enc}`, {
+      method: "GET",
+      headers: { authorization: authHeader },
+    });
+    if (!pushResp.ok) {
+      const text = await pushResp.text().catch(() => "");
+      return {
+        queued: true,
+        commandUuid,
+        status: "queued-no-push",
+        stubbed: false,
+        detail: `enqueued but push failed (${pushResp.status}): ${text.slice(0, 200)}`,
+      };
+    }
+    return { queued: true, commandUuid, status: "queued", stubbed: false, detail: null };
+  } catch (e) {
+    return {
+      queued: false,
+      commandUuid,
+      status: "error",
+      stubbed: false,
+      detail: `NanoMDM request error: ${(e as Error).message}`,
+    };
+  }
+}
+
+/** Authenticate a NanoMDM webhook POST (the device's command results).
+ *
+ *  Secret = COCORE_NANOMDM_WEBHOOK_KEY, constant-time, fail-closed when unset.
+ *  NanoMDM's `-webhook-url` does NOT send an Authorization header, so the
+ *  operator embeds the secret in the URL as `?key=<secret>` — that's the
+ *  primary check. A Bearer header is also accepted (e.g. for manual posts /
+ *  a future webhook proxy that adds one). */
+export function authenticateNanomdmWebhook(request: Request): boolean {
+  const expected = env("COCORE_NANOMDM_WEBHOOK_KEY");
+  if (!expected) return false;
+  const fromQuery = (() => {
+    try {
+      return new URL(request.url).searchParams.get("key");
+    } catch {
+      return null;
+    }
+  })();
+  const got = fromQuery ?? readBearer(request);
+  if (!got || got.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Parse a NanoMDM webhook payload for a DeviceInformation attestation result.
+ *
+ *  NanoMDM posts MDM events as JSON; a command-result event carries the
+ *  device's raw response plist (base64) under `command_results` / `raw_command`
+ *  (field names vary by NanoMDM webhook version, so we scan defensively). The
+ *  device's DeviceInformation response contains a `DevicePropertiesAttestation`
+ *  array of base64-DER certs (leaf-first) — the Apple x5c chain we persist.
+ *
+ *  Returns `{ serial, chain }` when an attestation chain is present, else null.
+ *  Pure (no I/O) so it's unit-tested against a sample payload; the exact NanoMDM
+ *  field layout is confirmed on first live capture (see RUNBOOK "Option-B"). */
+export function parseNanomdmAttestationWebhook(
+  payload: unknown,
+): { serial: string | null; chain: string[] } | null {
+  if (!payload || typeof payload !== "object") return null;
+  const obj = payload as Record<string, unknown>;
+
+  // Pull a candidate raw command-result plist (base64 or inline XML) from the
+  // common NanoMDM webhook shapes.
+  const rawCandidates: string[] = [];
+  const pushStr = (v: unknown) => {
+    if (typeof v === "string" && v.length > 0) rawCandidates.push(v);
+  };
+  pushStr(obj["raw_command_response"]);
+  pushStr(obj["command_response"]);
+  if (obj["command_results"] && typeof obj["command_results"] === "object") {
+    const cr = obj["command_results"] as Record<string, unknown>;
+    pushStr(cr["raw"]);
+    pushStr(cr["payload"]);
+  }
+  // Some webhook configs nest the device plist under `checkin`/`acknowledge`.
+  pushStr(
+    (obj["acknowledge_event"] as Record<string, unknown> | undefined)?.["raw_payload"] as unknown,
+  );
+
+  const serial = typeof obj["serial"] === "string" ? (obj["serial"] as string) : null;
+
+  for (const raw of rawCandidates) {
+    // raw may be base64 of a plist, or a plist string directly.
+    let xml = raw;
+    if (!/[<]plist/i.test(raw)) {
+      try {
+        xml = Buffer.from(raw, "base64").toString("utf8");
+      } catch {
+        continue;
+      }
+    }
+    const chain = extractDevicePropertiesAttestation(xml);
+    if (chain && chain.length > 0) {
+      return { serial: serial ?? extractSerialFromPlist(xml), chain };
+    }
+  }
+  return null;
+}
+
+/** Extract the `DevicePropertiesAttestation` cert array (base64 DER, leaf-first)
+ *  from a device's DeviceInformation response plist. Minimal, dependency-free:
+ *  finds the keyed <array> of <data> entries. */
+function extractDevicePropertiesAttestation(plistXml: string): string[] | null {
+  const keyIdx = plistXml.search(/<key>\s*DevicePropertiesAttestation\s*<\/key>/i);
+  if (keyIdx < 0) return null;
+  const after = plistXml.slice(keyIdx);
+  const arrMatch = after.match(/<array>([\s\S]*?)<\/array>/i);
+  if (!arrMatch) return null;
+  const datas = [...arrMatch[1]!.matchAll(/<data>([\s\S]*?)<\/data>/gi)].map((m) =>
+    m[1]!.replace(/\s+/g, ""),
+  );
+  return datas.length > 0 ? datas : null;
+}
+
+function extractSerialFromPlist(plistXml: string): string | null {
+  const m = plistXml.match(/<key>\s*SerialNumber\s*<\/key>\s*<string>([^<]+)<\/string>/i);
+  return m ? m[1]!.trim() : null;
 }

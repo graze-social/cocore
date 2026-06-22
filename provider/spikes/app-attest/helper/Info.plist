@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- MUST equal the provisioning profile's App ID suffix. The embedded
+         profile is 4L45P7CP9M.dev.cocore.provider (the same App ID used for
+         the APNs spike), now ALSO carrying the App Attest capability. -->
+    <key>CFBundleIdentifier</key>
+    <string>dev.cocore.provider</string>
+    <key>CFBundleName</key>
+    <string>cocore-appattest</string>
+    <key>CFBundleExecutable</key>
+    <string>cocore-appattest</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+</dict>
+</plist>

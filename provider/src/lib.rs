@@ -28,6 +28,7 @@ pub mod hypervisor;
 // alongside the rest of the in-process Python design. See
 // `engines::subprocess` for the replacement (out-of-process Python via
 // uvicorn-on-UDS).
+pub mod appattest;
 pub mod mda;
 pub mod mda_loader;
 pub mod oauth;

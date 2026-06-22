@@ -84,6 +84,10 @@ x509-parser = { version = "0.16", features = ["verify"] }
 asn1-rs = "0.6"
 oid-registry = "0.7"
 
+# CBOR — decode the Apple App Attest attestation object (a CBOR map of
+# fmt / attStmt(x5c, receipt) / authData). Used by `appattest.rs`.
+ciborium = "0.2"
+
 # POSIX / libc — used for PT_DENY_ATTACH and rlimit calls on macOS
 libc = "0.2"
 

@@ -310,6 +310,247 @@ fn writes_confidential_attestation_fixture() {
     eprintln!("wrote {}", path.display());
 }
 
+/// Synthesize an Apple App Attest attestation object bound to `signing_pubkey_raw`
+/// (the raw 64-byte P-256 X‖Y point published as `attestation.publicKey`).
+/// Mirrors the synthesis in `appattest.rs`'s unit tests, but here so the
+/// integration test (and the cross-language fixtures) can build one. Returns
+/// `(object_cbor, key_id, synthetic_root_der)`.
+fn synth_app_attest(signing_pubkey_raw: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use ciborium::value::Value;
+    use cocore_provider::appattest::{AAGUID_PRODUCTION, APP_ATTEST_APP_ID};
+    use sha2::{Digest, Sha256};
+    use x509_parser::prelude::{FromDer, SubjectPublicKeyInfo};
+
+    let now = time::OffsetDateTime::now_utc();
+    let nb = now - time::Duration::HOUR;
+    let na = now + time::Duration::days(365);
+
+    // Root (CA).
+    let mut root_params =
+        CertificateParams::new(vec!["cocore AppAttest Test Root".into()]).unwrap();
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.not_before = nb;
+    root_params.not_after = na;
+    let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+
+    // Intermediate (CA, signed by root).
+    let mut int_params = CertificateParams::new(vec!["cocore AppAttest Test CA".into()]).unwrap();
+    int_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    int_params.not_before = nb;
+    int_params.not_after = na;
+    let int_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let int_cert = int_params
+        .signed_by(&int_key, &root_cert, &root_key)
+        .unwrap();
+
+    // Leaf (credCert) key → credentialId.
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let spki = leaf_key.public_key_der();
+    let (_, info) = SubjectPublicKeyInfo::from_der(&spki).unwrap();
+    let leaf_point = info.subject_public_key.data.to_vec(); // 65-byte 0x04‖X‖Y
+    let cred_id = Sha256::digest(&leaf_point).to_vec();
+
+    // authData = rpIdHash | flags(AT) | signCount=0 | aaguid | credIdLen | credId
+    let mut auth_data = Vec::new();
+    auth_data.extend_from_slice(Sha256::digest(APP_ATTEST_APP_ID.as_bytes()).as_slice());
+    auth_data.push(0x40);
+    auth_data.extend_from_slice(&0u32.to_be_bytes());
+    auth_data.extend_from_slice(AAGUID_PRODUCTION);
+    auth_data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+    auth_data.extend_from_slice(&cred_id);
+
+    // nonce = sha256(authData ‖ sha256(signing pubkey)) → credCert nonce ext.
+    let client_data_hash = Sha256::digest(signing_pubkey_raw);
+    let mut nonce_in = auth_data.clone();
+    nonce_in.extend_from_slice(&client_data_hash);
+    let nonce = Sha256::digest(&nonce_in).to_vec();
+    // DER: SEQUENCE { [1] EXPLICIT OCTET STRING <nonce> }
+    let mut os = vec![0x04, nonce.len() as u8];
+    os.extend_from_slice(&nonce);
+    let mut ctx = vec![0xA1, os.len() as u8];
+    ctx.extend_from_slice(&os);
+    let mut seq = vec![0x30, ctx.len() as u8];
+    seq.extend_from_slice(&ctx);
+
+    let mut leaf_params = CertificateParams::new(vec!["credCert".into()]).unwrap();
+    leaf_params.is_ca = IsCa::NoCa;
+    leaf_params.not_before = nb;
+    leaf_params.not_after = na;
+    let mut ext = CustomExtension::from_oid_content(&[1, 2, 840, 113635, 100, 8, 2], seq);
+    ext.set_criticality(false);
+    leaf_params.custom_extensions.push(ext);
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &int_cert, &int_key)
+        .unwrap();
+
+    let obj = Value::Map(vec![
+        (
+            Value::Text("fmt".into()),
+            Value::Text("apple-appattest".into()),
+        ),
+        (
+            Value::Text("attStmt".into()),
+            Value::Map(vec![
+                (
+                    Value::Text("x5c".into()),
+                    Value::Array(vec![
+                        Value::Bytes(leaf_cert.der().to_vec()),
+                        Value::Bytes(int_cert.der().to_vec()),
+                    ]),
+                ),
+                (Value::Text("receipt".into()), Value::Bytes(vec![])),
+            ]),
+        ),
+        (Value::Text("authData".into()), Value::Bytes(auth_data)),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&obj, &mut buf).unwrap();
+    (buf, cred_id, root_cert.der().to_vec())
+}
+
+/// Standalone App Attest verifier parity fixture (mirrors the MDA one). The TS
+/// test in `packages/sdk/src/appattest.test.ts` verifies this object with the
+/// synthetic root and proves the wrong-root path rejects against Apple's real
+/// App Attest root.
+#[test]
+fn writes_appattest_cross_lang_fixture() {
+    use cocore_provider::appattest::{
+        verify_against, APPLE_APP_ATTEST_ROOT_CA_PEM, APP_ATTEST_APP_ID,
+    };
+
+    let signer = load_or_create_identity().unwrap();
+    let pubkey_b64 = signer.public_key_b64();
+    let pubkey_raw = signer.public_key_bytes().to_vec();
+    let (object, key_id, root_der) = synth_app_attest(&pubkey_raw);
+
+    // Self-test: prove the Rust verifier accepts what we built before asking TS.
+    let res = verify_against(
+        &object,
+        &key_id,
+        &pubkey_raw,
+        APP_ATTEST_APP_ID,
+        &root_der,
+        &chrono::Utc::now(),
+        false,
+    )
+    .expect("Rust must verify its own App Attest fixture");
+    assert!(res.valid && res.binds_signing_key);
+
+    let fixture = json!({
+        "objectB64": B64.encode(&object),
+        "keyIdB64": B64.encode(&key_id),
+        "publicKeyB64": pubkey_b64,
+        "appId": APP_ATTEST_APP_ID,
+        "rootDerB64": B64.encode(&root_der),
+        "appleRootPem": APPLE_APP_ATTEST_ROOT_CA_PEM,
+    });
+    let path = workspace_target_dir().join("appattest-cross-lang-fixture.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&fixture).unwrap())
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    eprintln!("wrote {}", path.display());
+}
+
+/// A COMPLETE confidential-tier attestation fixture whose hardware attestation
+/// comes from App Attest (not an MDA chain), proving the TS `verifyProviderForSeal`
+/// reaches `attested-confidential` via the MDM-free path. Same single-key
+/// discipline as `writes_confidential_attestation_fixture`.
+#[test]
+fn writes_confidential_appattest_fixture() {
+    use base64::engine::general_purpose::STANDARD as B64e;
+    use cocore_provider::canonical::to_canonical_bytes;
+    use cocore_provider::crypto::ProviderKeypair;
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::DecodePrivateKey;
+
+    // The signing key: a fresh P-256 key used as publicKey + selfSignature +
+    // session-key signer.
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let secret = p256::SecretKey::from_pkcs8_pem(&leaf_key.serialize_pem()).unwrap();
+    let signing_key = SigningKey::from(&secret);
+    let pub_point = secret.public_key().to_encoded_point(false);
+    let pubkey_raw = pub_point.as_bytes()[1..].to_vec(); // drop 0x04 → 64 bytes
+    let public_key_b64 = B64e.encode(&pubkey_raw);
+
+    // App Attest object bound to that signing key, under a synthetic App Attest root.
+    let (aa_object, aa_key_id, aa_root_der) = synth_app_attest(&pubkey_raw);
+
+    let enc = ProviderKeypair::generate();
+    let cd_hash = "ab".repeat(20);
+    let metallib_hash = "cd".repeat(32);
+    let attested_at = chrono::Utc::now();
+    let expires_at = attested_at + chrono::Duration::hours(24);
+
+    let mut body = json!({
+        "publicKey": public_key_b64,
+        "encryptionPubKey": enc.public_key_b64(),
+        "chipName": "Apple M4 Max",
+        "hardwareModel": "Mac16,1",
+        "serialNumberHash": "0".repeat(64),
+        "osVersion": "macOS 26.0",
+        "binaryHash": "1".repeat(64),
+        "cdHash": cd_hash,
+        "teamId": "4L45P7CP9M",
+        "hardenedRuntime": true,
+        "libraryValidation": true,
+        "getTaskAllow": false,
+        "metallibHash": metallib_hash,
+        "engineLibHash": "ef".repeat(32),
+        "inProcessBackend": true,
+        "antiDebug": true,
+        "coreDumpsDisabled": true,
+        "envScrubbed": true,
+        "sipEnabled": true,
+        "secureBootEnabled": true,
+        "secureEnclaveAvailable": true,
+        "authenticatedRootEnabled": true,
+        "rdmaDisabled": true,
+        "appAttest": { "object": B64e.encode(&aa_object), "keyId": B64e.encode(&aa_key_id) },
+        "tier": "attested-confidential",
+        "attestedAt": attested_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "expiresAt": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let canonical = to_canonical_bytes(&body).unwrap();
+    let self_sig: Signature = signing_key.sign(&canonical);
+    body.as_object_mut().unwrap().insert(
+        "selfSignature".into(),
+        json!(B64e.encode(self_sig.to_der().as_bytes())),
+    );
+
+    let ephemeral = ProviderKeypair::generate();
+    let nonce = "f".repeat(32);
+    let attestation_cid = "bafyconfappattestcid";
+    let sk_msg = to_canonical_bytes(&json!({
+        "attestationCid": attestation_cid,
+        "ephemeralPubKey": ephemeral.public_key_b64(),
+        "nonce": nonce,
+    }))
+    .unwrap();
+    let sk_sig: Signature = signing_key.sign(&sk_msg);
+
+    let fixture = json!({
+        "attestation": body,
+        "appAttestRootDerB64": B64e.encode(&aa_root_der),
+        "knownGoodCdHash": "ab".repeat(20),
+        "knownGoodMetallibHash": "cd".repeat(32),
+        "knownGoodEngineLibHash": "ef".repeat(32),
+        "osFloor": "14.0.0",
+        "attestationCid": attestation_cid,
+        "nonce": nonce,
+        "sessionKey": {
+            "ephemeralPubKey": ephemeral.public_key_b64(),
+            "nonce": nonce,
+            "attestationCid": attestation_cid,
+            "signature": B64e.encode(sk_sig.to_der().as_bytes()),
+        },
+    });
+    let path = workspace_target_dir().join("confidential-appattest-fixture.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&fixture).unwrap())
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    eprintln!("wrote {}", path.display());
+}
+
 fn workspace_target_dir() -> std::path::PathBuf {
     // CARGO_TARGET_DIR or <workspace>/target. We want a stable path
     // under the workspace root so the TS test can find the fixture

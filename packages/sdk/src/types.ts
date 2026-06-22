@@ -104,6 +104,10 @@ export interface AttestationRecord {
   authenticatedRootEnabled: boolean;
   rdmaDisabled?: boolean;
   mdaCertChain?: string[];
+  /** Apple App Attest evidence (CBOR `object` + `keyId`, both base64). The
+   *  MDM-free path to hardware-attested: bound to `publicKey` via
+   *  clientDataHash = sha256(publicKey). Absent on self-attested machines. */
+  appAttest?: { object: string; keyId: string };
   selfSignature: string;
   attestedAt: string;
   expiresAt: string;

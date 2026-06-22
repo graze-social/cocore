@@ -44,11 +44,7 @@ enum AgentCmd {
     /// approves the pairing and delivers a session blob to this
     /// agent. Persists the session at `~/.cocore/session.json`.
     Pair {
-        #[arg(
-            long,
-            env = "COCORE_CONSOLE",
-            default_value = "https://console.cocore.dev"
-        )]
+        #[arg(long, env = "COCORE_CONSOLE", default_value = "https://cocore.dev")]
         console: String,
     },
     /// Run the agent: connect to the advisor, register, heartbeat,
@@ -64,6 +60,11 @@ enum AgentCmd {
     },
     /// Print the active session's identity for debugging.
     Whoami,
+    /// Print this machine's receipt-signing P-256 public key (base64 of the
+    /// raw 64-byte X‖Y point — the value published as `attestation.publicKey`).
+    /// The App Attest helper hashes this for its clientDataHash binding; the
+    /// spike runner reads it via this command.
+    Pubkey,
     /// Print this machine's owner-chosen trust tier from its PDS provider
     /// record: `attested-confidential` or `best-effort`. The macOS tray's
     /// agent supervisor runs this to decide which worker binary to spawn (the
@@ -92,11 +93,7 @@ enum AgentCmd {
     /// commands the user runs themselves, since they require a
     /// browser or write to the binary on disk.
     Doctor {
-        #[arg(
-            long,
-            env = "COCORE_CONSOLE",
-            default_value = "https://console.cocore.dev"
-        )]
+        #[arg(long, env = "COCORE_CONSOLE", default_value = "https://cocore.dev")]
         console: String,
         /// Apply the safe fixes (kickstart the LaunchAgent if it's
         /// stopped or stale). Re-pair / update suggestions are
@@ -112,11 +109,7 @@ enum AgentCmd {
     /// kickstarts the LaunchAgent (macOS) so the daemon picks up the
     /// new binary.
     Update {
-        #[arg(
-            long,
-            env = "COCORE_CONSOLE",
-            default_value = "https://console.cocore.dev"
-        )]
+        #[arg(long, env = "COCORE_CONSOLE", default_value = "https://cocore.dev")]
         console: String,
         /// Print the latest version + comparison only; don't replace
         /// the installed binary.
@@ -201,6 +194,7 @@ async fn main() -> Result<()> {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
         Cmd::Agent(AgentCmd::Serve { advisor }) => cmd_serve_entry(advisor).await,
         Cmd::Agent(AgentCmd::Whoami) => cmd_whoami(),
+        Cmd::Agent(AgentCmd::Pubkey) => cmd_pubkey(),
         Cmd::Agent(AgentCmd::Tier) => cmd_print_tier().await,
         Cmd::Agent(AgentCmd::Confidential { off }) => cmd_set_confidential(!off).await,
         Cmd::Agent(AgentCmd::Doctor { console, fix }) => doctor::run(&console, fix).await,
@@ -1237,9 +1231,20 @@ async fn cmd_serve(
     // native engine serves under a hardened-attested posture.
     let mut attestation_inputs =
         attestation::build_stub_inputs(&session.did, &enc.public_key_b64());
+    // MDA option-B (the live macOS hardware-attested path): if the Secure Mode
+    // wizard wired the request env (URL + serial + UDID), ask the coordinator to
+    // trigger a key-bound DeviceInformation attestation (DeviceAttestationNonce =
+    // sha256(pubkey)) before we read the chain. Best-effort + fail-soft;
+    // Apple-rate-limited to ~weekly, so repeats are harmless. No-op unless wired.
+    cocore_provider::mda_loader::request_attestation(&signer.public_key_b64());
     let mda_cert_chain = cocore_provider::mda_loader::try_load();
-    let has_mda_chain = !mda_cert_chain.is_empty();
     attestation_inputs.mda_cert_chain = mda_cert_chain;
+    // App Attest evidence — bound to this signing key; `build` re-verifies + only
+    // embeds it if it binds. NB: App Attest is iOS-only (non-functional on macOS,
+    // DCAppAttestService.isSupported=false); this stays a no-op on the Mac and is
+    // retained for a future iOS companion. macOS binds via the MDA chain above.
+    attestation_inputs.app_attest =
+        cocore_provider::mda_loader::load_appattest(&signer.public_key_b64());
     attestation_inputs.in_process_backend = engines.entries().iter().any(|(_, e)| e.in_process());
     attestation_inputs.metallib_hash = engines
         .entries()
@@ -1252,7 +1257,11 @@ async fn cmd_serve(
     let built_attestation = attestation::build(attestation_inputs, &*signer);
     let (achieved_trust_level, achieved_tier) = match &built_attestation {
         Ok(rec) => (
-            if has_mda_chain {
+            // Derive from what the attestation ACTUALLY embedded, not from what
+            // was loaded: `build` drops any MDA chain / App Attest object that
+            // doesn't verify Apple-rooted AND bind to our signing key. Either a
+            // bound MDA chain or bound App Attest earns hardware-attested.
+            if !rec.mdaCertChain.is_empty() || rec.appAttest.is_some() {
                 TrustLevel::HardwareAttested
             } else {
                 TrustLevel::SelfAttested
@@ -2040,7 +2049,7 @@ fn build_engines(
                  so the configured model(s) [{}] could not load even after retrying. \
                  The machine is online but only serving the no-op `stub` engine, so \
                  it won't be matched to real inference jobs. Fix: re-run the installer \
-                 to (re)provision the environment — `curl -fsSL https://console.cocore.dev/agent | sh` \
+                 to (re)provision the environment — `curl -fsSL https://cocore.dev/agent | sh` \
                  — then start serving again.",
                 venv_python.display(),
                 failed.join(", "),
@@ -2190,6 +2199,15 @@ fn cmd_whoami() -> Result<()> {
         }
         None => println!("not paired; run `cocore agent pair`"),
     }
+    Ok(())
+}
+
+/// `cocore agent pubkey`: print the base64 receipt-signing public key. Loads
+/// (or creates) the Secure Enclave identity, same as the serve loop, so the
+/// printed key matches what attestations publish.
+fn cmd_pubkey() -> Result<()> {
+    let signer = secure_enclave::load_or_create_identity()?;
+    println!("{}", signer.public_key_b64());
     Ok(())
 }
 

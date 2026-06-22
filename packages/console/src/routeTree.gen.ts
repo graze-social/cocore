@@ -89,7 +89,9 @@ import { Route as ApiAuthAtprotoMetadataDotjsonRouteImport } from './routes/api.
 import { Route as ApiAuthAtprotoJwksDotjsonRouteImport } from './routes/api.auth.atproto.jwks[.]json'
 import { Route as ApiAuthAtprotoCallbackRouteImport } from './routes/api.auth.atproto.callback'
 import { Route as ApiAuthAtprotoAuthorizeRouteImport } from './routes/api.auth.atproto.authorize'
+import { Route as ApiAgentMdmRequestAttestationRouteImport } from './routes/api/agent.mdm.request-attestation'
 import { Route as ApiAgentMdmPushAttestationRouteImport } from './routes/api/agent.mdm.push-attestation'
+import { Route as ApiAgentMdmNanomdmWebhookRouteImport } from './routes/api/agent.mdm.nanomdm-webhook'
 import { Route as ApiAgentMdmEnrollProfileRouteImport } from './routes/api/agent.mdm.enroll-profile'
 import { Route as ApiAgentMdmAttestationChainRouteImport } from './routes/api/agent.mdm.attestation-chain'
 import { Route as DocsHeaderLayoutDocsInferenceAuthenticationRouteImport } from './routes/_docs-header-layout.docs.inference.authentication'
@@ -524,10 +526,22 @@ const ApiAuthAtprotoAuthorizeRoute = ApiAuthAtprotoAuthorizeRouteImport.update({
   path: '/api/auth/atproto/authorize',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiAgentMdmRequestAttestationRoute =
+  ApiAgentMdmRequestAttestationRouteImport.update({
+    id: '/api/agent/mdm/request-attestation',
+    path: '/api/agent/mdm/request-attestation',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiAgentMdmPushAttestationRoute =
   ApiAgentMdmPushAttestationRouteImport.update({
     id: '/api/agent/mdm/push-attestation',
     path: '/api/agent/mdm/push-attestation',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiAgentMdmNanomdmWebhookRoute =
+  ApiAgentMdmNanomdmWebhookRouteImport.update({
+    id: '/api/agent/mdm/nanomdm-webhook',
+    path: '/api/agent/mdm/nanomdm-webhook',
     getParentRoute: () => rootRouteImport,
   } as any)
 const ApiAgentMdmEnrollProfileRoute =
@@ -635,7 +649,9 @@ export interface FileRoutesByFullPath {
   '/docs/inference/authentication': typeof DocsHeaderLayoutDocsInferenceAuthenticationRoute
   '/api/agent/mdm/attestation-chain': typeof ApiAgentMdmAttestationChainRoute
   '/api/agent/mdm/enroll-profile': typeof ApiAgentMdmEnrollProfileRoute
+  '/api/agent/mdm/nanomdm-webhook': typeof ApiAgentMdmNanomdmWebhookRoute
   '/api/agent/mdm/push-attestation': typeof ApiAgentMdmPushAttestationRoute
+  '/api/agent/mdm/request-attestation': typeof ApiAgentMdmRequestAttestationRoute
   '/api/auth/atproto/authorize': typeof ApiAuthAtprotoAuthorizeRoute
   '/api/auth/atproto/callback': typeof ApiAuthAtprotoCallbackRoute
   '/api/auth/atproto/jwks.json': typeof ApiAuthAtprotoJwksDotjsonRoute
@@ -720,7 +736,9 @@ export interface FileRoutesByTo {
   '/docs/inference/authentication': typeof DocsHeaderLayoutDocsInferenceAuthenticationRoute
   '/api/agent/mdm/attestation-chain': typeof ApiAgentMdmAttestationChainRoute
   '/api/agent/mdm/enroll-profile': typeof ApiAgentMdmEnrollProfileRoute
+  '/api/agent/mdm/nanomdm-webhook': typeof ApiAgentMdmNanomdmWebhookRoute
   '/api/agent/mdm/push-attestation': typeof ApiAgentMdmPushAttestationRoute
+  '/api/agent/mdm/request-attestation': typeof ApiAgentMdmRequestAttestationRoute
   '/api/auth/atproto/authorize': typeof ApiAuthAtprotoAuthorizeRoute
   '/api/auth/atproto/callback': typeof ApiAuthAtprotoCallbackRoute
   '/api/auth/atproto/jwks.json': typeof ApiAuthAtprotoJwksDotjsonRoute
@@ -809,7 +827,9 @@ export interface FileRoutesById {
   '/_docs-header-layout/docs/inference/authentication': typeof DocsHeaderLayoutDocsInferenceAuthenticationRoute
   '/api/agent/mdm/attestation-chain': typeof ApiAgentMdmAttestationChainRoute
   '/api/agent/mdm/enroll-profile': typeof ApiAgentMdmEnrollProfileRoute
+  '/api/agent/mdm/nanomdm-webhook': typeof ApiAgentMdmNanomdmWebhookRoute
   '/api/agent/mdm/push-attestation': typeof ApiAgentMdmPushAttestationRoute
+  '/api/agent/mdm/request-attestation': typeof ApiAgentMdmRequestAttestationRoute
   '/api/auth/atproto/authorize': typeof ApiAuthAtprotoAuthorizeRoute
   '/api/auth/atproto/callback': typeof ApiAuthAtprotoCallbackRoute
   '/api/auth/atproto/jwks.json': typeof ApiAuthAtprotoJwksDotjsonRoute
@@ -897,7 +917,9 @@ export interface FileRouteTypes {
     | '/docs/inference/authentication'
     | '/api/agent/mdm/attestation-chain'
     | '/api/agent/mdm/enroll-profile'
+    | '/api/agent/mdm/nanomdm-webhook'
     | '/api/agent/mdm/push-attestation'
+    | '/api/agent/mdm/request-attestation'
     | '/api/auth/atproto/authorize'
     | '/api/auth/atproto/callback'
     | '/api/auth/atproto/jwks.json'
@@ -982,7 +1004,9 @@ export interface FileRouteTypes {
     | '/docs/inference/authentication'
     | '/api/agent/mdm/attestation-chain'
     | '/api/agent/mdm/enroll-profile'
+    | '/api/agent/mdm/nanomdm-webhook'
     | '/api/agent/mdm/push-attestation'
+    | '/api/agent/mdm/request-attestation'
     | '/api/auth/atproto/authorize'
     | '/api/auth/atproto/callback'
     | '/api/auth/atproto/jwks.json'
@@ -1070,7 +1094,9 @@ export interface FileRouteTypes {
     | '/_docs-header-layout/docs/inference/authentication'
     | '/api/agent/mdm/attestation-chain'
     | '/api/agent/mdm/enroll-profile'
+    | '/api/agent/mdm/nanomdm-webhook'
     | '/api/agent/mdm/push-attestation'
+    | '/api/agent/mdm/request-attestation'
     | '/api/auth/atproto/authorize'
     | '/api/auth/atproto/callback'
     | '/api/auth/atproto/jwks.json'
@@ -1124,7 +1150,9 @@ export interface RootRouteChildren {
   V1ChatCompletionsRoute: typeof V1ChatCompletionsRoute
   ApiAgentMdmAttestationChainRoute: typeof ApiAgentMdmAttestationChainRoute
   ApiAgentMdmEnrollProfileRoute: typeof ApiAgentMdmEnrollProfileRoute
+  ApiAgentMdmNanomdmWebhookRoute: typeof ApiAgentMdmNanomdmWebhookRoute
   ApiAgentMdmPushAttestationRoute: typeof ApiAgentMdmPushAttestationRoute
+  ApiAgentMdmRequestAttestationRoute: typeof ApiAgentMdmRequestAttestationRoute
   ApiAuthAtprotoAuthorizeRoute: typeof ApiAuthAtprotoAuthorizeRoute
   ApiAuthAtprotoCallbackRoute: typeof ApiAuthAtprotoCallbackRoute
   ApiAuthAtprotoJwksDotjsonRoute: typeof ApiAuthAtprotoJwksDotjsonRoute
@@ -1698,11 +1726,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiAuthAtprotoAuthorizeRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/agent/mdm/request-attestation': {
+      id: '/api/agent/mdm/request-attestation'
+      path: '/api/agent/mdm/request-attestation'
+      fullPath: '/api/agent/mdm/request-attestation'
+      preLoaderRoute: typeof ApiAgentMdmRequestAttestationRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/agent/mdm/push-attestation': {
       id: '/api/agent/mdm/push-attestation'
       path: '/api/agent/mdm/push-attestation'
       fullPath: '/api/agent/mdm/push-attestation'
       preLoaderRoute: typeof ApiAgentMdmPushAttestationRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/agent/mdm/nanomdm-webhook': {
+      id: '/api/agent/mdm/nanomdm-webhook'
+      path: '/api/agent/mdm/nanomdm-webhook'
+      fullPath: '/api/agent/mdm/nanomdm-webhook'
+      preLoaderRoute: typeof ApiAgentMdmNanomdmWebhookRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/agent/mdm/enroll-profile': {
@@ -1916,7 +1958,9 @@ const rootRouteChildren: RootRouteChildren = {
   V1ChatCompletionsRoute: V1ChatCompletionsRoute,
   ApiAgentMdmAttestationChainRoute: ApiAgentMdmAttestationChainRoute,
   ApiAgentMdmEnrollProfileRoute: ApiAgentMdmEnrollProfileRoute,
+  ApiAgentMdmNanomdmWebhookRoute: ApiAgentMdmNanomdmWebhookRoute,
   ApiAgentMdmPushAttestationRoute: ApiAgentMdmPushAttestationRoute,
+  ApiAgentMdmRequestAttestationRoute: ApiAgentMdmRequestAttestationRoute,
   ApiAuthAtprotoAuthorizeRoute: ApiAuthAtprotoAuthorizeRoute,
   ApiAuthAtprotoCallbackRoute: ApiAuthAtprotoCallbackRoute,
   ApiAuthAtprotoJwksDotjsonRoute: ApiAuthAtprotoJwksDotjsonRoute,

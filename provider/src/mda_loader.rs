@@ -100,6 +100,30 @@ pub const ENV_CHAIN_PATH: &str = "COCORE_MDA_CERT_CHAIN_PATH";
 pub const ENV_CHAIN_URL: &str = "COCORE_MDA_CHAIN_URL";
 pub const ENV_ATTEST_BINARY: &str = "COCORE_MDA_ATTEST_BINARY";
 
+/// Path to the signed App Attest helper (`cocore-appattest`). Distinct from
+/// `ENV_ATTEST_BINARY` (which yields a PEM MDA chain): this helper is invoked
+/// with the signing pubkey as argv[1] and emits JSON `{object, keyId}` for the
+/// App Attest path to hardware-attested. See `provider/spikes/app-attest`.
+///
+/// NOTE: App Attest is non-functional on macOS (DCAppAttestService.isSupported
+/// is false); this seam is retained for a future iOS companion. The live macOS
+/// path to hardware-attested is MDA option-B (the request below + freshness).
+pub const ENV_APPATTEST_BINARY: &str = "COCORE_APPATTEST_BINARY";
+
+/// Console endpoint that triggers a key-bound MDA option-B attestation
+/// (`POST /api/agent/mdm/request-attestation`). When set (with the serial +
+/// UDID below), the agent asks the coordinator to send an MDM DeviceInformation
+/// attestation with `DeviceAttestationNonce = sha256(pubkey)`, so the captured
+/// Apple chain's freshness OID commits to the signing key. The chain then
+/// arrives via `ENV_CHAIN_URL` as usual. See infra/mdm/RUNBOOK.md "Option-B".
+pub const ENV_REQUEST_URL: &str = "COCORE_MDA_REQUEST_URL";
+/// Device serial + NanoMDM enrollment UDID for the request above (set by the
+/// Secure Mode wizard / installer next to `ENV_REQUEST_URL`).
+pub const ENV_DEVICE_SERIAL: &str = "COCORE_MDA_DEVICE_SERIAL";
+pub const ENV_DEVICE_UDID: &str = "COCORE_MDA_DEVICE_UDID";
+/// Bearer API key the agent presents to the console.
+pub const ENV_CONSOLE_API_KEY: &str = "COCORE_API_KEY";
+
 /// Max time the attest-binary subprocess may run before we give
 /// up. Apple's DeviceCheck call typically resolves in well under
 /// a second; a 10-second ceiling is generous-but-bounded so a
@@ -189,6 +213,167 @@ pub fn try_load() -> Vec<Vec<u8>> {
     }
 
     Vec::new()
+}
+
+/// Acquire Apple App Attest evidence bound to `signing_pubkey_b64`.
+///
+/// Runs the helper named by `COCORE_APPATTEST_BINARY` with the base64 signing
+/// public key as argv[1]; the helper sets `clientDataHash = sha256(pubkey)` and
+/// emits JSON `{ "object": "<b64 CBOR>", "keyId": "<b64>", ... }` on stdout.
+///
+/// Returns `None` when the env var is unset, the helper fails / times out, or
+/// the output is malformed — the agent stays self-attested on the App Attest
+/// path rather than refusing to boot (same fail-soft posture as `try_load`).
+/// Note the caller (`attestation::build`) still re-verifies the evidence
+/// locally before embedding it, so a buggy helper can never elevate trust.
+pub fn load_appattest(signing_pubkey_b64: &str) -> Option<crate::attestation::AppAttestEvidence> {
+    let bin = std::env::var(ENV_APPATTEST_BINARY).ok()?;
+    match run_appattest_binary(Path::new(&bin), signing_pubkey_b64) {
+        Ok(ev) => {
+            tracing::info!(binary = %bin, "acquired App Attest evidence");
+            Some(ev)
+        }
+        Err(e) => {
+            tracing::warn!(binary = %bin, error = %e, "App Attest helper invocation failed; staying self-attested");
+            None
+        }
+    }
+}
+
+/// Invoke the App Attest helper with the signing pubkey and parse its JSON.
+fn run_appattest_binary(
+    binary: &Path,
+    signing_pubkey_b64: &str,
+) -> Result<crate::attestation::AppAttestEvidence> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new(binary)
+        .arg(signing_pubkey_b64)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()) // captured but never logged (may carry device IDs)
+        .spawn()
+        .with_context(|| format!("spawning {}", binary.display()))?;
+
+    let deadline = Instant::now() + ATTEST_BINARY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("App Attest helper exited with {status}");
+            }
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            bail!(
+                "App Attest helper did not exit within {}s; killed",
+                ATTEST_BINARY_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let mut stdout_buf = Vec::new();
+    if let Some(mut s) = child.stdout.take() {
+        s.read_to_end(&mut stdout_buf)
+            .context("reading App Attest helper stdout")?;
+    }
+    parse_appattest_json(&stdout_buf)
+}
+
+/// Parse the helper's stdout JSON into an [`AppAttestEvidence`]. Only `object`
+/// and `keyId` are consumed; the helper's other fields (clientDataHashHex,
+/// appId, environment) are diagnostic and ignored here.
+pub fn parse_appattest_json(stdout: &[u8]) -> Result<crate::attestation::AppAttestEvidence> {
+    #[derive(serde::Deserialize)]
+    struct Out {
+        object: String,
+        #[serde(rename = "keyId")]
+        key_id: String,
+    }
+    let s = std::str::from_utf8(stdout).context("App Attest helper stdout is not UTF-8")?;
+    let out: Out = serde_json::from_str(s.trim()).context("parsing App Attest helper JSON")?;
+    if out.object.is_empty() || out.key_id.is_empty() {
+        bail!("App Attest helper returned empty object or keyId");
+    }
+    Ok(crate::attestation::AppAttestEvidence {
+        object: out.object,
+        keyId: out.key_id,
+    })
+}
+
+/// Build the JSON body for `POST /api/agent/mdm/request-attestation`. Pure so
+/// it's unit-tested; the coordinator computes the DeviceAttestationNonce as
+/// `sha256(publicKey)` from this `publicKey`.
+pub fn build_request_body(serial: &str, udid: &str, public_key_b64: &str) -> String {
+    serde_json::json!({
+        "serial": serial,
+        "udid": udid,
+        "publicKey": public_key_b64,
+    })
+    .to_string()
+}
+
+/// Trigger a key-bound MDA option-B attestation: ask the console coordinator to
+/// send the device an MDM DeviceInformation attestation whose nonce commits to
+/// `public_key_b64`. Best-effort and fail-soft — a failure just means no fresh
+/// chain is requested this boot; the agent stays self-attested and the next
+/// boot retries. Reads serial/UDID/console-key/URL from the environment; a
+/// no-op (returns `false`) unless all are configured.
+///
+/// Apple rate-limits DeviceInformation attestation to ~1/device/7 days, so the
+/// coordinator/device may ignore rapid repeats — that's fine, the previously
+/// captured chain remains valid and bound while the signing key is stable.
+pub fn request_attestation(public_key_b64: &str) -> bool {
+    let (Ok(url), Ok(serial), Ok(udid)) = (
+        std::env::var(ENV_REQUEST_URL),
+        std::env::var(ENV_DEVICE_SERIAL),
+        std::env::var(ENV_DEVICE_UDID),
+    ) else {
+        return false;
+    };
+    let api_key = std::env::var(ENV_CONSOLE_API_KEY).unwrap_or_default();
+    let body = build_request_body(&serial, &udid, public_key_b64);
+
+    use std::process::Command;
+    // Shell out to curl (matches load_from_url — boot is synchronous and the
+    // agent's reqwest is async-only). 20s ceiling; never blocks boot for long.
+    let mut args = vec![
+        "-fsS".to_string(),
+        "--max-time".to_string(),
+        "20".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        "-H".to_string(),
+        "content-type: application/json".to_string(),
+    ];
+    if !api_key.is_empty() {
+        args.push("-H".to_string());
+        args.push(format!("authorization: Bearer {api_key}"));
+    }
+    args.push("-d".to_string());
+    args.push(body);
+    args.push(url);
+
+    match Command::new("curl").args(&args).output() {
+        Ok(out) if out.status.success() => {
+            tracing::info!("requested key-bound MDA attestation (option-B) from coordinator");
+            true
+        }
+        Ok(out) => {
+            tracing::warn!(
+                status = %out.status,
+                "request-attestation call returned non-zero; staying self-attested this boot"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "request-attestation curl failed; staying self-attested");
+            false
+        }
+    }
 }
 
 /// Read a PEM file and return one DER blob per CERTIFICATE block,
@@ -443,6 +628,15 @@ mod tests {
     fn load_from_file_errors_on_missing_path() {
         let err = load_from_file(Path::new("/nonexistent/path/xyz.pem")).unwrap_err();
         assert!(format!("{err}").contains("reading"));
+    }
+
+    #[test]
+    fn request_body_is_well_formed_json() {
+        let body = build_request_body("H2WHW38LQ6NV", "A1B2-UDID", "cHVia2V5");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["serial"], "H2WHW38LQ6NV");
+        assert_eq!(v["udid"], "A1B2-UDID");
+        assert_eq!(v["publicKey"], "cHVia2V5");
     }
 
     /// Make sure `try_load` returns empty (not an error) when no
