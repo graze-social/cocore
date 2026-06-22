@@ -1188,15 +1188,24 @@ struct ModelsView: View {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text("Applying… (bouncing the agent)")
+                                .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
                     }
                     if let e = manager.error {
-                        Text(e).foregroundStyle(.red).lineLimit(4)
+                        Text(e)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     if let s = manager.loadStatus {
+                        // Match the footnote/secondary styling of the grouped
+                        // section footers (it reads as one of those notes).
                         Text(s.text)
+                            .font(.footnote)
                             .foregroundStyle(s.isFailure ? .red : .secondary)
+                            .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
