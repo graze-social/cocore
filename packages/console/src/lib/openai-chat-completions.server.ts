@@ -296,18 +296,28 @@ export function streamingResponse(
             return;
           } else if (ev.kind === "error") {
             const mapped = dispatchErrorToHttpResponse(ev.code);
-            // OpenAI SDKs handle SSE errors with a specially-shaped event.
-            controller.enqueue(
-              encoder.encode(
-                `event: error\ndata: ${JSON.stringify({
-                  error: {
-                    message: ev.reason,
-                    type: mapped.type,
-                    code: mapped.code,
-                    param: null,
-                  },
-                })}\n\n`,
-              ),
+            // Emit the error on the DEFAULT SSE event (a `data:` frame),
+            // not a named `event: error`. This is the de-facto OpenAI
+            // mid-stream error shape (an `{ error: {...} }` object on the
+            // default event, HTTP stays 200) honored by the OpenAI SDKs
+            // and OpenAI-compatible servers (vLLM/SGLang/etc.). Minimal
+            // SSE clients (e.g. Apollo) only read default-event `data:`
+            // frames, so a named `event: error` is silently dropped —
+            // the stream then appears to end with no chunk, which the
+            // client reports as "the response is not a stream."
+            //
+            // No `[DONE]` follows: OpenAI interrupts the stream with the
+            // error frame and closes, rather than emitting the normal
+            // terminator. The `finally` closes the controller (EOF).
+            send(
+              JSON.stringify({
+                error: {
+                  message: ev.reason,
+                  type: mapped.type,
+                  code: mapped.code,
+                  param: null,
+                },
+              }),
             );
             return;
           }
