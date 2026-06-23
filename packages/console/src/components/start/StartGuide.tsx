@@ -25,12 +25,8 @@ import { Page } from "@/design-system/page/index.tsx";
 import { SegmentedControl, SegmentedControlItem } from "@/design-system/segmented-control";
 import { Select, SelectItem } from "@/design-system/select";
 import { uiColor } from "@/design-system/theme/color.stylex";
-import { horizontalSpace, verticalSpace } from "@/design-system/theme/semantic-spacing.stylex";
-import {
-  fontFamily,
-  fontSize,
-  fontWeight,
-} from "@/design-system/theme/typography.stylex";
+import { verticalSpace } from "@/design-system/theme/semantic-spacing.stylex";
+import { fontFamily, fontSize, fontWeight } from "@/design-system/theme/typography.stylex";
 import { Body, Heading1, InlineCode } from "@/design-system/typography";
 
 const REQUESTER_SNIPPET_LANG: SnippetLang = "typescript";
