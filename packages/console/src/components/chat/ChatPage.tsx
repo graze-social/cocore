@@ -35,6 +35,7 @@ import {
   saveSessions,
   titleFromText,
 } from "@/components/chat/chat-store.ts";
+import { chatImageDataUrl, loadChatImages, saveChatImages } from "@/components/chat/chat-images.ts";
 import { ChatMarkdown } from "@/components/chat/chat-markdown.tsx";
 import { ThinkingDisclosure } from "@/components/chat/chat-thinking.tsx";
 import { modelDirectoryRouteQueryOptions } from "@/components/models/models.functions.ts";
@@ -487,6 +488,30 @@ const styles = stylex.create({
     paddingTop: verticalSpace.md,
     whiteSpace: "pre-wrap",
   },
+  bubbleImageRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: gap.sm,
+    marginBottom: verticalSpace.sm,
+  },
+  bubbleImage: {
+    borderColor: uiColor.border2,
+    borderRadius: radius.sm,
+    borderStyle: "solid",
+    borderWidth: 1,
+    height: "120px",
+    maxWidth: "100%",
+    objectFit: "cover",
+    width: "auto",
+  },
+  bubbleImageMissing: {
+    alignItems: "center",
+    color: uiColor.text1,
+    display: "flex",
+    fontSize: MICRO,
+    gap: gap.xs,
+    marginBottom: verticalSpace.sm,
+  },
   msgAssistant: {
     alignSelf: "stretch",
     display: "flex",
@@ -894,6 +919,33 @@ function machineLabel(m: ModelDirectoryEntry["machines"][number]): string {
   return owner ?? machine ?? shortDid(m.did);
 }
 
+/** Render the image part of a user turn: thumbnails when the bytes are
+ *  available (just-sent or rehydrated from IndexedDB), otherwise a "had
+ *  image" indicator — while loading (undefined) it reads as the same neutral
+ *  chip, and once we know the bytes are gone ("lost") it says so. */
+function renderUserImages(
+  msgId: string,
+  count: number,
+  state: string[] | "lost" | undefined,
+): ReactElement {
+  if (Array.isArray(state)) {
+    return (
+      <div {...stylex.props(styles.bubbleImageRow)}>
+        {state.map((url, i) => (
+          <img key={`${msgId}-${i}`} src={url} alt="" {...stylex.props(styles.bubbleImage)} />
+        ))}
+      </div>
+    );
+  }
+  const label = count === 1 ? "1 image" : `${count} images`;
+  return (
+    <div {...stylex.props(styles.bubbleImageMissing)}>
+      <ImagePlus size={12} aria-hidden />
+      <span>{state === "lost" ? `${label} · no longer cached` : label}</span>
+    </div>
+  );
+}
+
 function fmtWhen(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return "";
@@ -1214,6 +1266,11 @@ export function ChatPage(): ReactElement {
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   // True while a file is dragged over the chat area (drives the drop overlay).
   const [dragActive, setDragActive] = useState(false);
+  // Rendered thumbnails for sent user turns, keyed by message id. An array of
+  // data URLs when the bytes are available (just-sent or rehydrated from
+  // IndexedDB), or "lost" when a turn had images (`imageCount`) but the cache
+  // no longer holds them — then we show a "had image" indicator.
+  const [msgImages, setMsgImages] = useState<Record<string, string[] | "lost">>({});
   const [streamingId, setStreamingId] = useState<string | null>(null);
 
   // Settings for the not-yet-created session shown by "new chat".
@@ -1496,10 +1553,19 @@ export function ChatPage(): ReactElement {
       id: newSessionId(),
       role: "user",
       // For an image-only turn keep a short marker so the bubble + title
-      // aren't blank (the images themselves aren't persisted).
+      // aren't blank when no thumbnail is available.
       text: text || (turnImages.length === 1 ? "(image)" : `(${turnImages.length} images)`),
+      ...(turnImages.length > 0 ? { imageCount: turnImages.length } : {}),
       createdAt: now,
     };
+    if (turnImages.length > 0) {
+      // Show the just-sent thumbnails immediately (reuse the composer's data
+      // URLs), and cache the bytes in IndexedDB so they survive a reload.
+      setMsgImages((prev) => ({ ...prev, [userMsg.id]: pendingImages.map((p) => p.url) }));
+      if (chatStorageKey) {
+        void saveChatImages(did, userMsg.id, turnImages, chatStorageKey);
+      }
+    }
     const assistantMsg: ChatMessage = {
       id: newSessionId(),
       role: "assistant",
@@ -1598,6 +1664,35 @@ export function ChatPage(): ReactElement {
     ? (selectedModel?.machines.find((m) => m.did === targetProviderDid) ?? null)
     : null;
   const messages = active?.messages ?? [];
+
+  // Stable signature of the user turns that carry images, so the rehydrate
+  // effect re-runs only when that set changes (not on every render).
+  const imageTurnIds = messages
+    .filter((m) => m.role === "user" && m.imageCount)
+    .map((m) => m.id)
+    .join(",");
+
+  // Rehydrate thumbnails for the visible session's image turns from
+  // IndexedDB. Skips turns already resolved (just-sent, or a prior load). A
+  // turn whose bytes are gone is marked "lost" so the bubble shows a "had
+  // image" indicator. The setMsgImages updater double-guards against races.
+  useEffect(() => {
+    if (did === "anon" || !chatStorageKey || !imageTurnIds) return;
+    let cancelled = false;
+    for (const id of imageTurnIds.split(",")) {
+      void loadChatImages(did, id, chatStorageKey).then((imgs) => {
+        if (cancelled) return;
+        setMsgImages((prev) =>
+          prev[id] !== undefined
+            ? prev
+            : { ...prev, [id]: imgs && imgs.length > 0 ? imgs.map(chatImageDataUrl) : "lost" },
+        );
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [imageTurnIds, did, chatStorageKey]);
 
   // Rough context estimate, mirroring the receipts where we have
   // them and ~4 chars/token where we don't.
@@ -1801,6 +1896,7 @@ export function ChatPage(): ReactElement {
                 {messages.map((m) =>
                   m.role === "user" ? (
                     <div key={m.id} {...stylex.props(styles.msgUser)}>
+                      {m.imageCount ? renderUserImages(m.id, m.imageCount, msgImages[m.id]) : null}
                       {m.text}
                     </div>
                   ) : (

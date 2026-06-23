@@ -42,6 +42,11 @@ export interface ChatMessage {
    *  partial output streamed before the failure. */
   errorCode?: string;
   errorReason?: string;
+  /** User turns: how many images rode this turn. The image BYTES live in
+   *  IndexedDB (see chat-images.ts), not in this localStorage blob — this
+   *  count is the durable marker so we always know images existed even after
+   *  the cached bytes are evicted (then we show a "had image" indicator). */
+  imageCount?: number;
   createdAt: string;
 }
 
