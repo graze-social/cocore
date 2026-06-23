@@ -81,6 +81,7 @@ import { Route as DocsHeaderLayoutDocsInferenceRouteImport } from './routes/_doc
 import { Route as DocsHeaderLayoutDocsCommunityToolsRouteImport } from './routes/_docs-header-layout.docs.community-tools'
 import { Route as DocsHeaderLayoutDocsApiRouteImport } from './routes/_docs-header-layout.docs.api'
 import { Route as DocsHeaderLayoutDocsInferenceIndexRouteImport } from './routes/_docs-header-layout.docs.inference.index'
+import { Route as V1VerifiedChatCompletionsRouteImport } from './routes/v1.verified.chat.completions'
 import { Route as V1PrivateChatCompletionsRouteImport } from './routes/v1.private.chat.completions'
 import { Route as ApiV1ChatCompletionsRouteImport } from './routes/api.v1.chat.completions'
 import { Route as ApiInternalDisputesResolveRouteImport } from './routes/api/internal/disputes.resolve'
@@ -96,6 +97,7 @@ import { Route as ApiAgentMdmEnrollProfileRouteImport } from './routes/api/agent
 import { Route as ApiAgentMdmAttestationChainRouteImport } from './routes/api/agent.mdm.attestation-chain'
 import { Route as DocsHeaderLayoutDocsInferenceAuthenticationRouteImport } from './routes/_docs-header-layout.docs.inference.authentication'
 import { Route as DocsHeaderLayoutDocsInferenceSlugRouteImport } from './routes/_docs-header-layout.docs.inference.$slug'
+import { Route as ApiV1VerifiedChatCompletionsRouteImport } from './routes/api.v1.verified.chat.completions'
 import { Route as ApiV1PrivateChatCompletionsRouteImport } from './routes/api.v1.private.chat.completions'
 
 const OgDotpngRoute = OgDotpngRouteImport.update({
@@ -482,6 +484,12 @@ const DocsHeaderLayoutDocsInferenceIndexRoute =
     path: '/',
     getParentRoute: () => DocsHeaderLayoutDocsInferenceRoute,
   } as any)
+const V1VerifiedChatCompletionsRoute =
+  V1VerifiedChatCompletionsRouteImport.update({
+    id: '/v1/verified/chat/completions',
+    path: '/v1/verified/chat/completions',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const V1PrivateChatCompletionsRoute =
   V1PrivateChatCompletionsRouteImport.update({
     id: '/v1/private/chat/completions',
@@ -567,6 +575,12 @@ const DocsHeaderLayoutDocsInferenceSlugRoute =
     id: '/$slug',
     path: '/$slug',
     getParentRoute: () => DocsHeaderLayoutDocsInferenceRoute,
+  } as any)
+const ApiV1VerifiedChatCompletionsRoute =
+  ApiV1VerifiedChatCompletionsRouteImport.update({
+    id: '/api/v1/verified/chat/completions',
+    path: '/api/v1/verified/chat/completions',
+    getParentRoute: () => rootRouteImport,
   } as any)
 const ApiV1PrivateChatCompletionsRoute =
   ApiV1PrivateChatCompletionsRouteImport.update({
@@ -660,8 +674,10 @@ export interface FileRoutesByFullPath {
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
   '/docs/inference/': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
+  '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
 }
 export interface FileRoutesByTo {
   '/': typeof HeaderLayoutIndexRoute
@@ -747,8 +763,10 @@ export interface FileRoutesByTo {
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
   '/docs/inference': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
+  '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -838,8 +856,10 @@ export interface FileRoutesById {
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
   '/_docs-header-layout/docs/inference/': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
+  '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -928,8 +948,10 @@ export interface FileRouteTypes {
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
     | '/v1/private/chat/completions'
+    | '/v1/verified/chat/completions'
     | '/docs/inference/'
     | '/api/v1/private/chat/completions'
+    | '/api/v1/verified/chat/completions'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -1015,8 +1037,10 @@ export interface FileRouteTypes {
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
     | '/v1/private/chat/completions'
+    | '/v1/verified/chat/completions'
     | '/docs/inference'
     | '/api/v1/private/chat/completions'
+    | '/api/v1/verified/chat/completions'
   id:
     | '__root__'
     | '/_docs-header-layout'
@@ -1105,8 +1129,10 @@ export interface FileRouteTypes {
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
     | '/v1/private/chat/completions'
+    | '/v1/verified/chat/completions'
     | '/_docs-header-layout/docs/inference/'
     | '/api/v1/private/chat/completions'
+    | '/api/v1/verified/chat/completions'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -1161,7 +1187,9 @@ export interface RootRouteChildren {
   ApiInternalDisputesResolveRoute: typeof ApiInternalDisputesResolveRoute
   ApiV1ChatCompletionsRoute: typeof ApiV1ChatCompletionsRoute
   V1PrivateChatCompletionsRoute: typeof V1PrivateChatCompletionsRoute
+  V1VerifiedChatCompletionsRoute: typeof V1VerifiedChatCompletionsRoute
   ApiV1PrivateChatCompletionsRoute: typeof ApiV1PrivateChatCompletionsRoute
+  ApiV1VerifiedChatCompletionsRoute: typeof ApiV1VerifiedChatCompletionsRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -1670,6 +1698,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DocsHeaderLayoutDocsInferenceIndexRouteImport
       parentRoute: typeof DocsHeaderLayoutDocsInferenceRoute
     }
+    '/v1/verified/chat/completions': {
+      id: '/v1/verified/chat/completions'
+      path: '/v1/verified/chat/completions'
+      fullPath: '/v1/verified/chat/completions'
+      preLoaderRoute: typeof V1VerifiedChatCompletionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/private/chat/completions': {
       id: '/v1/private/chat/completions'
       path: '/v1/private/chat/completions'
@@ -1774,6 +1809,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/docs/inference/$slug'
       preLoaderRoute: typeof DocsHeaderLayoutDocsInferenceSlugRouteImport
       parentRoute: typeof DocsHeaderLayoutDocsInferenceRoute
+    }
+    '/api/v1/verified/chat/completions': {
+      id: '/api/v1/verified/chat/completions'
+      path: '/api/v1/verified/chat/completions'
+      fullPath: '/api/v1/verified/chat/completions'
+      preLoaderRoute: typeof ApiV1VerifiedChatCompletionsRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/api/v1/private/chat/completions': {
       id: '/api/v1/private/chat/completions'
@@ -1969,7 +2011,9 @@ const rootRouteChildren: RootRouteChildren = {
   ApiInternalDisputesResolveRoute: ApiInternalDisputesResolveRoute,
   ApiV1ChatCompletionsRoute: ApiV1ChatCompletionsRoute,
   V1PrivateChatCompletionsRoute: V1PrivateChatCompletionsRoute,
+  V1VerifiedChatCompletionsRoute: V1VerifiedChatCompletionsRoute,
   ApiV1PrivateChatCompletionsRoute: ApiV1PrivateChatCompletionsRoute,
+  ApiV1VerifiedChatCompletionsRoute: ApiV1VerifiedChatCompletionsRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

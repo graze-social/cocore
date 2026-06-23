@@ -63,6 +63,14 @@ export default mergeConfig(
       stylexPlugin.vite({
         treeshakeCompensation: true,
         dev: process.env.NODE_ENV !== "production",
+        // Pin StyleX's collected CSS into our global `styles.css` asset (the
+        // one linked on every page in __root.tsx). Without this, the plugin
+        // appends its CSS to the *first* CSS asset in the bundle, which
+        // silently moves to a route chunk (e.g. ChatPage's `katex.min.css`)
+        // the moment any component adds a side-effect CSS import — leaving the
+        // rest of the app unstyled in production. Match `assets/styles-<hash>.css`.
+        cssInjectionTarget: (fileName: string) =>
+          /(^|\/)styles(-[A-Za-z0-9_-]+)?\.css$/.test(fileName),
         aliases: {
           "@/*": [path.join(rootDir, "./src/*")],
         },
