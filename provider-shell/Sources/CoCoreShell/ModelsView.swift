@@ -364,9 +364,9 @@ final class ModelManager: ObservableObject {
         }
 
         /// True for vision / multimodal (image-input) models — identified by the
-        /// HF `pipeline_tag`, the authoritative signal. The agent's inference
-        /// path is text-only (vllm-mlx serves text LLMs; the chat sends no
-        /// images), so these can't be served and adding one fails provisioning.
+        /// HF `pipeline_tag`, the authoritative signal. These ARE served now
+        /// (the agent loads them via vllm-mlx's multimodal path and the chat can
+        /// send images), so this is a capability hint for the row, not a gate.
         var isVision: Bool {
             guard let tag = pipelineTag else { return false }
             return [
@@ -1502,10 +1502,9 @@ struct ModelsView: View {
     /// One HuggingFace search result: the NSID, its download count, and Add.
     @ViewBuilder private func searchRow(_ r: ModelManager.CatalogResult) -> some View {
         let vision = r.isVision
-        // Vision models can't be served at all, so they take precedence over the
-        // budget check for the row's disabled/dimmed state.
+        // Vision models are servable now; only the RAM budget gates adding.
         let fits = r.fitsBudget
-        let addable = fits && !vision
+        let addable = fits
         // "needs ~14 GB (weights) · 12.3K downloads" — weight footprint omitted
         // when the size is unknown. KV cache rides on top at serve time.
         let ram: String? = r.weightGB.map { "needs ~\($0) GB (weights)" }
@@ -1526,9 +1525,10 @@ struct ModelsView: View {
                 }
                 if vision {
                     // Authoritative HF pipeline_tag says this is multimodal —
-                    // the text-only path can't serve it, so say so plainly.
-                    Text("Vision model — co/core serves text only")
-                        .font(.footnote).foregroundStyle(.orange)
+                    // surface it as a capability so the operator knows this model
+                    // accepts image input.
+                    Text("Vision model — accepts image input")
+                        .font(.footnote).foregroundStyle(.green)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 Text(stats)
