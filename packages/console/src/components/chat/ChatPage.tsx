@@ -837,7 +837,16 @@ function ModelPicker({
   onMaxTokens: (n: number) => void;
 }): ReactElement {
   const [open, setOpen] = useState(false);
+  const [modelQuery, setModelQuery] = useState("");
   const selected = models.find((m) => m.modelId === modelId) ?? null;
+  const filteredModels = useMemo(() => {
+    const q = modelQuery.trim().toLowerCase();
+    if (!q) return models;
+    return models.filter((m) => {
+      if (m.modelId.toLowerCase().includes(q)) return true;
+      return m.machines.some((mac) => machineLabel(mac).toLowerCase().includes(q));
+    });
+  }, [models, modelQuery]);
   const machines: MachineOption[] = (selected?.machines ?? []).map((m) => ({
     did: m.did,
     label: machineLabel(m),
@@ -865,7 +874,10 @@ function ModelPicker({
     <div {...stylex.props(styles.modelPickerRoot)}>
       <Popover
         isOpen={open}
-        onOpenChange={setOpen}
+        onOpenChange={(next) => {
+          setOpen(next);
+          if (!next) setModelQuery("");
+        }}
         placement="top start"
         trigger={
           <AriaButton {...stylex.props(styles.chipBtn)}>
@@ -886,13 +898,27 @@ function ModelPicker({
           <span>model</span>
           <span {...stylex.props(styles.popSectHint)}>models live on the network</span>
         </div>
+        {models.length > 4 ? (
+          <SearchField
+            size="sm"
+            placeholder="search models"
+            value={modelQuery}
+            onChange={setModelQuery}
+            aria-label="search models"
+          />
+        ) : null}
         <Flex direction="column" gap="xs">
           {models.length === 0 ? (
             <Text variant="secondary" size="sm">
               no models online right now
             </Text>
           ) : null}
-          {models.map((m) => (
+          {models.length > 0 && filteredModels.length === 0 ? (
+            <Text variant="secondary" size="sm">
+              no models match “{modelQuery.trim()}”
+            </Text>
+          ) : null}
+          {filteredModels.map((m) => (
             <button
               key={m.modelId}
               type="button"
