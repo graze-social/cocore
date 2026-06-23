@@ -2122,6 +2122,34 @@ fn build_engines(
             models: all_unserved,
             at: chrono::Utc::now(),
         }
+    } else if !failed.is_empty() && is_vision_config_failure(last_err.as_deref()) {
+        // A vision/multimodal model whose config the multimodal runtime
+        // (mlx_vlm) couldn't parse — the "not in MLX format" message below would
+        // be actively wrong here (the weights ARE MLX; the vision_config is the
+        // problem). This is overwhelmingly a merged / re-quantized VLM whose
+        // vision_config was stripped or left incomplete, so it can't load as a
+        // vision model in any client. Point the operator at a known-good VLM.
+        tracing::warn!(
+            models = ?failed,
+            last_error = %last_err.as_deref().unwrap_or("(none captured)"),
+            "vision model failed to load — incomplete vision_config; serving stub only"
+        );
+        EngineFault {
+            code: "model-vision-incompatible".to_string(),
+            message: format!(
+                "The vision/multimodal model(s) [{}] couldn't load: the runtime rejected \
+                 their image config (an incomplete `vision_config`). The weights are MLX, \
+                 but this is almost always a merged or re-quantized VLM whose vision config \
+                 was dropped during conversion — so it can't be served as a vision model in \
+                 any tool, not just co/core. The machine is online but only serving the \
+                 no-op `stub` engine. Fix: pick a standard MLX vision model — e.g. \
+                 `mlx-community/Qwen2.5-VL-7B-Instruct-4bit` or \
+                 `mlx-community/Qwen2.5-VL-3B-Instruct-4bit` — then start serving again.",
+                failed.join(", "),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
     } else if !failed.is_empty() {
         tracing::warn!(
             models = ?failed,
@@ -2197,6 +2225,19 @@ const ENGINE_START_MAX_ATTEMPTS: u32 = 3;
 /// wait a little longer each time for a concurrent venv install / weight
 /// download to make progress.
 const ENGINE_START_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether an engine-start error is the "this VLM's image config is broken"
+/// failure — the multimodal loader (mlx_vlm) choking on an incomplete
+/// `vision_config`. Detected from the captured subprocess stderr, which the
+/// startup bail embeds verbatim. Drives a precise operator message instead of
+/// the generic "not in MLX format" one (which is wrong: the weights ARE MLX).
+fn is_vision_config_failure(last_err: Option<&str>) -> bool {
+    let Some(e) = last_err else { return false };
+    // `VisionConfig` is the mlx_vlm class in the traceback; `vision_config` is
+    // the config key it failed to build. Either is a strong, content-safe
+    // signal (the ring buffer carries only library tracebacks at startup).
+    e.contains("VisionConfig") || e.contains("vision_config")
+}
 
 /// Try to start one model's inference subprocess, retrying transient
 /// failures with backoff. Re-checks for the venv interpreter on every
@@ -2345,6 +2386,33 @@ mod apply_desired_tier_tests {
         let mut v = serde_json::json!({});
         assert!(!apply_desired_tier(&mut v, false)); // absent == off already
         assert!(apply_desired_tier(&mut v, true)); // off -> on
+    }
+}
+
+#[cfg(test)]
+mod vision_fault_tests {
+    use super::is_vision_config_failure;
+
+    #[test]
+    fn detects_mlx_vlm_visionconfig_failure() {
+        let err = "inference subprocess for X exited during startup with exit status: 1\n  [stderr] TypeError: VisionConfig.__init__() missing 6 required positional arguments";
+        assert!(is_vision_config_failure(Some(err)));
+    }
+
+    #[test]
+    fn detects_vision_config_key_failure() {
+        assert!(is_vision_config_failure(Some("KeyError: 'vision_config'")));
+    }
+
+    #[test]
+    fn ignores_unrelated_failures_and_none() {
+        assert!(!is_vision_config_failure(Some(
+            "OSError: out of memory loading weights"
+        )));
+        assert!(!is_vision_config_failure(Some(
+            "ModuleNotFoundError: vllm_mlx"
+        )));
+        assert!(!is_vision_config_failure(None));
     }
 }
 
