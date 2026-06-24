@@ -543,7 +543,7 @@ final class ModelManager: ObservableObject {
 
     /// Classify a model id by what it produces. Image markers stay in sync
     /// with the Rust `IMAGE_MODEL_MARKERS` + the console `inferModelKind`.
-    static func kind(of nsid: String) -> ModelKind {
+    nonisolated static func kind(of nsid: String) -> ModelKind {
         let id = nsid.lowercased()
         let imageMarkers = [
             "flux", "sdxl", "stable-diffusion", "stable_diffusion", "diffusion", "dall",
@@ -555,25 +555,27 @@ final class ModelManager: ObservableObject {
     /// Curated image-generation models for the "Add a model" Image tab. Each
     /// runs on a specific framework, which decides where it can serve:
     ///   * `stub-flux`  — StubEngine (always; zero RAM smoke test).
-    ///   * FLUX         — the mflux subprocess (best-effort; any build).
-    ///   * SDXL / SD-2.1 — the in-process native-MLX diffusion engine, which
-    ///     runs ONLY under confidential mode (the nested worker). They're
-    ///     listed so they're discoverable, but the row marks them confidential
-    ///     and disables Add on a build that can't run confidential.
+    ///   * FLUX         — the mflux subprocess (any build).
+    ///   * SDXL / SD-2.1 — the in-process native-MLX diffusion engine. This
+    ///     runs whenever the build ships the native worker (the standard app
+    ///     does), at the best-effort tier — and is verified-confidential only
+    ///     when the owner turns confidential mode on. So they're listed and
+    ///     addable; Add is disabled only on a build with no native worker.
     /// Mirrors the Rust `RATES` image entries.
     static let imageCatalog: [CatalogEntry] = [
         CatalogEntry(nsid: "stub-flux", label: "Stub (image smoke test)", minRamGB: 0, recommended: false, blurb: "Emits a fixed 1×1 PNG — no GPU. Proves the image path end-to-end."),
         CatalogEntry(nsid: "black-forest-labs/FLUX.1-schnell", label: "FLUX.1 schnell", minRamGB: 16, recommended: true, blurb: "Fast 4-step FLUX image generation (via mflux)."),
         CatalogEntry(nsid: "black-forest-labs/FLUX.1-dev", label: "FLUX.1 dev", minRamGB: 24, recommended: false, blurb: "Higher-quality FLUX image generation (via mflux)."),
-        CatalogEntry(nsid: "stabilityai/sdxl-turbo", label: "SDXL-Turbo", minRamGB: 12, recommended: false, blurb: "Fast 2-step image gen. Runs in the in-process confidential engine."),
-        CatalogEntry(nsid: "stabilityai/stable-diffusion-2-1-base", label: "Stable Diffusion 2.1", minRamGB: 12, recommended: false, blurb: "Classic SD image gen. Runs in the in-process confidential engine."),
+        CatalogEntry(nsid: "stabilityai/sdxl-turbo", label: "SDXL-Turbo", minRamGB: 12, recommended: false, blurb: "Fast 2-step image gen. Runs in-process (native MLX)."),
+        CatalogEntry(nsid: "stabilityai/stable-diffusion-2-1-base", label: "Stable Diffusion 2.1", minRamGB: 12, recommended: false, blurb: "Classic SD image gen. Runs in-process (native MLX)."),
     ]
 
-    /// True for image models that ONLY the in-process native-MLX diffusion
-    /// engine can serve (SDXL / Stable-Diffusion) — i.e. they need confidential
-    /// mode. Mirrors the Rust `is_image_model(m) && !is_flux_model(m)`; the
-    /// always-available `stub-flux` and the FLUX (mflux) models are excluded.
-    static func isConfidentialOnlyImage(_ nsid: String) -> Bool {
+    /// True for image models that run ONLY on the in-process native-MLX
+    /// diffusion engine (SDXL / Stable-Diffusion) — i.e. they need the native
+    /// worker binary, regardless of tier. Mirrors the Rust
+    /// `is_image_model(m) && !is_flux_model(m)`; `stub-flux` and the FLUX
+    /// (mflux) models are excluded.
+    nonisolated static func isNativeOnlyImage(_ nsid: String) -> Bool {
         guard kind(of: nsid) == .image else { return false }
         let m = nsid.lowercased()
         if m == "stub-flux" { return false }
@@ -1536,13 +1538,14 @@ struct ModelsView: View {
         let fits = ModelManager.fitsBudget(item.minRamGB)
         let suggested = item.nsid == ModelManager.recommendedNSID
         let isLatest = recommendedNSIDs.contains(item.nsid)
-        // SDXL / SD image models run only in the in-process native engine
-        // (confidential mode). If this build can't do confidential at all, they
-        // can never serve — disable Add. Otherwise they're addable but only
-        // serve once the user turns confidential mode on.
-        let confidentialOnly = ModelManager.isConfidentialOnlyImage(item.nsid)
-        let canConfidential = AgentSupervisor.hasConfidentialWorker()
-        let blockedConfidential = confidentialOnly && !canConfidential
+        // SDXL / SD image models run only on the in-process native diffusion
+        // engine, which lives in the native worker binary. The standard build
+        // ships it, so they're addable and serve at the best-effort tier
+        // (verified-confidential only when confidential mode is on). A build
+        // with no native worker can't run them at all → disable Add.
+        let nativeOnly = ModelManager.isNativeOnlyImage(item.nsid)
+        let hasNativeEngine = AgentSupervisor.hasConfidentialWorker()
+        let blockedNative = nativeOnly && !hasNativeEngine
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -1583,14 +1586,14 @@ struct ModelsView: View {
                 )
                 .font(.footnote)
                 .foregroundStyle(fits ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
-                if confidentialOnly {
+                if nativeOnly {
                     Text(
-                        canConfidential
-                            ? "🔒 Confidential only — turn on confidential mode (Status → Security) to serve this."
-                            : "🔒 Confidential only — this build can't run the in-process engine, so it can't serve this model."
+                        hasNativeEngine
+                            ? "Runs in-process (native MLX) — best-effort tier, verified confidential only when confidential mode is on (Status → Security)."
+                            : "This build can't run the in-process engine, so it can't serve this model."
                     )
                     .font(.footnote)
-                    .foregroundStyle(blockedConfidential ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    .foregroundStyle(blockedNative ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -1599,15 +1602,14 @@ struct ModelsView: View {
                 .buttonStyle(.bordered)
                 .tint(Color(nsColor: .controlAccentColor))
                 .disabled(
-                    manager.busy || !fits || blockedConfidential
-                        || manager.models.contains(item.nsid)
+                    manager.busy || !fits || blockedNative || manager.models.contains(item.nsid)
                 )
                 .help(
-                    blockedConfidential
-                        ? "This image model needs the in-process confidential engine, which this build doesn't ship."
+                    blockedNative
+                        ? "This image model needs the in-process native engine, which this build doesn't ship."
                         : "")
         }
-        .opacity(fits && !blockedConfidential ? 1 : 0.65)
+        .opacity(fits && !blockedNative ? 1 : 0.65)
     }
 
     /// One HuggingFace search result: the NSID, its download count, and Add.

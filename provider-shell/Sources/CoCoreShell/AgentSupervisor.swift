@@ -230,7 +230,19 @@ final class AgentSupervisor {
         // native-only, so we must not inject subprocess models).
         let tier = Self.probeTier()
         let confidential = (tier == "attested-confidential")
-        guard let bin = Self.serveBinary(tier: tier) else {
+        // Native-only image models (SDXL / Stable-Diffusion) run on the
+        // in-process diffusion engine, which only the native worker binary
+        // ships. Use the worker for them EVEN on a best-effort machine: the
+        // worker serves best-effort when desiredTier isn't confidential (no
+        // push host, subprocess engines for everything else), but it has the
+        // native diffusion engine so SDXL/SD run — just not verified
+        // confidential. FLUX + chat keep going through the subprocess engines.
+        let needsNativeImage = Self.configuredModelsNeedNativeImage()
+        let bin: URL? =
+            (confidential || needsNativeImage)
+            ? (Self.confidentialWorkerBinary() ?? Self.locateBinary())
+            : Self.serveBinary(tier: tier)
+        guard let bin else {
             NSLog("cocore: provider binary not found")
             return
         }
@@ -730,5 +742,17 @@ final class AgentSupervisor {
     /// surface that rather than spin waiting for a verification that can't come.
     nonisolated static func hasConfidentialWorker() -> Bool {
         confidentialWorkerBinary() != nil
+    }
+
+    /// True when any configured (UserDefaults) model needs the in-process
+    /// native diffusion engine — SDXL / Stable-Diffusion. Those run only in the
+    /// native worker binary, so `spawnChild` uses the worker for them even on a
+    /// best-effort machine (serving best-effort, just with the native engine
+    /// available). FLUX / chat models don't need it.
+    nonisolated static func configuredModelsNeedNativeImage() -> Bool {
+        let models = (UserDefaults.standard.string(forKey: "inferenceModels") ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return models.contains { ModelManager.isNativeOnlyImage($0) }
     }
 }
