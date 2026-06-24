@@ -6,12 +6,13 @@ info:
     cocore is a decentralized network of Apple-Silicon Macs serving local
     inference, with every completed job recorded as a provider-signed receipt
     on AT Protocol. This is the public HTTP API: an OpenAI-compatible
-    chat-completions surface, a public directory of the models currently being
-    served, and bearer-key authed agent status.
+    chat-completions and images surface, a public directory of the models
+    currently being served, and bearer-key authed agent status.
 
     To use an OpenAI-compatible client, set its base URL to
     `https://cocore.dev/v1` (the client appends `/chat/completions`,
-    `/models`, … exactly as it does for `https://api.openai.com/v1`) and swap
+    `/images/generations`, `/models`, … exactly as it does for
+    `https://api.openai.com/v1`) and swap
     in a cocore API key. The legacy `/api/v1/*` paths are kept as aliases and
     behave identically. Pointing a client at `https://cocore.dev`
     alone (no version segment) hits the console web app and returns HTML, not
@@ -23,7 +24,7 @@ servers:
     description: Production
 tags:
   - name: Inference
-    description: OpenAI-compatible chat completions.
+    description: OpenAI-compatible chat completions and image generation.
   - name: Directory
     description: Public, unauthenticated discovery of what's being served.
   - name: Agent
@@ -179,6 +180,101 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
+  /v1/images/generations:
+    post:
+      tags: [Inference]
+      operationId: createImage
+      summary: Create an image (text-to-image)
+      description: >
+        OpenAI-compatible text-to-image, routed to a connected provider that
+        serves the requested image model. cocore returns inline base64 only:
+        `response_format` must be `b64_json` (the default) — `url` is rejected
+        with a 400 rather than returning a fake URL. `n` (1–4) requests multiple
+        images; each is an independent job + provider-signed receipt, and the
+        provider/machine that served each one is named in `x_cocore`.
+
+
+        Also available at the legacy path `/api/v1/images/generations`. The
+        friends-only and verified-tier variants live at
+        `/v1/private/images/generations` and `/v1/verified/images/generations`
+        (same request shape; the verified variant also accepts `min_trust`).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageGenerationRequest"
+      responses:
+        "200":
+          description: >
+            The generated image(s). Partial success (some of `n` slots failed)
+            still returns 200 with fewer images and `x_cocore.partial: true`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImagesResponse" }
+        "400":
+          description: >
+            Invalid request — e.g. `response_format: "url"`, a non-image model
+            (`model_not_supported_for_images`), or an out-of-range `n`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: No connected provider serves the requested model (`model_not_found`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "503":
+          description: No providers connected, or capacity churn (`model_unavailable`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/images/edits:
+    post:
+      tags: [Inference]
+      operationId: createImageEdit
+      summary: Edit an image (img2img)
+      description: >
+        OpenAI-compatible image edit. `multipart/form-data` with `model`,
+        `prompt`, `image` (the reference), and optional `n`. The reference image
+        is sealed alongside the prompt into a `messages-v1` envelope so the
+        commitment covers exactly what the provider sees. Returns inline base64
+        only, same shape as `/v1/images/generations`. Friends-only and verified
+        variants live at `/v1/private/images/edits` and
+        `/v1/verified/images/edits`; legacy alias `/api/v1/images/edits`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ImageEditRequest"
+      responses:
+        "200":
+          description: The edited image(s).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImagesResponse" }
+        "400":
+          description: Invalid request (bad/missing image, non-image model, bad `n`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /v1/models:
     get:
       tags: [Directory]
@@ -310,6 +406,79 @@ components:
         top_p:
           type: number
           description: Accepted for OpenAI compatibility; honoring is provider-dependent.
+
+    ImageGenerationRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model:
+          type: string
+          description: An image model id returned by `/v1/models` (e.g. `stub-flux`, a FLUX id).
+          example: stub-flux
+        prompt:
+          type: string
+          example: a watercolor fox in a misty forest
+        n:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 1
+          description: Number of images. Each is an independent job + receipt.
+        response_format:
+          type: string
+          enum: [b64_json]
+          default: b64_json
+          description: >
+            Only `b64_json` is supported — cocore returns inline base64.
+            `url` is rejected with a 400.
+        size:
+          type: string
+          description: Accepted for OpenAI compatibility; not yet plumbed to the engine.
+        user:
+          type: string
+          description: Accepted and ignored (OpenAI compatibility).
+
+    ImageEditRequest:
+      type: object
+      required: [model, prompt, image]
+      properties:
+        model: { type: string, example: stub-flux }
+        prompt: { type: string, example: make it a watercolor }
+        image:
+          type: string
+          format: binary
+          description: The reference image to edit (also accepts a base64 data URI).
+        n: { type: integer, minimum: 1, maximum: 4, default: 1 }
+        response_format: { type: string, enum: [b64_json], default: b64_json }
+
+    ImagesResponse:
+      type: object
+      properties:
+        created: { type: integer, example: 1717000000 }
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              b64_json:
+                type: string
+                description: Base64 of the raw image bytes (PNG).
+              revised_prompt: { type: string, nullable: true }
+        x_cocore:
+          type: object
+          description: >
+            Non-standard provenance block (OpenAI clients ignore unknown
+            top-level fields). One receipt + credit per image slot.
+          properties:
+            receiptUris:
+              type: array
+              items: { type: string, example: "at://did:plc:…/dev.cocore.compute.receipt/…" }
+            credits:
+              type: array
+              items: { type: string }
+            partial:
+              type: boolean
+              description: Present and true when fewer than `n` images succeeded.
 
     ChatCompletion:
       type: object

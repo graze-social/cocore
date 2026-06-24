@@ -47,6 +47,8 @@ import { Route as DotwellKnownDidDotjsonRouteImport } from './routes/[.]well-kno
 import { Route as HeaderLayoutMachinesIndexRouteImport } from './routes/_header-layout.machines.index'
 import { Route as HeaderLayoutBlogIndexRouteImport } from './routes/_header-layout.blog.index'
 import { Route as DocsHeaderLayoutDocsIndexRouteImport } from './routes/_docs-header-layout.docs.index'
+import { Route as V1ImagesGenerationsRouteImport } from './routes/v1.images.generations'
+import { Route as V1ImagesEditsRouteImport } from './routes/v1.images.edits'
 import { Route as V1ChatCompletionsRouteImport } from './routes/v1.chat.completions'
 import { Route as ApiXrpcDevDotcocoreDotproxyDotputRecordRouteImport } from './routes/api/xrpc/dev[.]cocore[.]proxy[.]putRecord'
 import { Route as ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRouteImport } from './routes/api/xrpc/dev[.]cocore[.]proxy[.]deleteRecord'
@@ -81,8 +83,14 @@ import { Route as DocsHeaderLayoutDocsInferenceRouteImport } from './routes/_doc
 import { Route as DocsHeaderLayoutDocsCommunityToolsRouteImport } from './routes/_docs-header-layout.docs.community-tools'
 import { Route as DocsHeaderLayoutDocsApiRouteImport } from './routes/_docs-header-layout.docs.api'
 import { Route as DocsHeaderLayoutDocsInferenceIndexRouteImport } from './routes/_docs-header-layout.docs.inference.index'
+import { Route as V1VerifiedImagesGenerationsRouteImport } from './routes/v1.verified.images.generations'
+import { Route as V1VerifiedImagesEditsRouteImport } from './routes/v1.verified.images.edits'
 import { Route as V1VerifiedChatCompletionsRouteImport } from './routes/v1.verified.chat.completions'
+import { Route as V1PrivateImagesGenerationsRouteImport } from './routes/v1.private.images.generations'
+import { Route as V1PrivateImagesEditsRouteImport } from './routes/v1.private.images.edits'
 import { Route as V1PrivateChatCompletionsRouteImport } from './routes/v1.private.chat.completions'
+import { Route as ApiV1ImagesGenerationsRouteImport } from './routes/api.v1.images.generations'
+import { Route as ApiV1ImagesEditsRouteImport } from './routes/api.v1.images.edits'
 import { Route as ApiV1ChatCompletionsRouteImport } from './routes/api.v1.chat.completions'
 import { Route as ApiInternalDisputesResolveRouteImport } from './routes/api/internal/disputes.resolve'
 import { Route as ApiAuthAtprotoSignupRouteImport } from './routes/api.auth.atproto.signup'
@@ -294,6 +302,16 @@ const DocsHeaderLayoutDocsIndexRoute =
     path: '/docs/',
     getParentRoute: () => DocsHeaderLayoutRoute,
   } as any)
+const V1ImagesGenerationsRoute = V1ImagesGenerationsRouteImport.update({
+  id: '/v1/images/generations',
+  path: '/v1/images/generations',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const V1ImagesEditsRoute = V1ImagesEditsRouteImport.update({
+  id: '/v1/images/edits',
+  path: '/v1/images/edits',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1ChatCompletionsRoute = V1ChatCompletionsRouteImport.update({
   id: '/v1/chat/completions',
   path: '/v1/chat/completions',
@@ -484,18 +502,50 @@ const DocsHeaderLayoutDocsInferenceIndexRoute =
     path: '/',
     getParentRoute: () => DocsHeaderLayoutDocsInferenceRoute,
   } as any)
+const V1VerifiedImagesGenerationsRoute =
+  V1VerifiedImagesGenerationsRouteImport.update({
+    id: '/v1/verified/images/generations',
+    path: '/v1/verified/images/generations',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const V1VerifiedImagesEditsRoute = V1VerifiedImagesEditsRouteImport.update({
+  id: '/v1/verified/images/edits',
+  path: '/v1/verified/images/edits',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1VerifiedChatCompletionsRoute =
   V1VerifiedChatCompletionsRouteImport.update({
     id: '/v1/verified/chat/completions',
     path: '/v1/verified/chat/completions',
     getParentRoute: () => rootRouteImport,
   } as any)
+const V1PrivateImagesGenerationsRoute =
+  V1PrivateImagesGenerationsRouteImport.update({
+    id: '/v1/private/images/generations',
+    path: '/v1/private/images/generations',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const V1PrivateImagesEditsRoute = V1PrivateImagesEditsRouteImport.update({
+  id: '/v1/private/images/edits',
+  path: '/v1/private/images/edits',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1PrivateChatCompletionsRoute =
   V1PrivateChatCompletionsRouteImport.update({
     id: '/v1/private/chat/completions',
     path: '/v1/private/chat/completions',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiV1ImagesGenerationsRoute = ApiV1ImagesGenerationsRouteImport.update({
+  id: '/api/v1/images/generations',
+  path: '/api/v1/images/generations',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiV1ImagesEditsRoute = ApiV1ImagesEditsRouteImport.update({
+  id: '/api/v1/images/edits',
+  path: '/api/v1/images/edits',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiV1ChatCompletionsRoute = ApiV1ChatCompletionsRouteImport.update({
   id: '/api/v1/chat/completions',
   path: '/api/v1/chat/completions',
@@ -656,6 +706,8 @@ export interface FileRoutesByFullPath {
   '/api/xrpc/dev.cocore.proxy.deleteRecord': typeof ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRoute
   '/api/xrpc/dev.cocore.proxy.putRecord': typeof ApiXrpcDevDotcocoreDotproxyDotputRecordRoute
   '/v1/chat/completions': typeof V1ChatCompletionsRoute
+  '/v1/images/edits': typeof V1ImagesEditsRoute
+  '/v1/images/generations': typeof V1ImagesGenerationsRoute
   '/docs/': typeof DocsHeaderLayoutDocsIndexRoute
   '/blog/': typeof HeaderLayoutBlogIndexRoute
   '/machines/': typeof HeaderLayoutMachinesIndexRoute
@@ -673,8 +725,14 @@ export interface FileRoutesByFullPath {
   '/api/auth/atproto/signup': typeof ApiAuthAtprotoSignupRoute
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
+  '/api/v1/images/edits': typeof ApiV1ImagesEditsRoute
+  '/api/v1/images/generations': typeof ApiV1ImagesGenerationsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/private/images/edits': typeof V1PrivateImagesEditsRoute
+  '/v1/private/images/generations': typeof V1PrivateImagesGenerationsRoute
   '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
+  '/v1/verified/images/edits': typeof V1VerifiedImagesEditsRoute
+  '/v1/verified/images/generations': typeof V1VerifiedImagesGenerationsRoute
   '/docs/inference/': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
   '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
@@ -745,6 +803,8 @@ export interface FileRoutesByTo {
   '/api/xrpc/dev.cocore.proxy.deleteRecord': typeof ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRoute
   '/api/xrpc/dev.cocore.proxy.putRecord': typeof ApiXrpcDevDotcocoreDotproxyDotputRecordRoute
   '/v1/chat/completions': typeof V1ChatCompletionsRoute
+  '/v1/images/edits': typeof V1ImagesEditsRoute
+  '/v1/images/generations': typeof V1ImagesGenerationsRoute
   '/docs': typeof DocsHeaderLayoutDocsIndexRoute
   '/blog': typeof HeaderLayoutBlogIndexRoute
   '/machines': typeof HeaderLayoutMachinesIndexRoute
@@ -762,8 +822,14 @@ export interface FileRoutesByTo {
   '/api/auth/atproto/signup': typeof ApiAuthAtprotoSignupRoute
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
+  '/api/v1/images/edits': typeof ApiV1ImagesEditsRoute
+  '/api/v1/images/generations': typeof ApiV1ImagesGenerationsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/private/images/edits': typeof V1PrivateImagesEditsRoute
+  '/v1/private/images/generations': typeof V1PrivateImagesGenerationsRoute
   '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
+  '/v1/verified/images/edits': typeof V1VerifiedImagesEditsRoute
+  '/v1/verified/images/generations': typeof V1VerifiedImagesGenerationsRoute
   '/docs/inference': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
   '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
@@ -838,6 +904,8 @@ export interface FileRoutesById {
   '/api/xrpc/dev.cocore.proxy.deleteRecord': typeof ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRoute
   '/api/xrpc/dev.cocore.proxy.putRecord': typeof ApiXrpcDevDotcocoreDotproxyDotputRecordRoute
   '/v1/chat/completions': typeof V1ChatCompletionsRoute
+  '/v1/images/edits': typeof V1ImagesEditsRoute
+  '/v1/images/generations': typeof V1ImagesGenerationsRoute
   '/_docs-header-layout/docs/': typeof DocsHeaderLayoutDocsIndexRoute
   '/_header-layout/blog/': typeof HeaderLayoutBlogIndexRoute
   '/_header-layout/machines/': typeof HeaderLayoutMachinesIndexRoute
@@ -855,8 +923,14 @@ export interface FileRoutesById {
   '/api/auth/atproto/signup': typeof ApiAuthAtprotoSignupRoute
   '/api/internal/disputes/resolve': typeof ApiInternalDisputesResolveRoute
   '/api/v1/chat/completions': typeof ApiV1ChatCompletionsRoute
+  '/api/v1/images/edits': typeof ApiV1ImagesEditsRoute
+  '/api/v1/images/generations': typeof ApiV1ImagesGenerationsRoute
   '/v1/private/chat/completions': typeof V1PrivateChatCompletionsRoute
+  '/v1/private/images/edits': typeof V1PrivateImagesEditsRoute
+  '/v1/private/images/generations': typeof V1PrivateImagesGenerationsRoute
   '/v1/verified/chat/completions': typeof V1VerifiedChatCompletionsRoute
+  '/v1/verified/images/edits': typeof V1VerifiedImagesEditsRoute
+  '/v1/verified/images/generations': typeof V1VerifiedImagesGenerationsRoute
   '/_docs-header-layout/docs/inference/': typeof DocsHeaderLayoutDocsInferenceIndexRoute
   '/api/v1/private/chat/completions': typeof ApiV1PrivateChatCompletionsRoute
   '/api/v1/verified/chat/completions': typeof ApiV1VerifiedChatCompletionsRoute
@@ -930,6 +1004,8 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.proxy.deleteRecord'
     | '/api/xrpc/dev.cocore.proxy.putRecord'
     | '/v1/chat/completions'
+    | '/v1/images/edits'
+    | '/v1/images/generations'
     | '/docs/'
     | '/blog/'
     | '/machines/'
@@ -947,8 +1023,14 @@ export interface FileRouteTypes {
     | '/api/auth/atproto/signup'
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
+    | '/api/v1/images/edits'
+    | '/api/v1/images/generations'
     | '/v1/private/chat/completions'
+    | '/v1/private/images/edits'
+    | '/v1/private/images/generations'
     | '/v1/verified/chat/completions'
+    | '/v1/verified/images/edits'
+    | '/v1/verified/images/generations'
     | '/docs/inference/'
     | '/api/v1/private/chat/completions'
     | '/api/v1/verified/chat/completions'
@@ -1019,6 +1101,8 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.proxy.deleteRecord'
     | '/api/xrpc/dev.cocore.proxy.putRecord'
     | '/v1/chat/completions'
+    | '/v1/images/edits'
+    | '/v1/images/generations'
     | '/docs'
     | '/blog'
     | '/machines'
@@ -1036,8 +1120,14 @@ export interface FileRouteTypes {
     | '/api/auth/atproto/signup'
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
+    | '/api/v1/images/edits'
+    | '/api/v1/images/generations'
     | '/v1/private/chat/completions'
+    | '/v1/private/images/edits'
+    | '/v1/private/images/generations'
     | '/v1/verified/chat/completions'
+    | '/v1/verified/images/edits'
+    | '/v1/verified/images/generations'
     | '/docs/inference'
     | '/api/v1/private/chat/completions'
     | '/api/v1/verified/chat/completions'
@@ -1111,6 +1201,8 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.proxy.deleteRecord'
     | '/api/xrpc/dev.cocore.proxy.putRecord'
     | '/v1/chat/completions'
+    | '/v1/images/edits'
+    | '/v1/images/generations'
     | '/_docs-header-layout/docs/'
     | '/_header-layout/blog/'
     | '/_header-layout/machines/'
@@ -1128,8 +1220,14 @@ export interface FileRouteTypes {
     | '/api/auth/atproto/signup'
     | '/api/internal/disputes/resolve'
     | '/api/v1/chat/completions'
+    | '/api/v1/images/edits'
+    | '/api/v1/images/generations'
     | '/v1/private/chat/completions'
+    | '/v1/private/images/edits'
+    | '/v1/private/images/generations'
     | '/v1/verified/chat/completions'
+    | '/v1/verified/images/edits'
+    | '/v1/verified/images/generations'
     | '/_docs-header-layout/docs/inference/'
     | '/api/v1/private/chat/completions'
     | '/api/v1/verified/chat/completions'
@@ -1174,6 +1272,8 @@ export interface RootRouteChildren {
   ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRoute: typeof ApiXrpcDevDotcocoreDotproxyDotdeleteRecordRoute
   ApiXrpcDevDotcocoreDotproxyDotputRecordRoute: typeof ApiXrpcDevDotcocoreDotproxyDotputRecordRoute
   V1ChatCompletionsRoute: typeof V1ChatCompletionsRoute
+  V1ImagesEditsRoute: typeof V1ImagesEditsRoute
+  V1ImagesGenerationsRoute: typeof V1ImagesGenerationsRoute
   ApiAgentMdmAttestationChainRoute: typeof ApiAgentMdmAttestationChainRoute
   ApiAgentMdmEnrollProfileRoute: typeof ApiAgentMdmEnrollProfileRoute
   ApiAgentMdmNanomdmWebhookRoute: typeof ApiAgentMdmNanomdmWebhookRoute
@@ -1186,8 +1286,14 @@ export interface RootRouteChildren {
   ApiAuthAtprotoSignupRoute: typeof ApiAuthAtprotoSignupRoute
   ApiInternalDisputesResolveRoute: typeof ApiInternalDisputesResolveRoute
   ApiV1ChatCompletionsRoute: typeof ApiV1ChatCompletionsRoute
+  ApiV1ImagesEditsRoute: typeof ApiV1ImagesEditsRoute
+  ApiV1ImagesGenerationsRoute: typeof ApiV1ImagesGenerationsRoute
   V1PrivateChatCompletionsRoute: typeof V1PrivateChatCompletionsRoute
+  V1PrivateImagesEditsRoute: typeof V1PrivateImagesEditsRoute
+  V1PrivateImagesGenerationsRoute: typeof V1PrivateImagesGenerationsRoute
   V1VerifiedChatCompletionsRoute: typeof V1VerifiedChatCompletionsRoute
+  V1VerifiedImagesEditsRoute: typeof V1VerifiedImagesEditsRoute
+  V1VerifiedImagesGenerationsRoute: typeof V1VerifiedImagesGenerationsRoute
   ApiV1PrivateChatCompletionsRoute: typeof ApiV1PrivateChatCompletionsRoute
   ApiV1VerifiedChatCompletionsRoute: typeof ApiV1VerifiedChatCompletionsRoute
 }
@@ -1460,6 +1566,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DocsHeaderLayoutDocsIndexRouteImport
       parentRoute: typeof DocsHeaderLayoutRoute
     }
+    '/v1/images/generations': {
+      id: '/v1/images/generations'
+      path: '/v1/images/generations'
+      fullPath: '/v1/images/generations'
+      preLoaderRoute: typeof V1ImagesGenerationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/images/edits': {
+      id: '/v1/images/edits'
+      path: '/v1/images/edits'
+      fullPath: '/v1/images/edits'
+      preLoaderRoute: typeof V1ImagesEditsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/chat/completions': {
       id: '/v1/chat/completions'
       path: '/v1/chat/completions'
@@ -1698,6 +1818,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DocsHeaderLayoutDocsInferenceIndexRouteImport
       parentRoute: typeof DocsHeaderLayoutDocsInferenceRoute
     }
+    '/v1/verified/images/generations': {
+      id: '/v1/verified/images/generations'
+      path: '/v1/verified/images/generations'
+      fullPath: '/v1/verified/images/generations'
+      preLoaderRoute: typeof V1VerifiedImagesGenerationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/verified/images/edits': {
+      id: '/v1/verified/images/edits'
+      path: '/v1/verified/images/edits'
+      fullPath: '/v1/verified/images/edits'
+      preLoaderRoute: typeof V1VerifiedImagesEditsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/verified/chat/completions': {
       id: '/v1/verified/chat/completions'
       path: '/v1/verified/chat/completions'
@@ -1705,11 +1839,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof V1VerifiedChatCompletionsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/v1/private/images/generations': {
+      id: '/v1/private/images/generations'
+      path: '/v1/private/images/generations'
+      fullPath: '/v1/private/images/generations'
+      preLoaderRoute: typeof V1PrivateImagesGenerationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/private/images/edits': {
+      id: '/v1/private/images/edits'
+      path: '/v1/private/images/edits'
+      fullPath: '/v1/private/images/edits'
+      preLoaderRoute: typeof V1PrivateImagesEditsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/v1/private/chat/completions': {
       id: '/v1/private/chat/completions'
       path: '/v1/private/chat/completions'
       fullPath: '/v1/private/chat/completions'
       preLoaderRoute: typeof V1PrivateChatCompletionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/images/generations': {
+      id: '/api/v1/images/generations'
+      path: '/api/v1/images/generations'
+      fullPath: '/api/v1/images/generations'
+      preLoaderRoute: typeof ApiV1ImagesGenerationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/images/edits': {
+      id: '/api/v1/images/edits'
+      path: '/api/v1/images/edits'
+      fullPath: '/api/v1/images/edits'
+      preLoaderRoute: typeof ApiV1ImagesEditsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/v1/chat/completions': {
@@ -1998,6 +2160,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiXrpcDevDotcocoreDotproxyDotputRecordRoute:
     ApiXrpcDevDotcocoreDotproxyDotputRecordRoute,
   V1ChatCompletionsRoute: V1ChatCompletionsRoute,
+  V1ImagesEditsRoute: V1ImagesEditsRoute,
+  V1ImagesGenerationsRoute: V1ImagesGenerationsRoute,
   ApiAgentMdmAttestationChainRoute: ApiAgentMdmAttestationChainRoute,
   ApiAgentMdmEnrollProfileRoute: ApiAgentMdmEnrollProfileRoute,
   ApiAgentMdmNanomdmWebhookRoute: ApiAgentMdmNanomdmWebhookRoute,
@@ -2010,8 +2174,14 @@ const rootRouteChildren: RootRouteChildren = {
   ApiAuthAtprotoSignupRoute: ApiAuthAtprotoSignupRoute,
   ApiInternalDisputesResolveRoute: ApiInternalDisputesResolveRoute,
   ApiV1ChatCompletionsRoute: ApiV1ChatCompletionsRoute,
+  ApiV1ImagesEditsRoute: ApiV1ImagesEditsRoute,
+  ApiV1ImagesGenerationsRoute: ApiV1ImagesGenerationsRoute,
   V1PrivateChatCompletionsRoute: V1PrivateChatCompletionsRoute,
+  V1PrivateImagesEditsRoute: V1PrivateImagesEditsRoute,
+  V1PrivateImagesGenerationsRoute: V1PrivateImagesGenerationsRoute,
   V1VerifiedChatCompletionsRoute: V1VerifiedChatCompletionsRoute,
+  V1VerifiedImagesEditsRoute: V1VerifiedImagesEditsRoute,
+  V1VerifiedImagesGenerationsRoute: V1VerifiedImagesGenerationsRoute,
   ApiV1PrivateChatCompletionsRoute: ApiV1PrivateChatCompletionsRoute,
   ApiV1VerifiedChatCompletionsRoute: ApiV1VerifiedChatCompletionsRoute,
 }

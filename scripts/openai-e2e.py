@@ -8,12 +8,16 @@ Usage:
 Defaults the base URL to https://console.cocore.dev/api/v1; override
 with COCORE_BASE_URL for a local console (e.g. http://localhost:3000/api/v1).
 
-The script runs both code paths:
+The script runs both chat code paths:
   1. Streaming — prints chunks as they arrive
   2. Non-streaming — buffered JSON, prints content + token usage
 
+and the image-generation path:
+  3. images.generate — text-to-image, writes the returned PNG to disk
+
 Requires at least one attested provider on the configured advisor; the
-provider's stub is non-deterministic but produces a short reply.
+provider's stub is non-deterministic but produces a short reply, and
+`stub-flux` emits a fixed 1x1 PNG (no GPU needed).
 """
 
 from __future__ import annotations
@@ -67,6 +71,31 @@ def main() -> int:
             f"(usage: {resp.usage.prompt_tokens} prompt / "
             f"{resp.usage.completion_tokens} completion)"
         )
+    print()
+
+    # Image generation. cocore returns inline base64 (b64_json) only — point
+    # COCORE_IMAGE_MODEL at `stub-flux` for a no-GPU smoke test, or a real
+    # FLUX id on a capable Mac.
+    image_model = os.environ.get("COCORE_IMAGE_MODEL", "stub-flux")
+    print(f"--- images.generate ({image_model}) ---")
+    import base64
+
+    img = client.images.generate(
+        model=image_model,
+        prompt="a watercolor fox in a misty forest",
+        n=1,
+        response_format="b64_json",
+    )
+    b64 = img.data[0].b64_json
+    out_path = os.environ.get("COCORE_IMAGE_OUT", "cocore-image.png")
+    with open(out_path, "wb") as fh:
+        fh.write(base64.b64decode(b64))
+    print(f"wrote {out_path} ({len(b64)} b64 chars)")
+    # The non-standard x_cocore block names who served it (OpenAI SDK exposes
+    # unknown fields via model_extra).
+    extra = getattr(img, "model_extra", None) or {}
+    if extra.get("x_cocore"):
+        print(f"x_cocore: {extra['x_cocore']}")
     return 0
 
 
