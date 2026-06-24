@@ -1019,7 +1019,14 @@ async fn handle_inference_request_inner(
     {
         Ok(pt) => Zeroizing::new(pt),
         Err(e) => {
-            tracing::warn!(error = %e, session_id = %session_id, "failed to open inference ciphertext");
+            tracing::warn!(
+                error = %e,
+                session_id = %session_id,
+                our_pub_key = %ctx.encryption.public_key_b64(),
+                requester_pub_key = %req.requester_pub_key,
+                ciphertext_len = req.ciphertext.len(),
+                "failed to open inference ciphertext"
+            );
             return Vec::new();
         }
     };
@@ -1096,11 +1103,15 @@ async fn handle_inference_request_inner(
             String::from_utf8_lossy(&plaintext).to_string(),
         )],
     };
+    // Deterministic mode: temperature=0 + fixed seed makes output reproducible
+    // so third-party verifiers can re-run and compare the output commitment.
+    // Off by default; opt in with COCORE_DETERMINISTIC=1.
+    let (det_temperature, det_seed) = crate::determinism::params();
     let request = crate::engines::GenerateRequest {
         model: req.model.clone(),
         messages,
         max_tokens: req.max_tokens_out,
-        temperature: None,
+        temperature: det_temperature,
         top_p: None,
         guided_json: req.output_schema.clone(),
         tools: req.tools.clone(),
@@ -1116,6 +1127,7 @@ async fn handle_inference_request_inner(
             // Otherwise pass through tool_choice as-is.
             _ => req.tool_choice.clone(),
         },
+        seed: det_seed,
     };
 
     // Look up the engine for the requested model. A miss means the
@@ -1341,10 +1353,13 @@ async fn handle_inference_request_inner(
             .map(|bytes| sha256_hex(&bytes))
     });
 
+    // Commit the actual params used to the receipt so verifiers can reproduce
+    // the call. temperatureMilli uses integer milliunits (canonical JSON
+    // forbids floats); temperature=0.0 → temperatureMilli=0.
     let params = receipt::GenerationParams {
         maxTokens: Some(req.max_tokens_out as u64),
-        seed: None,
-        temperatureMilli: None,
+        seed: det_seed,
+        temperatureMilli: det_temperature.map(|t| (t * 1000.0) as u64),
         topPMilli: None,
         outputSchemaHash: output_schema_hash,
         toolSchemaHash: tool_schema_hash,
