@@ -1544,7 +1544,7 @@ struct ModelsView: View {
         // (verified-confidential only when confidential mode is on). A build
         // with no native worker can't run them at all → disable Add.
         let nativeOnly = ModelManager.isNativeOnlyImage(item.nsid)
-        let hasNativeEngine = AgentSupervisor.hasConfidentialWorker()
+        let hasNativeEngine = AgentSupervisor.hasNativeImageEngine()
         let blockedNative = nativeOnly && !hasNativeEngine
         HStack {
             VStack(alignment: .leading, spacing: 2) {
