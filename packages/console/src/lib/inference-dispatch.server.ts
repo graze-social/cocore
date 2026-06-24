@@ -190,10 +190,24 @@ export type DispatchEvent =
     }
   | { kind: "chunk"; seq: number; channel: "content" | "reasoning"; text: string }
   | {
+      /** A generated-image chunk. The provider sealed a canonical JSON part
+       *  `{ type:"image", mime, data }`; we decode it here so the client
+       *  gets the image bytes directly rather than as opaque text. */
+      kind: "chunk";
+      seq: number;
+      channel: "image";
+      mime: string;
+      data: string;
+    }
+  | {
       kind: "complete";
       tokensIn: number;
       tokensOut: number;
       receiptUri: string;
+      /** Output shape the provider produced. `images-v1` tells the client
+       *  the answer arrived on the image channel, not as text. Absent =
+       *  text (legacy). */
+      outputFormat?: "text" | "images-v1";
       /** Who ran it — surfaced to API clients as a non-standard
        *  `x_cocore` field. Absent when resolution failed. */
       providerCredit?: ProviderCredit;
@@ -702,13 +716,16 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
   };
 
   // 5. Stream the advisor's SSE and decrypt chunks.
+  // Track whether any image chunk arrived so `complete` can report the
+  // output shape — the advisor's complete frame doesn't carry it.
+  let sawImage = false;
   try {
     for await (const ev of readSse(advisorBody)) {
       if (ev.event === "open") continue;
       if (ev.event === "chunk") {
         let parsed: {
           seq: number;
-          channel?: "content" | "reasoning";
+          channel?: "content" | "reasoning" | "image";
           ciphertext: number[] | string;
         };
         try {
@@ -729,11 +746,34 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
           };
           continue;
         }
+        const plaintext = new TextDecoder().decode(opened);
+        if (parsed.channel === "image") {
+          // The image chunk's plaintext is a canonical JSON part
+          // { type:"image", mime, data }. Decode it to hand the client the
+          // image bytes; a malformed part is dropped rather than surfaced
+          // as garbled text.
+          let part: { mime?: unknown; data?: unknown };
+          try {
+            part = JSON.parse(plaintext);
+          } catch {
+            continue;
+          }
+          if (typeof part.mime !== "string" || typeof part.data !== "string") continue;
+          sawImage = true;
+          yield {
+            kind: "chunk",
+            seq: parsed.seq,
+            channel: "image",
+            mime: part.mime,
+            data: part.data,
+          };
+          continue;
+        }
         yield {
           kind: "chunk",
           seq: parsed.seq,
           channel: parsed.channel ?? "content",
-          text: new TextDecoder().decode(opened),
+          text: plaintext,
         };
         continue;
       }
@@ -749,6 +789,7 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
           tokensIn: parsed.tokensIn,
           tokensOut: parsed.tokensOut,
           receiptUri: parsed.receiptUri,
+          ...(sawImage ? { outputFormat: "images-v1" as const } : {}),
           providerCredit: await creditPromise,
         };
         return;

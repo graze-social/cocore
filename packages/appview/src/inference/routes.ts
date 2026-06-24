@@ -252,12 +252,13 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
               );
             }
             if (ev.kind === "chunk") {
-              return encoder.encode(
-                sseFrame(
-                  "chunk",
-                  JSON.stringify({ seq: ev.seq, channel: ev.channel, text: ev.text }),
-                ),
-              );
+              // Image chunks carry { mime, data } instead of text; relay the
+              // shape verbatim so the client can render the generated image.
+              const payload =
+                ev.channel === "image"
+                  ? { seq: ev.seq, channel: ev.channel, mime: ev.mime, data: ev.data }
+                  : { seq: ev.seq, channel: ev.channel, text: ev.text };
+              return encoder.encode(sseFrame("chunk", JSON.stringify(payload)));
             }
             if (ev.kind === "complete") {
               return encoder.encode(
@@ -267,6 +268,7 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
                     tokensIn: ev.tokensIn,
                     tokensOut: ev.tokensOut,
                     receiptUri: ev.receiptUri,
+                    ...(ev.outputFormat ? { outputFormat: ev.outputFormat } : {}),
                     ...(ev.providerCredit ? { providerCredit: ev.providerCredit } : {}),
                   }),
                 ),

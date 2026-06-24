@@ -166,12 +166,13 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
                     ),
                   );
                 } else if (ev.kind === "chunk") {
-                  controller.enqueue(
-                    sseFrame(
-                      "chunk",
-                      JSON.stringify({ seq: ev.seq, channel: ev.channel, text: ev.text }),
-                    ),
-                  );
+                  // Image chunks carry { mime, data }; text/reasoning carry
+                  // { text }. Relay the shape verbatim.
+                  const payload =
+                    ev.channel === "image"
+                      ? { seq: ev.seq, channel: ev.channel, mime: ev.mime, data: ev.data }
+                      : { seq: ev.seq, channel: ev.channel, text: ev.text };
+                  controller.enqueue(sseFrame("chunk", JSON.stringify(payload)));
                 } else if (ev.kind === "complete") {
                   controller.enqueue(
                     sseFrame(
@@ -180,6 +181,7 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
                         tokensIn: ev.tokensIn,
                         tokensOut: ev.tokensOut,
                         receiptUri: ev.receiptUri,
+                        ...(ev.outputFormat ? { outputFormat: ev.outputFormat } : {}),
                         ...(ev.providerCredit ? { providerCredit: ev.providerCredit } : {}),
                       }),
                     ),

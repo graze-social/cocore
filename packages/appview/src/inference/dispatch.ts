@@ -161,10 +161,22 @@ export type DispatchEvent =
     }
   | { kind: "chunk"; seq: number; channel: "content" | "reasoning"; text: string }
   | {
+      /** A generated-image chunk. The provider sealed a canonical JSON part
+       *  `{ type:"image", mime, data }`; decoded here to image bytes. */
+      kind: "chunk";
+      seq: number;
+      channel: "image";
+      mime: string;
+      data: string;
+    }
+  | {
       kind: "complete";
       tokensIn: number;
       tokensOut: number;
       receiptUri: string;
+      /** Output shape the provider produced. `images-v1` = image channel,
+       *  not text. Absent = text (legacy). */
+      outputFormat?: "text" | "images-v1";
       providerCredit?: ProviderCredit;
     }
   | { kind: "error"; reason: string; code: DispatchErrorCode };
@@ -561,13 +573,16 @@ export async function* runDispatch(
   };
 
   // 5. Stream the advisor's SSE and decrypt chunks.
+  // Track image chunks so `complete` can report the output shape — the
+  // advisor's complete frame doesn't carry it.
+  let sawImage = false;
   try {
     for await (const ev of readSse(advisorBody)) {
       if (ev.event === "open") continue;
       if (ev.event === "chunk") {
         let parsed: {
           seq: number;
-          channel?: "content" | "reasoning";
+          channel?: "content" | "reasoning" | "image";
           ciphertext: number[] | string;
         };
         try {
@@ -584,11 +599,33 @@ export async function* runDispatch(
           yield { kind: "error", reason: "chunk decrypt failed", code: "chunk-decrypt-failed" };
           continue;
         }
+        const plaintext = new TextDecoder().decode(opened);
+        if (parsed.channel === "image") {
+          // Image chunk plaintext is a canonical JSON part
+          // { type:"image", mime, data }; decode to image bytes. A
+          // malformed part is dropped rather than surfaced as text.
+          let part: { mime?: unknown; data?: unknown };
+          try {
+            part = JSON.parse(plaintext);
+          } catch {
+            continue;
+          }
+          if (typeof part.mime !== "string" || typeof part.data !== "string") continue;
+          sawImage = true;
+          yield {
+            kind: "chunk",
+            seq: parsed.seq,
+            channel: "image",
+            mime: part.mime,
+            data: part.data,
+          };
+          continue;
+        }
         yield {
           kind: "chunk",
           seq: parsed.seq,
           channel: parsed.channel ?? "content",
-          text: new TextDecoder().decode(opened),
+          text: plaintext,
         };
         continue;
       }
@@ -604,6 +641,7 @@ export async function* runDispatch(
           tokensIn: parsed.tokensIn,
           tokensOut: parsed.tokensOut,
           receiptUri: parsed.receiptUri,
+          ...(sawImage ? { outputFormat: "images-v1" as const } : {}),
           providerCredit: await creditPromise,
         };
         return;

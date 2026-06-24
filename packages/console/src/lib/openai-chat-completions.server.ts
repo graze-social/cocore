@@ -448,6 +448,10 @@ export function streamingResponse(
       try {
         for await (const ev of events) {
           if (ev.kind === "chunk") {
+            // Image chunks never appear on chat-completions (it serves text
+            // models only); ignore defensively so a misrouted image doesn't
+            // emit a malformed delta.
+            if (ev.channel === "image") continue;
             // Reasoning ("thinking") rides delta.reasoning_content, the
             // vLLM/DeepSeek convention; the answer rides delta.content.
             const delta =
@@ -520,6 +524,7 @@ export async function bufferedResponse(
 
   for await (const ev of events) {
     if (ev.kind === "chunk") {
+      if (ev.channel === "image") continue; // text-only endpoint
       if (ev.channel === "reasoning") reasoning += ev.text;
       else content += ev.text;
     } else if (ev.kind === "complete") {
