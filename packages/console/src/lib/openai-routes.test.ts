@@ -114,7 +114,9 @@ describe("handleImagesGenerations", () => {
         outputFormat: "images-v1",
       },
     ];
-    const res = await handleImagesGenerations(imageRequest({ model: "stub-flux", prompt: "a fox" }));
+    const res = await handleImagesGenerations(
+      imageRequest({ model: "stub-flux", prompt: "a fox" }),
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: { b64_json: string }[] };
     expect(body.data[0]?.b64_json).toBe("AAAA");

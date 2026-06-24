@@ -31,7 +31,7 @@ export const DEFAULT_IMAGE_STEPS = 4;
 
 /** OpenAI caps `n` at 10 for images; cocore caps at 4 to bound fan-out
  *  spend (one job + receipt per image — see Phase 11). */
-export const MAX_IMAGE_N = 4;
+const MAX_IMAGE_N = 4;
 
 const MAX_PROMPT_BYTES = 64 * 1024; // image prompts are short
 const MAX_EDIT_IMAGE_BYTES = 20 * 1024 * 1024; // matches the chat image budget
@@ -119,7 +119,9 @@ function parseN(value: unknown): number | string {
 
 /** Normalize an uploaded edit image (a File/Blob or a data: URI string)
  *  into an inline `{ mime, data }` part. */
-async function normalizeUploadedImage(image: unknown): Promise<{ mime: string; data: string } | string> {
+async function normalizeUploadedImage(
+  image: unknown,
+): Promise<{ mime: string; data: string } | string> {
   if (typeof image === "string") {
     const m = /^data:([^;,]+);base64,(.*)$/s.exec(image);
     if (!m) return "image must be a file upload or a base64 data URI";

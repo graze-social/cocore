@@ -210,7 +210,10 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
                 );
               } catch (e) {
                 controller.enqueue(
-                  sseFrame("error", JSON.stringify({ reason: (e as Error).message, code: "unknown" })),
+                  sseFrame(
+                    "error",
+                    JSON.stringify({ reason: (e as Error).message, code: "unknown" }),
+                  ),
                 );
               } finally {
                 controller.close();

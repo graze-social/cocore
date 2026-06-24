@@ -404,7 +404,12 @@ function imageSlotsToResponse(slots: ImageSlotResult[]): Response {
   if (!haveImage) {
     const firstError = slots.find((s) => s.error)?.error ?? "unknown";
     const mapped = dispatchErrorToHttpResponse(firstError);
-    return jsonError(mapped.status, `image generation failed: ${mapped.code}`, mapped.type, mapped.code);
+    return jsonError(
+      mapped.status,
+      `image generation failed: ${mapped.code}`,
+      mapped.type,
+      mapped.code,
+    );
   }
   return generationsResponse(slots);
 }
@@ -431,7 +436,12 @@ async function imagesGenerations(request: Request, tier: ImageTier): Promise<Res
     );
   }
 
-  const pool = await resolveImagePool(tier, auth, parsed.model, (raw as { min_trust?: unknown }).min_trust);
+  const pool = await resolveImagePool(
+    tier,
+    auth,
+    parsed.model,
+    (raw as { min_trust?: unknown }).min_trust,
+  );
   if (pool instanceof Response) return pool;
 
   const job = generationsJobInput(parsed.prompt);

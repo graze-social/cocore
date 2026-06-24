@@ -39,11 +39,14 @@ describe("parseGenerationsRequest", () => {
   });
 
   test("accepts b64_json and bounds n to 1..4", () => {
-    assert.deepEqual(parseGenerationsRequest({ model: "m", prompt: "x", response_format: "b64_json", n: 4 }), {
-      model: "m",
-      prompt: "x",
-      n: 4,
-    });
+    assert.deepEqual(
+      parseGenerationsRequest({ model: "m", prompt: "x", response_format: "b64_json", n: 4 }),
+      {
+        model: "m",
+        prompt: "x",
+        n: 4,
+      },
+    );
     assert.equal(typeof parseGenerationsRequest({ model: "m", prompt: "x", n: 5 }), "string");
     assert.equal(typeof parseGenerationsRequest({ model: "m", prompt: "x", n: 0 }), "string");
   });
@@ -77,9 +80,23 @@ describe("collectImageDispatch", () => {
   test("collects image chunks and the terminal receipt", async () => {
     const result = await collectImageDispatch(
       events(
-        { kind: "meta", jobUri: "at://j", jobCid: "c", authUri: "at://a", inputCommitment: "x", providerDid: "did:plc:p", sessionId: "s" },
+        {
+          kind: "meta",
+          jobUri: "at://j",
+          jobCid: "c",
+          authUri: "at://a",
+          inputCommitment: "x",
+          providerDid: "did:plc:p",
+          sessionId: "s",
+        },
         { kind: "chunk", seq: 0, channel: "image", mime: "image/png", data: "AAAA" },
-        { kind: "complete", tokensIn: 1, tokensOut: 2, receiptUri: "at://r", outputFormat: "images-v1" },
+        {
+          kind: "complete",
+          tokensIn: 1,
+          tokensOut: 2,
+          receiptUri: "at://r",
+          outputFormat: "images-v1",
+        },
       ),
     );
     assert.deepEqual(result.images, [{ mime: "image/png", data: "AAAA" }]);

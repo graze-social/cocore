@@ -32,13 +32,48 @@ describe("machineKey", () => {
 describe("listModelMachines", () => {
   test("returns distinct attested machines serving the model, freshest-first", async () => {
     globalThis.fetch = providersResponse([
-      { did: "did:plc:a", machineId: "m1", attestedAt: "t", lastSeen: "2026-01-01T00:00:01Z", supportedModels: ["stub-flux"], encryptionPubKey: "k" },
-      { did: "did:plc:a", machineId: "m2", attestedAt: "t", lastSeen: "2026-01-01T00:00:03Z", supportedModels: ["stub-flux"], encryptionPubKey: "k" },
-      { did: "did:plc:b", machineId: "m1", attestedAt: "t", lastSeen: "2026-01-01T00:00:02Z", supportedModels: [], encryptionPubKey: "k" },
+      {
+        did: "did:plc:a",
+        machineId: "m1",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:01Z",
+        supportedModels: ["stub-flux"],
+        encryptionPubKey: "k",
+      },
+      {
+        did: "did:plc:a",
+        machineId: "m2",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:03Z",
+        supportedModels: ["stub-flux"],
+        encryptionPubKey: "k",
+      },
+      {
+        did: "did:plc:b",
+        machineId: "m1",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:02Z",
+        supportedModels: [],
+        encryptionPubKey: "k",
+      },
       // Not attested — excluded.
-      { did: "did:plc:c", machineId: "m1", attestedAt: null, lastSeen: "2026-01-01T00:00:09Z", supportedModels: ["stub-flux"], encryptionPubKey: "k" },
+      {
+        did: "did:plc:c",
+        machineId: "m1",
+        attestedAt: null,
+        lastSeen: "2026-01-01T00:00:09Z",
+        supportedModels: ["stub-flux"],
+        encryptionPubKey: "k",
+      },
       // Doesn't serve the model — excluded.
-      { did: "did:plc:d", machineId: "m1", attestedAt: "t", lastSeen: "2026-01-01T00:00:09Z", supportedModels: ["other"], encryptionPubKey: "k" },
+      {
+        did: "did:plc:d",
+        machineId: "m1",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:09Z",
+        supportedModels: ["other"],
+        encryptionPubKey: "k",
+      },
     ]);
 
     const machines = await listModelMachines("http://advisor", "stub-flux");
@@ -52,8 +87,22 @@ describe("listModelMachines", () => {
 
   test("constrains to the allowed DID set when given", async () => {
     globalThis.fetch = providersResponse([
-      { did: "did:plc:a", machineId: "m1", attestedAt: "t", lastSeen: "2026-01-01T00:00:01Z", supportedModels: ["stub-flux"], encryptionPubKey: "k" },
-      { did: "did:plc:b", machineId: "m1", attestedAt: "t", lastSeen: "2026-01-01T00:00:02Z", supportedModels: ["stub-flux"], encryptionPubKey: "k" },
+      {
+        did: "did:plc:a",
+        machineId: "m1",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:01Z",
+        supportedModels: ["stub-flux"],
+        encryptionPubKey: "k",
+      },
+      {
+        did: "did:plc:b",
+        machineId: "m1",
+        attestedAt: "t",
+        lastSeen: "2026-01-01T00:00:02Z",
+        supportedModels: ["stub-flux"],
+        encryptionPubKey: "k",
+      },
     ]);
     const machines = await listModelMachines("http://advisor", "stub-flux", new Set(["did:plc:b"]));
     expect(machines).toEqual([{ did: "did:plc:b", machineId: "m1" }]);

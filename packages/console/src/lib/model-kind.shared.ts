@@ -8,7 +8,7 @@
 // side (see provider/src/pricing.rs `Modality` + `is_image_model`); this
 // mirrors it for ids the console only knows as strings.
 
-export const MODEL_KINDS = ["text", "image", "audio", "video", "test", "other"] as const;
+const MODEL_KINDS = ["text", "image", "audio", "video", "test", "other"] as const;
 export type ModelKind = (typeof MODEL_KINDS)[number];
 
 /** Classify a model id by the kind of output it produces. Mirrors the Rust

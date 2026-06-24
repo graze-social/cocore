@@ -340,7 +340,7 @@ async function pickProvider(
 }
 
 /** One distinct provider machine serving a model. */
-export interface ModelMachine {
+interface ModelMachine {
   did: string;
   machineId?: string;
 }
@@ -351,10 +351,7 @@ function machineKey(m: ModelMachine): string {
 
 /** Distinct attested machines serving `model`, freshest-first. Mirrors the
  *  console helper of the same name; used by the multi-image fan-out. */
-export async function listModelMachines(
-  advisorUrl: string,
-  model: string,
-): Promise<ModelMachine[]> {
+async function listModelMachines(advisorUrl: string, model: string): Promise<ModelMachine[]> {
   const list = await fetchProviders(advisorUrl);
   let rows = list.filter((p) => p.attestedAt);
   rows = rows.filter((p) => p.supportedModels.length === 0 || p.supportedModels.includes(model));
