@@ -2072,6 +2072,34 @@ fn build_engines(
     let mut last_err: Option<String> = None;
 
     for model in &configured {
+        // Smoke-test stubs (`stub`, `stub-flux`) are always served by the
+        // StubEngine registered above; never spawn a Python subprocess for
+        // them even if an operator pins one explicitly.
+        if cocore_provider::pricing::is_smoke_test_model(model) {
+            continue;
+        }
+        // Image-generation models load the diffusion subprocess engine
+        // (`cocore_image_server.py` / mflux), not the vllm-mlx chat engine.
+        // Routing is by the catalog-authoritative `is_image_model`.
+        if cocore_provider::engines::is_image_model(model) {
+            match start_image_engine_with_recovery(model, &venv_python) {
+                Ok(engine) => {
+                    tracing::info!(model = %model, "image-generation subprocess engine ready");
+                    registry.register(model.clone(), std::sync::Arc::new(engine));
+                }
+                Err(EngineStartFailure::VenvMissing) => {
+                    saw_venv_missing = true;
+                    tracing::warn!(model = %model, reason = "venv-missing", "inference engine load failed");
+                    failed.push(model.clone());
+                }
+                Err(EngineStartFailure::Failed(err)) => {
+                    last_err = Some(err);
+                    tracing::warn!(model = %model, "inference engine load failed");
+                    failed.push(model.clone());
+                }
+            }
+            continue;
+        }
         match start_engine_with_recovery(model, &venv_python) {
             Ok(engine) => {
                 tracing::info!(model = %model, "inference subprocess engine ready");
@@ -2294,6 +2322,59 @@ fn start_engine_with_recovery(
                 backoff_s = backoff.as_secs(),
                 "retrying inference engine load after backoff"
             );
+            std::thread::sleep(backoff);
+        }
+    }
+    if !venv_python.exists() {
+        Err(EngineStartFailure::VenvMissing)
+    } else {
+        Err(EngineStartFailure::Failed(
+            last_err.unwrap_or_else(|| "unknown error".to_string()),
+        ))
+    }
+}
+
+/// Image-generation counterpart of [`start_engine_with_recovery`]. Same
+/// bounded-retry/backoff lifecycle, but constructs an
+/// [`ImageSubprocessEngine`](cocore_provider::engines::image_subprocess::ImageSubprocessEngine)
+/// (mflux diffusion over `/generate`) instead of the vllm-mlx chat engine.
+fn start_image_engine_with_recovery(
+    model: &str,
+    venv_python: &std::path::Path,
+) -> std::result::Result<
+    cocore_provider::engines::image_subprocess::ImageSubprocessEngine,
+    EngineStartFailure,
+> {
+    use cocore_provider::engines::image_subprocess::ImageSubprocessEngine;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=ENGINE_START_MAX_ATTEMPTS {
+        if !venv_python.exists() {
+            last_err = Some(format!("venv python missing at {}", venv_python.display()));
+            tracing::warn!(
+                model = %model,
+                attempt,
+                python = %venv_python.display(),
+                "venv python missing; the installer may still be provisioning it — will retry after backoff"
+            );
+        } else {
+            match ImageSubprocessEngine::new(model, venv_python.to_path_buf()) {
+                Ok(engine) => match engine.start() {
+                    Ok(()) => return Ok(engine),
+                    Err(e) => {
+                        let err = format!("{e:#}");
+                        tracing::warn!(model = %model, attempt, error = %err, "image subprocess failed to start; will retry");
+                        last_err = Some(err);
+                    }
+                },
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    tracing::warn!(model = %model, attempt, error = %err, "could not construct image subprocess engine; will retry");
+                    last_err = Some(err);
+                }
+            }
+        }
+        if attempt < ENGINE_START_MAX_ATTEMPTS {
+            let backoff = ENGINE_START_BACKOFF * attempt;
             std::thread::sleep(backoff);
         }
     }

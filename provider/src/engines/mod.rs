@@ -34,6 +34,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub mod image_subprocess;
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
 pub mod stub;
@@ -986,11 +987,13 @@ mod tests {
 
     #[test]
     fn image_models_classified_by_catalog_then_heuristic() {
-        // Catalog is authoritative: stub-flux is declared Modality::Image.
+        // Catalog is authoritative: stub-flux + the FLUX entries are
+        // declared Modality::Image.
         assert!(is_image_model("stub-flux"));
-        // Off-catalog ids fall back to the id heuristic.
         assert!(is_image_model("black-forest-labs/FLUX.1-schnell"));
+        // Off-catalog ids fall back to the id heuristic.
         assert!(is_image_model("stabilityai/stable-diffusion-xl-base-1.0"));
+        assert!(is_image_model("some-org/my-sdxl-finetune"));
         // A catalog text model is never mis-routed even with a loud id; and
         // a plain off-catalog chat id stays text.
         assert!(!is_image_model("stub"));

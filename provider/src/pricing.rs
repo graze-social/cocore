@@ -105,6 +105,31 @@ pub const RATES: &[ModelRate] = &[
         recommended: false,
         modality: Modality::Image,
     },
+    // ---- Image-generation models (FLUX.1 via mflux) -------------------
+    // Served by the diffusion subprocess engine (cocore_image_server.py).
+    // RAM floors are conservative for 8-bit-quantized weights resident +
+    // the diffusion activation working set. schnell is the fast 4-step
+    // model; dev is slower (~20-50 steps) but higher quality.
+    ModelRate {
+        model_id: "black-forest-labs/FLUX.1-schnell",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 16,
+        description: "FLUX.1 schnell — fast 4-step image gen; 16GB+",
+        recommended: true,
+        modality: Modality::Image,
+    },
+    ModelRate {
+        model_id: "black-forest-labs/FLUX.1-dev",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 24,
+        description: "FLUX.1 dev — higher-quality image gen; 24GB+",
+        recommended: true,
+        modality: Modality::Image,
+    },
     // ---- Current rotation (recommended) -------------------------------
     // The "latest & greatest" set the Secure Mode upgrade urges providers
     // to pin. min_ram_gb is the conservative MINIMUM machine RAM (4-bit
