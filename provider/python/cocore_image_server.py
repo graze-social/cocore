@@ -38,6 +38,7 @@ import os
 import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -243,14 +244,18 @@ def _build_app(backend: _FluxBackend) -> FastAPI:
 
         # img2img: take the FIRST reference image, decode to a temp PNG the
         # backend can read. (Multi-reference is backend-specific; v1 uses one.)
+        # The path is unpredictable (tempfile) — never derived from the
+        # caller-supplied seed — so a crafted seed can't target/collide a path.
         init_path = None
         ref_images = body.get("images") or []
         if isinstance(ref_images, list) and ref_images:
             first = ref_images[0]
             if isinstance(first, dict) and isinstance(first.get("data"), str):
                 raw = base64.b64decode(first["data"])
-                init_path = str(Path(args_uds_dir() / f"ref-{os.getpid()}-{seed}.png"))
-                with open(init_path, "wb") as fh:
+                fd, init_path = tempfile.mkstemp(
+                    dir=str(args_uds_dir()), prefix="ref-", suffix=".png"
+                )
+                with os.fdopen(fd, "wb") as fh:
                     fh.write(raw)
 
         try:

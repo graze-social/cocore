@@ -33,6 +33,7 @@ import { listMyFriendDids } from "@/lib/friends.server.ts";
 import {
   buildJobInput,
   bufferedResponse,
+  dispatchErrorToHttpResponse,
   jsonError,
   type OpenAiChatRequest,
   parseRequest,
@@ -52,7 +53,6 @@ import {
   parseEditsRequest,
   parseGenerationsRequest,
 } from "@/lib/openai-images-generations.server.ts";
-import { dispatchErrorToHttpResponse } from "@/lib/openai-chat-completions.server.ts";
 import {
   parseTrustFloor,
   resolveVerifiedProviderDids,

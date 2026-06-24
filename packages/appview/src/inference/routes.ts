@@ -31,6 +31,7 @@ import {
   hasImageParts,
   MESSAGES_V1,
 } from "@cocore/sdk/multimodal-envelope";
+import { isImageModel } from "@cocore/sdk/model-kind";
 
 import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { Store } from "../store.ts";
@@ -220,20 +221,23 @@ async function* multiImageEvents(
 ): AsyncGenerator<DispatchEvent> {
   const slots = await runMultiImageDispatch(base, deps, outputCount);
   let seq = 0;
-  let receiptUri = "";
+  const receiptUris: string[] = [];
   let providerCredit: ProviderCredit | undefined;
   for (const slot of slots) {
     for (const img of slot.images) {
       yield { kind: "chunk", seq: seq++, channel: "image", mime: img.mime, data: img.data };
     }
-    if (!receiptUri && slot.receiptUri) receiptUri = slot.receiptUri;
+    if (slot.receiptUri) receiptUris.push(slot.receiptUri);
     if (!providerCredit && slot.providerCredit) providerCredit = slot.providerCredit;
   }
   yield {
     kind: "complete",
     tokensIn: 0,
     tokensOut: 0,
-    receiptUri,
+    // Every image's receipt — clients/verifiers need all of them, not just
+    // the first (the single-dispatch field stays the first for back-compat).
+    receiptUri: receiptUris[0] ?? "",
+    ...(receiptUris.length > 1 ? { receiptUris } : {}),
     outputFormat: "images-v1",
     ...(providerCredit ? { providerCredit } : {}),
   };
@@ -285,10 +289,13 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
           getProfile: storeProfileFetcher(ctx.store),
         };
         // Multi-image fan-out (outputCount > 1) runs distinct-machine slots
-        // and re-emits their image chunks + one aggregate complete through
-        // the same SSE shape; n === 1 is the normal single dispatch.
+        // and re-emits their image chunks + one aggregate complete through the
+        // same SSE shape; n === 1 is the normal single dispatch. Only IMAGE
+        // models fan out — `outputCount > 1` on a text model would run N
+        // completions, discard the text, and falsely claim images-v1, so it's
+        // ignored (single dispatch) for non-image models.
         const events =
-          parsed.outputCount && parsed.outputCount > 1
+          parsed.outputCount && parsed.outputCount > 1 && isImageModel(parsed.model)
             ? multiImageEvents({ did, ...parsed }, deps, parsed.outputCount)
             : runDispatch({ did, ...parsed }, deps);
 
@@ -327,6 +334,7 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
                     tokensIn: ev.tokensIn,
                     tokensOut: ev.tokensOut,
                     receiptUri: ev.receiptUri,
+                    ...(ev.receiptUris ? { receiptUris: ev.receiptUris } : {}),
                     ...(ev.outputFormat ? { outputFormat: ev.outputFormat } : {}),
                     ...(ev.providerCredit ? { providerCredit: ev.providerCredit } : {}),
                   }),

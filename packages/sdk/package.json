@@ -13,6 +13,7 @@
     "./mda": "./src/mda.ts",
     "./multimodal-envelope": "./src/multimodal-envelope.ts",
     "./images-envelope": "./src/images-envelope.ts",
+    "./model-kind": "./src/model-kind.ts",
     "./appattest": "./src/appattest.ts",
     "./verify-provider": "./src/verify-provider.ts",
     "./oauth-scope": "./src/oauth-scope.ts",

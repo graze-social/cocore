@@ -29,6 +29,8 @@ import {
   forwardDispatch,
   isDispatchForwardConfigured,
 } from "@/lib/inference-dispatch-forward.server.ts";
+import { isImageModel } from "@cocore/sdk/model-kind";
+
 import { runDispatch, runMultiImageDispatch } from "@/lib/inference-dispatch.server.ts";
 import { getAtprotoSessionForRequest } from "@/middleware/auth.server.ts";
 
@@ -168,7 +170,10 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
         // Multi-output (image) fan-out: run distinct-machine slots, then emit
         // each image as an indexed chunk + one aggregate complete. The client
         // (chat-dispatch) already accumulates multiple image chunks per turn.
-        if (outputCount && outputCount > 1) {
+        // Only image models fan out — `outputCount > 1` on a text model would
+        // run N completions, discard the text, and falsely claim images-v1, so
+        // it's ignored (single dispatch) for non-image models.
+        if (outputCount && outputCount > 1 && isImageModel(parsed.model)) {
           const stream = new ReadableStream<Uint8Array>({
             async start(controller) {
               try {

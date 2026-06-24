@@ -182,6 +182,11 @@ export type DispatchEvent =
       tokensIn: number;
       tokensOut: number;
       receiptUri: string;
+      /** Every receipt for the job — one per image slot on a multi-image
+       *  fan-out (so SSE clients can verify ALL images, not just the first).
+       *  Single-dispatch jobs carry the one `receiptUri`; this is present when
+       *  there is more than one. */
+      receiptUris?: string[];
       /** Output shape the provider produced. `images-v1` = image channel,
        *  not text. Absent = text (legacy). */
       outputFormat?: "text" | "images-v1";
@@ -350,10 +355,18 @@ function machineKey(m: ModelMachine): string {
 }
 
 /** Distinct attested machines serving `model`, freshest-first. Mirrors the
- *  console helper of the same name; used by the multi-image fan-out. */
-async function listModelMachines(advisorUrl: string, model: string): Promise<ModelMachine[]> {
+ *  console helper of the same name; used by the multi-image fan-out.
+ *  `allowedDids` (when set) restricts the pool to those DIDs — the fan-out
+ *  passes the caller's `targetProviderDid` so an explicit pin never crosses to
+ *  other operators' machines. */
+async function listModelMachines(
+  advisorUrl: string,
+  model: string,
+  allowedDids?: Set<string>,
+): Promise<ModelMachine[]> {
   const list = await fetchProviders(advisorUrl);
   let rows = list.filter((p) => p.attestedAt);
+  if (allowedDids !== undefined) rows = rows.filter((p) => allowedDids.has(p.did));
   rows = rows.filter((p) => p.supportedModels.length === 0 || p.supportedModels.includes(model));
   rows.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
   const seen = new Set<string>();
@@ -386,7 +399,10 @@ export async function runMultiImageDispatch(
   deps: DispatchDeps,
   outputCount: number,
 ): Promise<ImageDispatchSlot[]> {
-  const machines = await listModelMachines(deps.advisorUrl, base.model);
+  // Honor an explicit pin: fan out across THAT DID's machines only, never
+  // crossing to other operators. (AppView dispatch has no friends pool.)
+  const allowed = base.targetProviderDid ? new Set([base.targetProviderDid]) : undefined;
+  const machines = await listModelMachines(deps.advisorUrl, base.model, allowed);
   if (machines.length === 0) {
     return Array.from({ length: outputCount }, (_unused, index) => ({
       index,

@@ -147,9 +147,9 @@ function estimateBase64Bytes(b64: string): number {
 }
 
 function base64FromBytes(bytes: Uint8Array): string {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
-  return btoa(bin);
+  // Node server context: Buffer is a single C++ call — far faster than a
+  // char-by-char `String.fromCharCode` loop on a multi-MB upload.
+  return Buffer.from(bytes).toString("base64");
 }
 
 /** Sealed-payload bytes for a generations (t2i) job — the raw prompt on
