@@ -38,6 +38,11 @@ pub struct ReceiptInputs {
     pub model: String,
     pub input_commitment: String,
     pub output_commitment: String,
+    /// How to interpret the plaintext output bytes `output_commitment`
+    /// covers. `None`/`"text"` = UTF-8 answer text (legacy); `"images-v1"`
+    /// = canonical images envelope bytes. Mirrors the lexicon
+    /// `dev.cocore.compute.receipt#main.outputFormat`.
+    pub output_format: Option<String>,
     /// SHA-256 hex over the exact sealed bytes delivered to the
     /// requester. Lets a requester confirm the ciphertext they received
     /// is the one this receipt's signature commits to.
@@ -82,6 +87,8 @@ pub struct ReceiptRecord {
     pub model: String,
     pub inputCommitment: String,
     pub outputCommitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputFormat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputCipherCommitment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +152,12 @@ pub fn build(
     // record's `skip_serializing_if = None` — the signed `unsigned`
     // value MUST canonicalise to the same bytes the verifier derives
     // from the published record (minus enclaveSignature).
+    if let Some(f) = &inputs.output_format {
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("outputFormat".into(), Value::String(f.clone()));
+    }
     if let Some(c) = &inputs.output_cipher_commitment {
         unsigned
             .as_object_mut()
@@ -186,6 +199,7 @@ pub fn build(
             model: inputs.model,
             inputCommitment: inputs.input_commitment,
             outputCommitment: inputs.output_commitment,
+            outputFormat: inputs.output_format,
             outputCipherCommitment: inputs.output_cipher_commitment,
             reasoningCommitment: inputs.reasoning_commitment,
             params: inputs.params,
@@ -231,6 +245,7 @@ mod tests {
             model: "llama-3.1-70b".into(),
             input_commitment: "a".repeat(64),
             output_commitment: "b".repeat(64),
+            output_format: None,
             output_cipher_commitment: None,
             reasoning_commitment: None,
             params: None,

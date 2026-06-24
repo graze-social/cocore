@@ -123,6 +123,18 @@ export interface JobRecord {
    *  canonical multimodal envelope (see multimodal-envelope.ts). */
   inputFormat?: "text" | "messages-v1";
   inputCipherURL?: string;
+  /** Optional requester hint for the expected output shape. Absent/"text":
+   *  a UTF-8 answer. "images-v1": the receipt's outputCommitment covers a
+   *  canonical images envelope (see images-envelope.ts). */
+  outputFormat?: "text" | "images-v1";
+  /** Optional lowercase-hex UUID (16 bytes) tying sibling jobs from one
+   *  user request (e.g. a multi-image fan-out). Each sibling still has its
+   *  own job + receipt; this is for indexer/UX correlation only. */
+  batchId?: string;
+  /** Optional 0-based index of this job within its batch (see batchId). */
+  outputIndex?: number;
+  /** Optional total number of sibling outputs in the batch (see batchId). */
+  outputCount?: number;
   maxTokensOut: number;
   priceCeiling: Money;
   acceptedProviders?: string[];
@@ -151,6 +163,10 @@ export interface ReceiptRecord {
   inputCommitment: string;
   /** SHA-256 hex over the plaintext output the requester receives. */
   outputCommitment: string;
+  /** How to interpret the plaintext output bytes outputCommitment covers.
+   *  Absent/"text": UTF-8 answer text (legacy). "images-v1": UTF-8 of the
+   *  canonical images envelope (see images-envelope.ts). */
+  outputFormat?: "text" | "images-v1";
   /** Optional SHA-256 hex over the exact encrypted bytes delivered. */
   outputCipherCommitment?: string;
   /** Optional SHA-256 hex over the plaintext reasoning ('thinking') output,

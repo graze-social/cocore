@@ -153,6 +153,10 @@ export interface JobRecord {
   inputCommitment: string;
   inputFormat?: "text" | "messages-v1";
   inputCipherURL?: string;
+  outputFormat?: "text" | "images-v1";
+  batchId?: string;
+  outputIndex?: number;
+  outputCount?: number;
   maxTokensOut: number;
   priceCeiling: Money;
   acceptedProviders?: string[];
@@ -210,6 +214,7 @@ export interface ReceiptRecord {
   model: string;
   inputCommitment: string;
   outputCommitment: string;
+  outputFormat?: "text" | "images-v1";
   outputCipherCommitment?: string;
   reasoningCommitment?: string;
   sessionKeyCommitment?: string;

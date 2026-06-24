@@ -43,7 +43,12 @@
             "type": "string",
             "minLength": 64,
             "maxLength": 64,
-            "description": "SHA-256 hex over the plaintext output bytes — the decrypted result the requester receives. (The earlier 'encrypted output' wording was a doc error; the provider has always committed to the plaintext, which is what a requester can verify after decrypting. Use outputCipherCommitment to commit to the encrypted bytes on the wire.)"
+            "description": "SHA-256 hex over the plaintext output bytes — the decrypted result the requester receives. (The earlier 'encrypted output' wording was a doc error; the provider has always committed to the plaintext, which is what a requester can verify after decrypting. Use outputCipherCommitment to commit to the encrypted bytes on the wire.) The byte layout is described by `outputFormat`: absent/`text` means the bytes are the UTF-8 answer text (legacy behavior); `images-v1` means they are the UTF-8 of the canonical images envelope (see `outputFormat`)."
+          },
+          "outputFormat": {
+            "type": "string",
+            "knownValues": ["text", "images-v1"],
+            "description": "How to interpret the plaintext output bytes that `outputCommitment` covers. Absent (legacy) or `text`: the bytes are the UTF-8 answer text the requester acts on (current behavior). `images-v1`: the bytes are the UTF-8 of a canonical-JSON images envelope { v: 1, images: [ { mime, data } ] }, where `data` is base64-encoded image bytes inline and `mime` is the media type (e.g. \"image/png\"). A verifier reconstructs the same canonical bytes to recompute `outputCommitment`. Additive: a verifier that doesn't understand a format treats the commitment as opaque rather than mis-reading it as text. Covered by enclaveSignature."
           },
           "outputCipherCommitment": {
             "type": "string",
