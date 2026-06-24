@@ -131,8 +131,9 @@ interface InferenceChunk {
   session_id: string;
   seq: number;
   /** Which channel this chunk's plaintext belongs to. Absent (older
-   *  providers) means the answer. The advisor relays it opaquely. */
-  channel?: "content" | "reasoning";
+   *  providers) means the answer; "image" marks a generated-image part.
+   *  The advisor relays it opaquely. */
+  channel?: "content" | "reasoning" | "image";
   ciphertext: number[] | string;
 }
 
