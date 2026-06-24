@@ -123,6 +123,18 @@ impl EngineRegistry {
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect()
     }
+
+    /// Reap every engine's external process, synchronously. Call this
+    /// immediately before any `std::process::exit` on the serve path
+    /// (trust-tier / model switch) — `std::process::exit` runs no
+    /// destructors, so without this the engines' `Drop` never fires and
+    /// their Python children orphan to launchd until their own watchdog
+    /// notices. Idempotent and safe after a partial reap.
+    pub fn terminate_all(&self) {
+        for engine in self.by_model.values() {
+            engine.terminate();
+        }
+    }
 }
 
 impl Default for EngineRegistry {
@@ -434,6 +446,19 @@ pub trait Engine: Send + Sync {
     fn restart(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Reap any external process this engine owns, synchronously, before
+    /// the agent exits. The default is a no-op — correct for engines with
+    /// no subprocess (the stub). The subprocess engine SIGTERMs (then
+    /// SIGKILLs) its Python child and unlinks its socket.
+    ///
+    /// `Drop` already does this on the normal unwind path, but the serve
+    /// loop also exits via `std::process::exit` on a trust-tier or model
+    /// switch (the supervisor must re-select the worker shape), and
+    /// `std::process::exit` runs no destructors. Calling `terminate()`
+    /// explicitly at those sites reaps the children promptly instead of
+    /// leaning on the child-side parent-death watchdog's poll latency.
+    fn terminate(&self) {}
 
     /// Synchronous, non-streaming generate. Collects a streaming
     /// response when the engine only implements token deltas.

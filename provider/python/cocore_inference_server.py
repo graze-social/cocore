@@ -5,7 +5,18 @@ cocore inference subprocess wrapper.
 The Rust agent (`cocore agent serve`) spawns one instance of this
 script per model it wants to serve. The script loads vllm-mlx, binds
 its FastAPI app to a Unix domain socket, and serves until the parent
-sends SIGTERM.
+sends SIGTERM *or* the parent goes away.
+
+The second condition is a hard failsafe. An explicit SIGTERM is the
+clean teardown path, but it is not the only one the parent can take:
+the agent can be SIGKILLed, crash, get `launchctl kickstart -k`'d, or
+exit non-gracefully on a trust-tier / model switch (`std::process::exit`
+skips Rust destructors), and an uninstall removes the app without
+signalling its children at all. In every one of those cases this child
+would otherwise reparent to launchd (PPID 1) and run forever, holding
+hundreds of MB of RAM on a socket nobody can reach. So a daemon thread
+watches the parent PID and exits this process the moment the parent is
+gone — see `_start_parent_death_watch`. The agent cannot leak us.
 
 Why a subprocess and not in-process PyO3:
   * The Rust binary stays free of libpython linkage — `otool -L
@@ -116,6 +127,49 @@ def _unlink_if_owned(socket_path: Path, owned_ino: "int | None") -> None:
         pass
 
 
+# How often the parent-death watchdog checks whether the agent is still
+# our parent. 2s is a negligible cost (one getppid() syscall) and bounds
+# how long an orphan can linger after the parent dies — far below the
+# minutes-long TCP timeout that left engines running in the field.
+_PARENT_WATCH_INTERVAL_S = 2.0
+
+
+def _start_parent_death_watch(
+    parent_pid: int, socket_path: Path, bound_ino: "list[int | None]"
+) -> None:
+    """Exit this process if the parent agent ever goes away.
+
+    The only *clean* teardown is an explicit SIGTERM from the parent, but
+    that path is not guaranteed: the agent can be SIGKILLed, crash, be
+    ``launchctl kickstart -k``'d, exit via ``std::process::exit`` on a
+    tier/model switch (which skips its Rust ``Drop`` that would SIGTERM
+    us), or be removed wholesale by an uninstall. In all of those the
+    kernel reparents us to launchd (PID 1) and our ``getppid()`` stops
+    equalling ``parent_pid``. A daemon thread polls for exactly that and,
+    when it sees it, unlinks our own socket and hard-exits — so an engine
+    can never outlive the agent that spawned it.
+
+    ``parent_pid`` is the agent's PID, passed explicitly via ``--parent-pid``
+    (PID reuse can't cause a false negative: an orphan's parent is launchd,
+    never the recycled agent PID). We compare against it rather than just
+    checking ``getppid() == 1`` so the watch also fires under a process
+    reaper / subreaper that adopts orphans at a PID other than 1.
+    """
+
+    def _watch() -> None:
+        while True:
+            time.sleep(_PARENT_WATCH_INTERVAL_S)
+            if os.getppid() != parent_pid:
+                # Parent is gone. Drop our socket so we don't leave a dead
+                # file behind, then hard-exit: uvicorn owns the main thread
+                # and won't honour sys.exit() from here, so os._exit is the
+                # only reliable way out of a foreign event loop.
+                _unlink_if_owned(socket_path, bound_ino[0])
+                os._exit(0)
+
+    threading.Thread(target=_watch, name="parent-death-watch", daemon=True).start()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="cocore inference subprocess wrapper")
     ap.add_argument(
@@ -127,6 +181,17 @@ def main() -> None:
         "--uds",
         required=True,
         help="Unix domain socket path to bind",
+    )
+    ap.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help=(
+            "PID of the spawning agent. When set, a watchdog thread exits "
+            "this process if the parent goes away (reparent off this PID), so "
+            "the engine can't outlive the agent. Defaults to the actual parent "
+            "PID at startup for older agents that don't pass it."
+        ),
     )
     args = ap.parse_args()
 
@@ -168,6 +233,18 @@ def main() -> None:
     threading.Thread(
         target=_record_bound_socket, name="socket-ino-recorder", daemon=True
     ).start()
+
+    # Parent-death failsafe: exit if the agent ever goes away, however it
+    # goes (SIGKILL, crash, kickstart -k, std::process::exit on a tier/model
+    # switch, uninstall). Capture the parent PID now — explicit from the
+    # agent when given, else our actual parent at startup for older agents.
+    # Started before the slow model load so an agent that dies *during* load
+    # still reaps us. Shares bound_ino so it unlinks only our own socket.
+    _start_parent_death_watch(
+        args.parent_pid if args.parent_pid is not None else os.getppid(),
+        socket_path,
+        bound_ino,
+    )
 
     # Load the model into vllm-mlx's module-level global. The
     # FastAPI routes inside vllm_mlx.server pick it up via

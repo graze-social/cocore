@@ -62,6 +62,34 @@ else
   note "$MENUBAR_PLIST not found"
 fi
 
+# Reap anything still running before we delete its files. `bootout`
+# above covers the launchd-supervised agent, but not an app-supervised
+# or manually-started one — and never the Python inference engines it
+# spawns (`cocore_inference_server.py`, one per served model). Those
+# reparent to launchd when the agent goes and, unsignalled, survive the
+# uninstall holding hundreds of MB of RAM. Newer agents self-reap via a
+# parent-death watchdog; this sweep covers older ones and mid-startup
+# kills. Engines first (no agent left to respawn them), then the agent.
+bold "==> stop running processes"
+reap_pattern() {
+  local label="$1" pattern="$2" pids
+  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    note "no $label running"
+    return 0
+  fi
+  note "stopping $label"
+  # shellcheck disable=SC2086
+  echo $pids | tr ' ' '\n' | while read -r pid; do [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; done
+  sleep 1
+  # shellcheck disable=SC2086
+  echo $pids | tr ' ' '\n' | while read -r pid; do
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+reap_pattern "inference engine(s)" "cocore_inference_server.py"
+reap_pattern "agent process(es)" "cocore(-provider)? agent serve"
+
 bold "==> remove installed binary"
 if [[ -f "$INSTALL_BIN" ]]; then
   rm -f "$INSTALL_BIN"

@@ -178,6 +178,53 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 fi
 
+# --- running processes -------------------------------------------------
+#
+# Reap anything still running BEFORE we delete the binary, venv, and
+# state dir out from under it. Two kinds of process:
+#
+#   1. The agent itself (`cocore agent serve` / the confidential
+#      `cocore-provider agent serve`). The LaunchAgent bootout above
+#      handles the launchd-supervised case, but an app-supervised or
+#      manually-started agent isn't covered by that.
+#   2. The Python inference engines (`cocore_inference_server.py`, one
+#      per served model). These are spawned by the agent and, if the
+#      agent is gone, have reparented to launchd (PID 1). Nothing else
+#      signals them, so without this they survive the uninstall holding
+#      hundreds of MB of RAM (the bug this phase fixes). Newer agents
+#      ship a parent-death watchdog that self-reaps these, but we still
+#      sweep here so an uninstall of an older agent — or one killed
+#      mid-startup before its watchdog armed — leaves nothing behind.
+
+phase "running processes"
+reap_pattern() {
+  # SIGTERM matching PIDs, wait briefly, then SIGKILL survivors. Uses
+  # pgrep/kill (not pkill) so dry-run can just report. `|| true` keeps
+  # set -e happy when nothing matches.
+  local label="$1" pattern="$2" pids
+  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    note "no $label running"
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  if [[ "$COCORE_DRY_RUN" == "1" ]]; then
+    note "  [dry-run] kill $label: $(echo $pids | tr '\n' ' ')"
+    return 0
+  fi
+  note "stopping $label ($(echo $pids | tr '\n' ' '))"
+  echo "$pids" | while read -r pid; do [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; done
+  sleep 1
+  echo "$pids" | while read -r pid; do
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  done
+}
+# Engines first — once the agent is gone there's no one to respawn them,
+# and reaping them before the agent avoids the agent's health watchdog
+# trying to restart a child mid-uninstall.
+reap_pattern "inference engine(s)" "cocore_inference_server.py"
+reap_pattern "agent process(es)" "cocore(-provider)? agent serve"
+
 # --- binary ------------------------------------------------------------
 
 phase "binary"

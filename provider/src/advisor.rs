@@ -318,6 +318,10 @@ impl AdvisorClient {
                                 from = ?active_at_start, to = ?active_now,
                                 "a model's schedule window changed the active set; restarting to reload engines"
                             );
+                            // process::exit runs no destructors, so reap the
+                            // engine subprocesses here — otherwise their Drop
+                            // never fires and the Python children orphan.
+                            ctx.engines.terminate_all();
                             std::process::exit(3);
                         }
                     }
@@ -348,6 +352,11 @@ impl AdvisorClient {
                             from = ?desired_tier_at_start, to = ?desired_tier,
                             "owner changed this machine's trust tier from the console; restarting to re-select the worker"
                         );
+                        // Reap engine subprocesses before the destructor-
+                        // skipping exit — confidential serves in-process, so
+                        // a leaked best-effort child would linger with no
+                        // owner. (See terminate_all.)
+                        ctx.engines.terminate_all();
                         std::process::exit(3);
                     }
                     if models_changed(&desired, desired_at_start) {
@@ -360,6 +369,10 @@ impl AdvisorClient {
                             from = ?desired_at_start, to = ?desired,
                             "owner changed this machine's models from the console; restarting to reload engines"
                         );
+                        // Reap engine subprocesses before the destructor-
+                        // skipping exit so the old model's child doesn't
+                        // orphan while the fresh serve loads the new set.
+                        ctx.engines.terminate_all();
                         std::process::exit(3);
                     }
                 }
@@ -397,7 +410,11 @@ impl AdvisorClient {
                         // Exit non-zero so launchd KeepAlive (SuccessfulExit
                         // =false) / the app supervisor respawn us. A distinct
                         // code from the model-change reload (exit 3) keeps the
-                        // two causes apart in logs.
+                        // two causes apart in logs. Reap first: the engines
+                        // that AREN'T dead would otherwise orphan past this
+                        // destructor-skipping exit (terminate is a no-op on
+                        // the already-dead ones).
+                        ctx.engines.terminate_all();
                         std::process::exit(7);
                     }
                 }
@@ -436,6 +453,9 @@ impl AdvisorClient {
                             models = ?dead,
                             "self-right could not restart engine(s); restarting agent to re-register without them"
                         );
+                        // Reap surviving engines before the destructor-
+                        // skipping exit (no-op on the dead ones).
+                        ctx.engines.terminate_all();
                         std::process::exit(7);
                     }
                     tracing::info!("self-right succeeded; cleared bad-standing");

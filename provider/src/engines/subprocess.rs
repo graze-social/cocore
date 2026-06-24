@@ -418,6 +418,17 @@ impl SubprocessEngine {
             .arg(&self.model_id)
             .arg("--uds")
             .arg(&self.socket_path)
+            // Parent-death failsafe: tell the child our PID so its
+            // watchdog thread can self-exit if we ever go away without a
+            // clean SIGTERM (SIGKILL, crash, `kickstart -k`, the
+            // `std::process::exit` we take on a tier/model switch — which
+            // skips the Drop below — or an uninstall that just removes the
+            // app). Without this the child reparents to launchd and runs
+            // forever on a socket nobody can reach. The explicit Drop
+            // teardown is still the fast path; this only backstops the
+            // exits that never reach Drop.
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
             // Capture stdout + stderr into a bounded ring buffer
             // (see ENGINE_RING_BUFFER_CAP). We deliberately do NOT
             // pipe child output into tracing: vllm-mlx logs prompt
@@ -427,8 +438,11 @@ impl SubprocessEngine {
             // startup-failure bail paths below.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Don't inherit a controlling tty; we want this child to
-            // be reparentable by launchd if the agent itself dies.
+            // Don't inherit a controlling tty. If the agent dies the
+            // child does reparent to launchd, but it no longer *survives*
+            // there: the `--parent-pid` watchdog above notices the agent
+            // is gone and exits the child. Reparenting is just the kernel
+            // mechanic; the failsafe is what bounds its lifetime.
             .stdin(Stdio::null());
 
         let mut child = cmd.spawn().with_context(|| {
@@ -867,26 +881,30 @@ impl SubprocessEngine {
     }
 }
 
-impl Drop for SubprocessEngine {
-    fn drop(&mut self) {
-        // NEVER `.unwrap()` a lock inside a Drop. If the mutex is
-        // poisoned (some thread panicked while holding it), `unwrap()`
-        // panics — and a panic inside a destructor that runs *during
-        // an unwind* is "panic while panicking", which Rust turns into
-        // an immediate `abort()` (SIGABRT) via `panic_in_cleanup`.
-        // That abort (a) kills the whole agent and (b) skips the
-        // SIGTERM below, orphaning the Python inference child. Recover
-        // the guard from the poison instead: the `Option<Child>` it
-        // protects is still valid data, and we WANT to run the kill
-        // path regardless of whether some other thread panicked.
+impl SubprocessEngine {
+    /// Reap the child (if running) and unlink its socket. SIGTERM first —
+    /// the Python wrapper has a SIGTERM handler that unlinks the socket
+    /// cleanly — then escalate to SIGKILL after 5s if it hasn't exited.
+    ///
+    /// Shared by `Drop` and [`Engine::terminate`] so both the unwind path
+    /// and the explicit pre-`std::process::exit` reap behave identically.
+    /// Takes the child out under the lock so a second call is a no-op.
+    /// Poison-tolerant on the lock (see the Drop note below) and safe to
+    /// call from any thread.
+    fn terminate_child(&self) {
+        // NEVER `.unwrap()` a lock here. When this runs from Drop during an
+        // unwind, an `unwrap()` on a poisoned mutex would panic, and a panic
+        // while panicking is `panic_in_cleanup` → an immediate `abort()`
+        // (SIGABRT) that (a) kills the whole agent and (b) skips the SIGTERM
+        // below, orphaning the Python inference child. Recover the guard from
+        // the poison instead: the `Option<Child>` it protects is still valid
+        // data, and we WANT to run the kill path regardless of whether some
+        // other thread panicked.
         let mut guard = self
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(mut child) = guard.take() {
-            // SIGTERM first — the Python wrapper has a SIGTERM handler
-            // that unlinks the socket cleanly. Wait up to 5s, then
-            // escalate to SIGKILL.
             tracing::info!(model = %self.model_id, "terminating inference subprocess");
             #[cfg(unix)]
             unsafe {
@@ -911,6 +929,12 @@ impl Drop for SubprocessEngine {
     }
 }
 
+impl Drop for SubprocessEngine {
+    fn drop(&mut self) {
+        self.terminate_child();
+    }
+}
+
 impl Engine for SubprocessEngine {
     fn name(&self) -> &'static str {
         "subprocess-vllm-mlx"
@@ -918,6 +942,10 @@ impl Engine for SubprocessEngine {
 
     fn ready(&self) -> bool {
         self.is_alive()
+    }
+
+    fn terminate(&self) {
+        self.terminate_child();
     }
 
     /// Reap the dead child (if any) and respawn it on the same
