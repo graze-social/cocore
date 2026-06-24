@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
+pub mod openai;
 pub mod stub;
 pub mod subprocess;
 
@@ -401,6 +402,13 @@ pub struct GenerateRequest {
     pub tools: Option<serde_json::Value>,
     /// Optional tool choice strategy (OpenAI-compatible `tool_choice`).
     pub tool_choice: Option<serde_json::Value>,
+    /// RNG seed for deterministic generation. When set alongside
+    /// `temperature = Some(0.0)`, backends that support seeding (llama.cpp,
+    /// Ollama, vLLM) produce the same output for the same input. This is the
+    /// basis for the verification path: the receipt commits to the seed via
+    /// `params.seed`, and a third party can reproduce the inference to confirm
+    /// the output commitment. See `crate::determinism`.
+    pub seed: Option<u64>,
 }
 
 /// Result of a non-streaming inference call.

@@ -1873,6 +1873,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         // Text-only stays a scalar string — byte-identical to the legacy path.
@@ -1902,6 +1903,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         let parts = body["messages"][0]["content"]
@@ -1943,6 +1945,7 @@ mod tests {
             guided_json: Some(schema),
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         // The schema is wrapped in the OpenAI response_format envelope.
@@ -1977,6 +1980,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         // No response_format key when guided_json is absent.
@@ -2012,6 +2016,7 @@ mod tests {
             guided_json: None,
             tools: Some(tools.clone()),
             tool_choice: Some(serde_json::json!("auto")),
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         assert_eq!(body["tools"], tools);
@@ -2029,6 +2034,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         assert!(body.get("tools").is_none());
@@ -2059,6 +2065,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         let assistant_msg = &body["messages"][1];
@@ -2113,6 +2120,7 @@ mod tests {
             guided_json: None,
             tools: None,
             tool_choice: None,
+            seed: None,
         };
         let body = SubprocessEngine::build_chat_body(&req, false).unwrap();
         let tool_msg = &body["messages"][2];

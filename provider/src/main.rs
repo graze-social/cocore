@@ -208,6 +208,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
 
+    // Install a process-default rustls CryptoProvider before any TLS handshake
+    // (the advisor WebSocket, the OpenAI engine, PDS/console HTTPS). Required
+    // because this tree compiles in more than one provider (see the fn).
+    install_crypto_provider();
+
     match cli.cmd {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
         Cmd::Agent(AgentCmd::Serve { advisor }) => cmd_serve_entry(advisor).await,
@@ -2464,6 +2469,123 @@ fn pick_confidential_native_model(
         .unwrap_or_else(|| default_model.to_string())
 }
 
+/// Install a process-wide default rustls `CryptoProvider`.
+///
+/// rustls 0.23 resolves its crypto backend from a process-level default, and
+/// auto-selects one only when exactly one of the `aws-lc-rs` / `ring` features
+/// is compiled in. This dependency tree pulls in BOTH (reqwest's `rustls-tls`
+/// brings aws-lc-rs; the tokio-tungstenite rustls stack brings ring), so the
+/// auto-select fails and rustls panics at the first TLS handshake — which is
+/// the advisor WebSocket connect in `cmd_serve`. We pick `aws-lc-rs`
+/// explicitly (the rustls 0.23 default, and what reqwest uses) so every TLS
+/// path — the WebSocket, the OpenAI engine, and PDS/console HTTPS — shares one
+/// provider. Idempotent: `install_default` returns `Err` if a default is
+/// already set, which we ignore (first winner stands).
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    #[test]
+    fn install_sets_a_process_default() {
+        super::install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+}
+
+/// True when the operator selected the OpenAI-compatible HTTP backend via
+/// `COCORE_ENGINE_BACKEND=openai` (case-insensitive, surrounding whitespace
+/// ignored). Default (unset / anything else) keeps the existing Apple-MLX/vllm
+/// path, so this is purely opt-in and changes nothing for existing macOS installs.
+fn backend_is_openai() -> bool {
+    std::env::var("COCORE_ENGINE_BACKEND")
+        .map(|v| v.trim().eq_ignore_ascii_case("openai"))
+        .unwrap_or(false)
+}
+
+/// Build the engine registry for the OpenAI-compatible HTTP backend: one
+/// `OpenAiEngine` per configured model id, all pointed at
+/// `COCORE_OPENAI_BASE_URL` (Bearer `COCORE_OPENAI_API_KEY` if set). The
+/// cocore model id is sent verbatim as the upstream `model`. We gate
+/// registration on a `/v1/models` reachability probe so a dead/misconfigured
+/// endpoint surfaces as an `engineFault` (and isn't advertised) instead of a
+/// green machine that drops every job. No RAM-floor guard — inference is
+/// remote.
+fn build_openai_engines(
+    mut registry: cocore_provider::engines::EngineRegistry,
+    configured: Vec<String>,
+) -> (
+    cocore_provider::engines::EngineRegistry,
+    Option<EngineFault>,
+    Vec<String>,
+) {
+    use cocore_provider::engines::openai::OpenAiEngine;
+    use cocore_provider::engines::Engine;
+
+    let base_url = std::env::var("COCORE_OPENAI_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(base_url) = base_url else {
+        tracing::warn!(
+            "COCORE_ENGINE_BACKEND=openai but COCORE_OPENAI_BASE_URL is unset; serving stub only"
+        );
+        let fault = EngineFault {
+            code: "openai-base-url-missing".to_string(),
+            message: "The OpenAI-compatible backend is selected \
+                      (COCORE_ENGINE_BACKEND=openai) but COCORE_OPENAI_BASE_URL is not set, so no \
+                      endpoint could be reached. The machine is online but only serving the no-op \
+                      `stub` engine. Fix: set COCORE_OPENAI_BASE_URL to your endpoint (e.g. \
+                      http://127.0.0.1:8080) and start serving again."
+                .to_string(),
+            models: vec![],
+            at: chrono::Utc::now(),
+        };
+        return (registry, Some(fault), vec![]);
+    };
+    let api_key = std::env::var("COCORE_OPENAI_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut failed: Vec<String> = vec![];
+    for model in &configured {
+        match OpenAiEngine::new(model.as_str(), &base_url, api_key.clone()) {
+            Ok(engine) if engine.ready() => {
+                tracing::info!(model = %model, "openai endpoint engine ready");
+                registry.register(model.clone(), std::sync::Arc::new(engine));
+            }
+            Ok(_) => {
+                tracing::warn!(model = %model, "inference engine load failed");
+                failed.push(model.clone());
+            }
+            Err(e) => {
+                tracing::warn!(model = %model, error = %format!("{e:#}"), "inference engine load failed");
+                failed.push(model.clone());
+            }
+        }
+    }
+
+    if failed.is_empty() {
+        return (registry, None, vec![]);
+    }
+    let fault = EngineFault {
+        code: "openai-endpoint-unreachable".to_string(),
+        message: format!(
+            "The OpenAI-compatible endpoint at {base_url} did not answer a /v1/models probe for \
+             model(s) [{}], so they were not loaded. The machine is online but only serving the \
+             no-op `stub` engine. Fix: confirm the endpoint is running and reachable, that \
+             COCORE_OPENAI_BASE_URL is correct, and that COCORE_OPENAI_API_KEY (if the endpoint \
+             requires auth) is set, then start serving again.",
+            failed.join(", "),
+        ),
+        models: failed,
+        at: chrono::Utc::now(),
+    };
+    (registry, Some(fault), vec![])
+}
+
 /// Build the per-model engine registry for this serve invocation.
 ///
 /// Every registry includes a `stub` entry — it's the no-cost
@@ -2600,6 +2722,21 @@ fn build_engines(
         // (inference runs in-process), so a native failure is the fault to
         // surface here. On best-effort machines `native_fault` is `None`.
         return (registry, native_fault, vec![]);
+    }
+
+    // Backend selection. The OpenAI-compatible HTTP engine (the Linux
+    // real-inference path) attaches to an external endpoint, so it skips the
+    // venv + RAM-floor machinery the Apple-MLX path below needs — a remote
+    // endpoint's RAM isn't this machine's concern. Opt in with
+    // COCORE_ENGINE_BACKEND=openai; the default keeps the vllm-mlx path below
+    // unchanged so existing macOS installs are not affected.
+    if backend_is_openai() {
+        let configured: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return build_openai_engines(registry, configured);
     }
 
     // Resolve the venv interpreter once. The install script writes it
