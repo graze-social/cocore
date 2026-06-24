@@ -1942,6 +1942,55 @@ fn build_engines(
         }
     }
 
+    // WS-ENGINE (image): the native in-process MLX DIFFUSION engine. Same
+    // opt-in/feature-gated shape as the LLM native engine above; configure an
+    // image model id + its local snapshot dir and image generation runs
+    // entirely inside the measured binary (flips inProcessBackend true and
+    // makes the confidential tier reachable for image models). When set and
+    // loadable it is PREFERRED over the subprocess image engine for that id
+    // (registered here first; the configured loop below skips ids the registry
+    // already serves).
+    #[cfg(feature = "native_mlx")]
+    if let Ok(model) = std::env::var("COCORE_NATIVE_MLX_IMAGE_MODEL") {
+        use cocore_provider::engines::native_mlx_image::NativeMlxImageEngine;
+        use cocore_provider::engines::Engine;
+        // The weight-cache dir is optional: the in-process SD presets download
+        // to the default Hub cache when it's unset.
+        let dir = std::env::var("COCORE_NATIVE_MLX_IMAGE_MODEL_DIR").unwrap_or_default();
+        match NativeMlxImageEngine::load(&model, std::path::PathBuf::from(dir)) {
+            Ok(engine) if engine.ready() => {
+                tracing::info!(model = %model, "loaded native in-process MLX diffusion engine (confidential-capable)");
+                registry.register(model, std::sync::Arc::new(engine));
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    model = %model,
+                    "native MLX diffusion engine loaded but metallib not located; not registering (confidential image tier unavailable)"
+                );
+                native_fault = Some(EngineFault {
+                    code: "native-metallib-missing".to_string(),
+                    message: format!(
+                        "The confidential (in-process MLX) diffusion engine for `{model}` loaded \
+                         but its signed Metal kernel library couldn't be located, so it won't serve."
+                    ),
+                    models: vec![model.clone()],
+                    at: chrono::Utc::now(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, model = %model, "failed to load native MLX diffusion engine");
+                native_fault = Some(EngineFault {
+                    code: "native-load-failed".to_string(),
+                    message: format!(
+                        "The confidential (in-process MLX) diffusion engine couldn't load `{model}`: {e}"
+                    ),
+                    models: vec![model.clone()],
+                    at: chrono::Utc::now(),
+                });
+            }
+        }
+    }
+
     let raw = std::env::var("COCORE_INFERENCE_MODELS")
         .or_else(|_| std::env::var("COCORE_INFERENCE_MODEL"))
         .unwrap_or_default();
@@ -2076,6 +2125,13 @@ fn build_engines(
         // StubEngine registered above; never spawn a Python subprocess for
         // them even if an operator pins one explicitly.
         if cocore_provider::pricing::is_smoke_test_model(model) {
+            continue;
+        }
+        // A native in-process engine already registered for this id (the
+        // confidential diffusion or LLM engine) is PREFERRED — don't spawn a
+        // subprocess that would overwrite it.
+        if registry.for_model(model).is_some() {
+            tracing::info!(model = %model, "model already served by a native in-process engine; skipping subprocess");
             continue;
         }
         // Image-generation models load the diffusion subprocess engine

@@ -405,13 +405,18 @@ final class ModelManager: ObservableObject {
     /// can show a real weight footprint; results whose weights exceed the
     /// resource budget are sorted to the bottom (the UI disables them) rather
     /// than dropped. Empty on any error (the UI shows "no results").
-    nonisolated static func searchModels(_ query: String) async -> [CatalogResult] {
+    nonisolated static func searchModels(_ query: String, kind: ModelKind = .text) async -> [CatalogResult] {
         let q = query.trimmingCharacters(in: .whitespaces)
+        // Image models (FLUX/SDXL) aren't tagged `mlx` on HF and have their own
+        // pipeline tag — the agent serves them via mflux (subprocess) or the
+        // native SD engine, by repo id. Text models keep the `mlx` library
+        // filter so every hit is loadable by the vllm-mlx chat engine.
+        let filter = kind == .image ? "pipeline_tag=text-to-image" : "filter=mlx"
         guard !q.isEmpty,
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
             let url = URL(
                 string: "https://huggingface.co/api/models?search=\(encoded)"
-                    + "&filter=mlx&sort=downloads&direction=-1&limit=20")
+                    + "&\(filter)&sort=downloads&direction=-1&limit=20")
         else { return [] }
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
@@ -527,6 +532,38 @@ final class ModelManager: ObservableObject {
         if supported.contains(where: id.contains) { return .capable }
         return .unknown
     }
+
+    /// What a model produces — used by the "Add a model" Text/Image filter.
+    /// Mirrors the agent's `is_image_model` heuristic (provider/src/engines).
+    enum ModelKind: String, CaseIterable, Identifiable {
+        case text = "Text"
+        case image = "Image"
+        var id: String { rawValue }
+    }
+
+    /// Classify a model id by what it produces. Image markers stay in sync
+    /// with the Rust `IMAGE_MODEL_MARKERS` + the console `inferModelKind`.
+    static func kind(of nsid: String) -> ModelKind {
+        let id = nsid.lowercased()
+        let imageMarkers = [
+            "flux", "sdxl", "stable-diffusion", "stable_diffusion", "diffusion", "dall",
+            "midjourney", "imagen", "stub-flux", "sd-2", "sd2",
+        ]
+        return imageMarkers.contains(where: id.contains) ? .image : .text
+    }
+
+    /// Curated image-generation models for the "Add a model" Image tab. The
+    /// SDXL/SD entries are confidential-capable (in-process native MLX); the
+    /// FLUX entries serve on the best-effort subprocess path (mflux);
+    /// `stub-flux` is the zero-RAM smoke test. Mirrors the Rust `RATES` image
+    /// entries + `stub-flux`.
+    static let imageCatalog: [CatalogEntry] = [
+        CatalogEntry(nsid: "stub-flux", label: "Stub (image smoke test)", minRamGB: 0, recommended: false, blurb: "Emits a fixed 1×1 PNG — no GPU. Proves the image path end-to-end."),
+        CatalogEntry(nsid: "stabilityai/sdxl-turbo", label: "SDXL-Turbo", minRamGB: 12, recommended: true, blurb: "Fast 2-step image gen. Runs in the confidential engine."),
+        CatalogEntry(nsid: "stabilityai/stable-diffusion-2-1-base", label: "Stable Diffusion 2.1", minRamGB: 12, recommended: false, blurb: "Classic SD image gen. Confidential-capable."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-schnell", label: "FLUX.1 schnell", minRamGB: 16, recommended: true, blurb: "Fast 4-step FLUX (best-effort, via mflux)."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-dev", label: "FLUX.1 dev", minRamGB: 24, recommended: false, blurb: "Higher-quality FLUX (best-effort, via mflux)."),
+    ]
 
     /// The recommended (latest & greatest) subset of the catalog mirror.
     static var recommendedCatalog: [CatalogEntry] { catalog.filter { $0.recommended } }
@@ -996,6 +1033,9 @@ struct ModelsView: View {
     @State private var searchResults: [ModelManager.CatalogResult] = []
     @State private var searching = false
     @State private var searchTask: Task<Void, Never>?
+    /// Whether "Add a model" is browsing Text or Image models. Switches the HF
+    /// search query and the curated suggestions shown.
+    @State private var addKind: ModelManager.ModelKind = .text
     /// Live recommended set from the console (falls back to the mirror).
     /// Drives the "Latest" badges; loaded once on appear.
     @State private var recommendedNSIDs: Set<String> = Set(ModelManager.recommendedCatalog.map { $0.nsid })
@@ -1011,10 +1051,11 @@ struct ModelsView: View {
             return
         }
         searching = true
+        let kind = addKind
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
             if Task.isCancelled { return }
-            let results = await ModelManager.searchModels(query)
+            let results = await ModelManager.searchModels(query, kind: kind)
             if Task.isCancelled { return }
             searchResults = results
             searching = false
@@ -1143,6 +1184,16 @@ struct ModelsView: View {
             }
 
             Section {
+                // Text vs Image filter. Switches the HF search query and the
+                // curated suggestions below.
+                Picker("Kind", selection: $addKind) {
+                    ForEach(ModelManager.ModelKind.allCases) { k in
+                        Text(k.rawValue).tag(k)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
                 HStack(spacing: 8) {
                     // labelsHidden + prompt: a plain full-width search box with
                     // an in-field placeholder, not a Form label/value row (which
@@ -1150,7 +1201,10 @@ struct ModelsView: View {
                     // placeholder).
                     TextField(
                         "Search", text: $searchQuery,
-                        prompt: Text("Search HuggingFace for MLX models…")
+                        prompt: Text(
+                            addKind == .image
+                                ? "Search HuggingFace for image models…"
+                                : "Search HuggingFace for MLX models…")
                     )
                     .labelsHidden()
                     .textFieldStyle(.roundedBorder)
@@ -1158,11 +1212,13 @@ struct ModelsView: View {
                 }
 
                 if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                    // No query: the curated, device-fit suggestions. Already-added
-                    // models are dropped — they live in "Active models" above.
-                    let suggestions = ModelManager.catalogForDevice.filter {
-                        !manager.models.contains($0.nsid)
-                    }
+                    // No query: the curated, device-fit suggestions for the
+                    // selected kind. Already-added models are dropped — they live
+                    // in "Active models" above.
+                    let base = addKind == .image
+                        ? ModelManager.imageCatalog
+                        : ModelManager.catalogForDevice
+                    let suggestions = base.filter { !manager.models.contains($0.nsid) }
                     ForEach(suggestions, id: \.nsid) { catalogRow($0) }
                 } else if searchResults.isEmpty && !searching {
                     Text("No MLX models found for “\(searchQuery.trimmingCharacters(in: .whitespaces))”.")
@@ -1191,10 +1247,13 @@ struct ModelsView: View {
                 Text("Add a model")
             } footer: {
                 sectionFooter(
-                    "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential ✓” models can serve in the confidential engine (Qwen2/Qwen3/Llama/Gemma/Phi-class). A “Best-effort only” model (newer Qwen3.5+/Gemma4/Llama4 archs) runs in a helper the operator can read — choosing one means this machine can't offer confidential guarantees to requestors for it."
+                    addKind == .image
+                        ? "Search HuggingFace for image-generation models, or pick a suggestion. SDXL-Turbo / SD-2.1 run in the in-process confidential engine; FLUX runs best-effort via the mflux helper. `stub-flux` is a zero-RAM smoke test."
+                        : "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential ✓” models can serve in the confidential engine (Qwen2/Qwen3/Llama/Gemma/Phi-class). A “Best-effort only” model (newer Qwen3.5+/Gemma4/Llama4 archs) runs in a helper the operator can read — choosing one means this machine can't offer confidential guarantees to requestors for it."
                 )
             }
             .onChange(of: searchQuery) { query in runSearch(query) }
+            .onChange(of: addKind) { _ in runSearch(searchQuery) }
 
             if manager.busy || manager.error != nil || manager.loadStatus != nil {
                 Section {

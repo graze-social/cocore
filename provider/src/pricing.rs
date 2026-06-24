@@ -130,6 +130,30 @@ pub const RATES: &[ModelRate] = &[
         recommended: true,
         modality: Modality::Image,
     },
+    // In-process diffusion models for the confidential tier (native MLX /
+    // CoCoreMLX dylib). These are the two the MLX-Swift StableDiffusion library
+    // ships — they run entirely inside the measured binary, unlike the Flux
+    // entries above which serve on the best-effort subprocess path.
+    ModelRate {
+        model_id: "stabilityai/sdxl-turbo",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 12,
+        description: "SDXL-Turbo — fast 2-step image gen; confidential-capable",
+        recommended: true,
+        modality: Modality::Image,
+    },
+    ModelRate {
+        model_id: "stabilityai/stable-diffusion-2-1-base",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 12,
+        description: "Stable Diffusion 2.1 — image gen; confidential-capable",
+        recommended: false,
+        modality: Modality::Image,
+    },
     // ---- Current rotation (recommended) -------------------------------
     // The "latest & greatest" set the Secure Mode upgrade urges providers
     // to pin. min_ram_gb is the conservative MINIMUM machine RAM (4-bit

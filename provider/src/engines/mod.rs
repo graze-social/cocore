@@ -37,6 +37,8 @@ use std::sync::Arc;
 pub mod image_subprocess;
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
+#[cfg(feature = "native_mlx")]
+pub mod native_mlx_image;
 pub mod stub;
 pub mod subprocess;
 
