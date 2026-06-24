@@ -1201,19 +1201,6 @@ struct ModelsView: View {
 
             Section {
                 HStack(spacing: 8) {
-                    // Text vs Image filter as an inline dropdown sitting with the
-                    // search field. Switches the HF query + the curated
-                    // suggestions below. `.fixedSize` keeps it compact so the
-                    // search box takes the rest of the row.
-                    Picker("Kind", selection: $addKind) {
-                        ForEach(ModelManager.ModelKind.allCases) { k in
-                            Text(k.rawValue).tag(k)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .fixedSize()
-
                     // labelsHidden + prompt: a plain full-width search box with
                     // an in-field placeholder, not a Form label/value row (which
                     // would push the typed text to the right and wrap the
@@ -1228,6 +1215,28 @@ struct ModelsView: View {
                     .labelsHidden()
                     .textFieldStyle(.roundedBorder)
                     if searching { ProgressView().controlSize(.small) }
+
+                    // Text vs Image filter, sitting to the RIGHT of the search
+                    // field. Borderless menu + a rounded filled background so it
+                    // visually matches the rounded-border search box next to it.
+                    Picker("Kind", selection: $addKind) {
+                        ForEach(ModelManager.ModelKind.allCases) { k in
+                            Text(k.rawValue).tag(k)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
                 }
 
                 if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
