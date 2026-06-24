@@ -24,7 +24,11 @@ import { runTraced } from "@/lib/o11y.server.ts";
 import { restoreAtprotoSessionEffect } from "@/integrations/auth/atproto.server.ts";
 import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-session.server.ts";
 import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
-import { type DispatchInputs, runDispatch } from "@/lib/inference-dispatch.server.ts";
+import {
+  type DispatchInputs,
+  runDispatch,
+  runMultiImageDispatch,
+} from "@/lib/inference-dispatch.server.ts";
 import { listMyFriendDids } from "@/lib/friends.server.ts";
 import {
   buildJobInput,
@@ -374,21 +378,22 @@ async function resolveImagePool(
 }
 
 /** Run `n` image jobs and collect their slot results. Each slot is an
- *  independent job + receipt; the per-call ceiling is split across slots so
- *  total spend stays within DEFAULT_PRICE_CEILING. v1 runs slots
- *  sequentially against the same pool — Phase 11 swaps in cross-machine
- *  fan-out (one distinct machine per slot) here without changing callers. */
+ *  independent job + receipt. For `n === 1` it's a single dispatch; for
+ *  `n > 1` it delegates to {@link runMultiImageDispatch}, which fans the
+ *  slots out across DISTINCT provider machines (requester-side, no advisor
+ *  coordinator) and splits the price ceiling so total spend stays within
+ *  DEFAULT_PRICE_CEILING. */
 async function runImageSlots(base: DispatchInputs, n: number): Promise<ImageSlotResult[]> {
-  const perSlotAmount = Math.max(1, Math.floor(base.priceCeiling.amount / n));
-  const slots: ImageSlotResult[] = [];
-  for (let i = 0; i < n; i++) {
-    const inputs: DispatchInputs = {
-      ...base,
-      priceCeiling: { ...base.priceCeiling, amount: perSlotAmount },
-    };
-    slots.push(await collectImageDispatch(runDispatch(inputs)));
+  if (n === 1) {
+    return [await collectImageDispatch(runDispatch(base))];
   }
-  return slots;
+  const slots = await runMultiImageDispatch(base, n);
+  return slots.map((s) => ({
+    images: s.images,
+    receiptUri: s.receiptUri,
+    providerCredit: s.providerCredit,
+    error: s.error,
+  }));
 }
 
 /** Shape slot results into a response: 200 (full or partial success) when

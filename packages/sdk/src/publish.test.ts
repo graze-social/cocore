@@ -99,6 +99,31 @@ describe("publishJob", () => {
     expect(out.record.acceptedTrustLevel).toBe("self-attested");
     expect(out.record.nonce).toMatch(/^[0-9a-f]{32}$/);
     expect(t.calls[0]!.collection).toBe("dev.cocore.compute.job");
+    // Batch fields are omitted when not requested.
+    expect(out.record.batchId).toBeUndefined();
+    expect(out.record.outputIndex).toBeUndefined();
+    expect(out.record.outputCount).toBeUndefined();
+  });
+
+  it("stamps multi-output batch fields when provided", async () => {
+    const t = new CapturingTransport();
+    const out = await publishJob({
+      transport: t,
+      requesterDid: REQUESTER,
+      inputs: {
+        model: "stub-flux",
+        inputCommitment: "b".repeat(64),
+        maxTokensOut: 4,
+        priceCeiling: { amount: 100, currency: "CC" },
+        paymentAuthorization: { uri: "at://x/y/z", cid: "bafy" },
+        batchId: "0".repeat(32),
+        outputIndex: 0,
+        outputCount: 3,
+      },
+    });
+    expect(out.record.batchId).toBe("0".repeat(32));
+    expect(out.record.outputIndex).toBe(0);
+    expect(out.record.outputCount).toBe(3);
   });
 });
 

@@ -140,6 +140,14 @@ export interface PublishJobInputs {
   acceptedExchanges?: string[];
   paymentAuthorization: StrongRef;
   expiresAt?: string;
+  /** Multi-output batch linkage (e.g. an `n>1` image request fanned out
+   *  across machines). `batchId` is a lowercase-hex UUID shared by sibling
+   *  jobs; `outputIndex` is this job's 0-based slot; `outputCount` is the
+   *  total. Each sibling is still its own job + receipt — these are for
+   *  indexer/UX correlation only. */
+  batchId?: string;
+  outputIndex?: number;
+  outputCount?: number;
 }
 
 /** Build + publish a `dev.cocore.compute.paymentAuthorization` to the
@@ -194,6 +202,9 @@ export async function publishJob(args: {
     ...(args.inputs.inputCipherURL ? { inputCipherURL: args.inputs.inputCipherURL } : {}),
     ...(args.inputs.acceptedProviders ? { acceptedProviders: args.inputs.acceptedProviders } : {}),
     ...(args.inputs.acceptedExchanges ? { acceptedExchanges: args.inputs.acceptedExchanges } : {}),
+    ...(args.inputs.batchId ? { batchId: args.inputs.batchId } : {}),
+    ...(args.inputs.outputIndex !== undefined ? { outputIndex: args.inputs.outputIndex } : {}),
+    ...(args.inputs.outputCount !== undefined ? { outputCount: args.inputs.outputCount } : {}),
   };
   const out = await args.transport.publish({
     repo: args.requesterDid,
@@ -220,6 +231,10 @@ export interface SubmitJobInputs {
   priceCeiling: Money;
   exchangeDid: string;
   acceptedTrustLevel?: TrustLevel;
+  /** Multi-output batch linkage — see {@link PublishJobInputs}. */
+  batchId?: string;
+  outputIndex?: number;
+  outputCount?: number;
 }
 
 export interface SubmittedJob {
@@ -260,6 +275,9 @@ export async function submitJob(args: {
       acceptedTrustLevel: args.inputs.acceptedTrustLevel,
       acceptedExchanges: [args.inputs.exchangeDid],
       paymentAuthorization: authorization.ref,
+      ...(args.inputs.batchId ? { batchId: args.inputs.batchId } : {}),
+      ...(args.inputs.outputIndex !== undefined ? { outputIndex: args.inputs.outputIndex } : {}),
+      ...(args.inputs.outputCount !== undefined ? { outputCount: args.inputs.outputCount } : {}),
     },
   });
   return { authorization, job };

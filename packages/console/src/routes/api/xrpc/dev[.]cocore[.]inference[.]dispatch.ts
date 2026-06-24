@@ -29,8 +29,10 @@ import {
   forwardDispatch,
   isDispatchForwardConfigured,
 } from "@/lib/inference-dispatch-forward.server.ts";
-import { runDispatch } from "@/lib/inference-dispatch.server.ts";
+import { runDispatch, runMultiImageDispatch } from "@/lib/inference-dispatch.server.ts";
 import { getAtprotoSessionForRequest } from "@/middleware/auth.server.ts";
+
+const MAX_OUTPUT_COUNT = 4;
 
 interface DispatchBody {
   model?: unknown;
@@ -42,6 +44,8 @@ interface DispatchBody {
   maxTokensOut?: unknown;
   priceCeiling?: unknown;
   targetProviderDid?: unknown;
+  /** Number of outputs (image models). >1 fans out across machines. */
+  outputCount?: unknown;
 }
 
 interface ParsedDispatch {
@@ -52,6 +56,7 @@ interface ParsedDispatch {
   maxTokensOut: number;
   priceCeiling: { amount: number; currency: string };
   targetProviderDid?: string;
+  outputCount?: number;
 }
 
 function parseDispatch(body: DispatchBody): ParsedDispatch | string {
@@ -78,6 +83,18 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   if (body.targetProviderDid !== undefined && typeof body.targetProviderDid !== "string") {
     return "targetProviderDid must be a string when provided";
   }
+  let outputCount: number | undefined;
+  if (body.outputCount !== undefined) {
+    if (
+      typeof body.outputCount !== "number" ||
+      !Number.isInteger(body.outputCount) ||
+      body.outputCount < 1 ||
+      body.outputCount > MAX_OUTPUT_COUNT
+    ) {
+      return `outputCount must be an integer between 1 and ${MAX_OUTPUT_COUNT}`;
+    }
+    outputCount = body.outputCount;
+  }
   // `messages` is optional; only validated (and only matters) when images
   // ride along. An explicitly-present-but-malformed value is a 400.
   let messages: EnvelopeMessage[] | undefined;
@@ -95,6 +112,7 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     ...(typeof body.targetProviderDid === "string"
       ? { targetProviderDid: body.targetProviderDid }
       : {}),
+    ...(outputCount !== undefined ? { outputCount } : {}),
   };
 }
 
@@ -136,16 +154,80 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
 
         // Local in-process core: seal the canonical multimodal envelope when
         // images are present, else the flattened prompt.
-        const { messages, ...textInputs } = parsed;
+        const { messages, outputCount, ...textInputs } = parsed;
         const envelope = messages
           ? { payloadBytes: buildEnvelopeBytes(messages), inputFormat: MESSAGES_V1 }
           : {};
-        const events = runDispatch({
+        const baseInputs = {
           did: session.did,
           oauthSession: session.oauthSession,
           ...textInputs,
           ...envelope,
-        });
+        };
+
+        // Multi-output (image) fan-out: run distinct-machine slots, then emit
+        // each image as an indexed chunk + one aggregate complete. The client
+        // (chat-dispatch) already accumulates multiple image chunks per turn.
+        if (outputCount && outputCount > 1) {
+          const stream = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              try {
+                const slots = await runMultiImageDispatch(baseInputs, outputCount);
+                let seq = 0;
+                let tokensIn = 0;
+                let tokensOut = 0;
+                const receiptUris: string[] = [];
+                for (const slot of slots) {
+                  for (const img of slot.images) {
+                    controller.enqueue(
+                      sseFrame(
+                        "chunk",
+                        JSON.stringify({
+                          seq: seq++,
+                          channel: "image",
+                          index: slot.index,
+                          mime: img.mime,
+                          data: img.data,
+                        }),
+                      ),
+                    );
+                  }
+                  if (slot.receiptUri) receiptUris.push(slot.receiptUri);
+                }
+                const partial = slots.some((s) => s.error) && receiptUris.length > 0;
+                controller.enqueue(
+                  sseFrame(
+                    "complete",
+                    JSON.stringify({
+                      tokensIn,
+                      tokensOut,
+                      receiptUri: receiptUris[0] ?? "",
+                      receiptUris,
+                      outputFormat: "images-v1",
+                      ...(partial ? { partial: true } : {}),
+                    }),
+                  ),
+                );
+              } catch (e) {
+                controller.enqueue(
+                  sseFrame("error", JSON.stringify({ reason: (e as Error).message, code: "unknown" })),
+                );
+              } finally {
+                controller.close();
+              }
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache, no-transform",
+              "x-accel-buffering": "no",
+            },
+          });
+        }
+
+        const events = runDispatch(baseInputs);
 
         const stream = new ReadableStream<Uint8Array>({
           async start(controller) {

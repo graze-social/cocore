@@ -28,6 +28,9 @@ export interface ChatDispatchInputs {
    *  envelope) instead of the flattened prompt. */
   images?: ChatDispatchImage[];
   maxTokensOut: number;
+  /** Number of outputs to request (image models). 1 by default; >1 fans the
+   *  request out across distinct provider machines server-side. */
+  outputCount?: number;
   targetProviderDid?: string | null;
   signal?: AbortSignal;
   onMeta?: (meta: { providerDid: string; jobUri: string }) => void;
@@ -146,6 +149,7 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
       ...(messages ? { messages } : {}),
       maxTokensOut: inputs.maxTokensOut,
       priceCeiling: PRICE_CEILING,
+      ...(inputs.outputCount && inputs.outputCount > 1 ? { outputCount: inputs.outputCount } : {}),
       ...(inputs.targetProviderDid ? { targetProviderDid: inputs.targetProviderDid } : {}),
     }),
     ...(inputs.signal ? { signal: inputs.signal } : {}),

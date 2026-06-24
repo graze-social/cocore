@@ -1297,6 +1297,9 @@ export function ChatPage(): ReactElement {
   // no longer holds them — then we show a "had image" indicator.
   const [msgImages, setMsgImages] = useState<Record<string, string[] | "lost">>({});
   const [streamingId, setStreamingId] = useState<string | null>(null);
+  // How many images to request for an image model (1–4). Fans out across
+  // distinct provider machines server-side when >1.
+  const [imageCount, setImageCount] = useState<number>(1);
 
   // Settings for the not-yet-created session shown by "new chat".
   const [draftModelId, setDraftModelId] = useState<string | null>(null);
@@ -1622,6 +1625,7 @@ export function ChatPage(): ReactElement {
         prompt: flattenTranscript(transcript),
         ...(turnImages.length > 0 ? { transcript, images: turnImages } : {}),
         maxTokensOut,
+        ...(modelIsImage && imageCount > 1 ? { outputCount: imageCount } : {}),
         targetProviderDid,
         signal: abort.signal,
         onMeta: (meta) => {
@@ -2066,6 +2070,22 @@ export function ChatPage(): ReactElement {
                     onMaxTokens={setMaxTokens}
                   />
                 </div>
+                {modelIsImage ? (
+                  <label {...stylex.props(styles.rateNote)}>
+                    images{" "}
+                    <select
+                      value={imageCount}
+                      onChange={(e) => setImageCount(Number(e.target.value))}
+                      aria-label="number of images to generate"
+                    >
+                      {[1, 2, 3, 4].map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
                 <span {...stylex.props(styles.rateNote)}>
                   {balance ? `${formatTokensCompact(balance.balance)} tok left · ` : ""}
                   billed per generated token

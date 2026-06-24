@@ -55,6 +55,13 @@ export interface DispatchInputs {
   maxTokensOut: number;
   priceCeiling: { amount: number; currency: string };
   targetProviderDid?: string;
+  /** Pin to one SPECIFIC machine under `targetProviderDid` (the
+   *  provider-record rkey). Used by the multi-image fan-out. */
+  targetMachineId?: string;
+  /** Multi-output batch linkage stamped onto the job record. */
+  batchId?: string;
+  outputIndex?: number;
+  outputCount?: number;
 }
 
 /** The slice of a provider's indexed profile the credit line needs.
@@ -141,7 +148,7 @@ export type DispatchErrorCode =
 
 /** Who ran a job, resolved from the provider's AppView footprint, so a
  *  response can credit the human + machine behind a completion. */
-interface ProviderCredit {
+export interface ProviderCredit {
   did: string;
   handle: string | null;
   displayName: string | null;
@@ -291,13 +298,19 @@ async function pickProvider(
    *  failover lands on a DIFFERENT machine. Never applied to an explicit
    *  `targetDid` — a pinned provider is the user's choice. */
   excludeDids: Set<string> | undefined,
+  /** Pin to one specific machine (rkey) under `targetDid` — multi-image
+   *  fan-out so each slot lands on a distinct machine. */
+  targetMachineId?: string,
 ): Promise<AdvisorProviderRow> {
   const list = await fetchProviders(advisorUrl);
   const attested = list.filter((p) => p.attestedAt);
   if (attested.length === 0) throw new NoProvidersConnectedError();
 
   if (targetDid) {
-    const hit = attested.find((p) => p.did === targetDid);
+    const hit = targetMachineId
+      ? (attested.find((p) => p.did === targetDid && p.machineId === targetMachineId) ??
+        attested.find((p) => p.did === targetDid))
+      : attested.find((p) => p.did === targetDid);
     if (!hit) throw new TargetProviderNotConnectedError(targetDid);
     const targetPasses = filterByPayoutsEligibility([hit], options).length > 0;
     if (!targetPasses) throw new ProviderPayoutsNotEligibleError(targetDid);
@@ -319,6 +332,100 @@ async function pickProvider(
   }
   eligible.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
   return eligible[0]!;
+}
+
+/** One distinct provider machine serving a model. */
+export interface ModelMachine {
+  did: string;
+  machineId?: string;
+}
+
+function machineKey(m: ModelMachine): string {
+  return `${m.did} ${m.machineId ?? ""}`;
+}
+
+/** Distinct attested machines serving `model`, freshest-first. Mirrors the
+ *  console helper of the same name; used by the multi-image fan-out. */
+export async function listModelMachines(
+  advisorUrl: string,
+  model: string,
+): Promise<ModelMachine[]> {
+  const list = await fetchProviders(advisorUrl);
+  let rows = list.filter((p) => p.attestedAt);
+  rows = rows.filter((p) => p.supportedModels.length === 0 || p.supportedModels.includes(model));
+  rows.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+  const seen = new Set<string>();
+  const out: ModelMachine[] = [];
+  for (const p of rows) {
+    const m: ModelMachine = { did: p.did, ...(p.machineId ? { machineId: p.machineId } : {}) };
+    const k = machineKey(m);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(m);
+  }
+  return out;
+}
+
+/** One image slot's collected outcome from {@link runMultiImageDispatch}. */
+export interface ImageDispatchSlot {
+  index: number;
+  images: { mime: string; data: string }[];
+  receiptUri: string | null;
+  providerCredit?: ProviderCredit;
+  error?: DispatchErrorCode;
+}
+
+/** Requester-side multi-image orchestrator (cocore invariant #5). Runs
+ *  `outputCount` independent image jobs, each pinned to a DISTINCT machine
+ *  when the pool allows, sharing one `batchId` and splitting the ceiling.
+ *  Mirrors the console implementation. */
+export async function runMultiImageDispatch(
+  base: DispatchInputs,
+  deps: DispatchDeps,
+  outputCount: number,
+): Promise<ImageDispatchSlot[]> {
+  const machines = await listModelMachines(deps.advisorUrl, base.model);
+  if (machines.length === 0) {
+    return Array.from({ length: outputCount }, (_unused, index) => ({
+      index,
+      images: [],
+      receiptUri: null,
+      error: "no-providers-for-model" as DispatchErrorCode,
+    }));
+  }
+  const batchId = randomBatchId();
+  const perSlotAmount = Math.max(1, Math.floor(base.priceCeiling.amount / outputCount));
+  const slotPromises = Array.from({ length: outputCount }, async (_unused, index) => {
+    const machine = machines[index % machines.length]!;
+    const inputs: DispatchInputs = {
+      ...base,
+      targetProviderDid: machine.did,
+      ...(machine.machineId ? { targetMachineId: machine.machineId } : {}),
+      batchId,
+      outputIndex: index,
+      outputCount,
+      priceCeiling: { ...base.priceCeiling, amount: perSlotAmount },
+    };
+    const slot: ImageDispatchSlot = { index, images: [], receiptUri: null };
+    for await (const ev of runDispatch(inputs, deps)) {
+      if (ev.kind === "chunk") {
+        if (ev.channel === "image") slot.images.push({ mime: ev.mime, data: ev.data });
+      } else if (ev.kind === "complete") {
+        slot.receiptUri = ev.receiptUri || null;
+        slot.providerCredit = ev.providerCredit;
+      } else if (ev.kind === "error") {
+        slot.error = ev.code;
+      }
+    }
+    return slot;
+  });
+  return Promise.all(slotPromises);
+}
+
+function randomBatchId(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 function decodeBase64(s: string): Uint8Array {
@@ -430,6 +537,9 @@ export async function* runDispatch(
         maxTokensOut: input.maxTokensOut,
         priceCeiling: input.priceCeiling,
         exchangeDid: deps.exchangeDid,
+        ...(input.batchId ? { batchId: input.batchId } : {}),
+        ...(input.outputIndex !== undefined ? { outputIndex: input.outputIndex } : {}),
+        ...(input.outputCount !== undefined ? { outputCount: input.outputCount } : {}),
       },
     });
   } catch (e) {
@@ -467,6 +577,7 @@ export async function* runDispatch(
         input.targetProviderDid,
         { payoutsEligibleDids: null, selfLoopExempt: null },
         excludeDids,
+        input.targetMachineId,
       );
     } catch (e) {
       // First attempt: the genuine "nothing matches" diagnostic. A later
@@ -519,6 +630,7 @@ export async function* runDispatch(
         ...(input.inputFormat ? { inputFormat: input.inputFormat } : {}),
         sessionId,
         targetProviderDid: candidate.did,
+        ...(candidate.machineId ? { targetMachineId: candidate.machineId } : {}),
       }),
     });
 

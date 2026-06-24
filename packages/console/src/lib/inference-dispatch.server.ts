@@ -49,6 +49,16 @@ export interface DispatchInputs {
   maxTokensOut: number;
   priceCeiling: { amount: number; currency: string };
   targetProviderDid?: string;
+  /** Pin dispatch to one SPECIFIC machine under `targetProviderDid` (the
+   *  provider-record rkey). Used by the multi-image fan-out so each slot
+   *  lands on a distinct machine. Requires `targetProviderDid`. */
+  targetMachineId?: string;
+  /** Multi-output batch linkage stamped onto the published job record
+   *  (e.g. an `n>1` image request). See the lexicon `dev.cocore.compute.job`
+   *  batch fields — for indexer/UX correlation only. */
+  batchId?: string;
+  outputIndex?: number;
+  outputCount?: number;
   /** OAuth session to publish records under. Required — every
    *  authoritative record must hit the user's PDS. */
   oauthSession: OAuthSession;
@@ -347,6 +357,10 @@ async function pickProvider(
    *  DIFFERENT machine. Never applied to an explicit `targetDid` — a
    *  pinned provider is the user's choice, not ours to reroute. */
   excludeDids?: Set<string>,
+  /** Pin to one specific machine (provider-record rkey) under `targetDid`.
+   *  Used by multi-image fan-out so each slot lands on a distinct machine.
+   *  Only honored together with `targetDid`. */
+  targetMachineId?: string,
 ): Promise<AdvisorProviderRow> {
   const r = await fetch(`${advisorUrl}/providers`);
   if (!r.ok) throw new Error(`advisor /providers ${r.status}`);
@@ -355,7 +369,12 @@ async function pickProvider(
   if (attested.length === 0) throw new NoProvidersConnectedError();
 
   if (targetDid) {
-    const hit = attested.find((p) => p.did === targetDid);
+    // When a machine is pinned too, match the exact (did, machineId) row;
+    // otherwise fall back to the first row for the DID.
+    const hit = targetMachineId
+      ? (attested.find((p) => p.did === targetDid && p.machineId === targetMachineId) ??
+        attested.find((p) => p.did === targetDid))
+      : attested.find((p) => p.did === targetDid);
     if (!hit) throw new TargetProviderNotConnectedError(targetDid);
     // Hard refusal on explicit target: surface why before the user
     // submits the (now doomed) job. We don't auto-fall-back to
@@ -414,6 +433,128 @@ async function pickProvider(
   }
   eligible.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
   return eligible[0]!;
+}
+
+/** One distinct provider machine that serves a model — the unit the
+ *  multi-image fan-out spreads slots across. */
+export interface ModelMachine {
+  did: string;
+  machineId?: string;
+}
+
+/** Composite machine key matching the advisor registry's exclude key
+ *  (`${did}\0${machineId}`). Distinguishes two machines under one DID. */
+export function machineKey(m: ModelMachine): string {
+  return `${m.did} ${m.machineId ?? ""}`;
+}
+
+/** Enumerate the DISTINCT, attested machines currently serving `model`,
+ *  freshest-first. Used by the multi-image orchestrator to pin each output
+ *  slot to a different machine. `allowedDids` constrains to a friend set
+ *  (undefined = open network). Pure-ish: one advisor `/providers` read. */
+export async function listModelMachines(
+  advisorUrl: string,
+  model: string,
+  allowedDids?: Set<string>,
+): Promise<ModelMachine[]> {
+  const r = await fetch(`${advisorUrl}/providers`);
+  if (!r.ok) throw new Error(`advisor /providers ${r.status}`);
+  const list = (await r.json()) as AdvisorProviderRow[];
+  let rows = list.filter((p) => p.attestedAt);
+  if (allowedDids !== undefined) rows = rows.filter((p) => allowedDids.has(p.did));
+  rows = rows.filter((p) => p.supportedModels.length === 0 || p.supportedModels.includes(model));
+  rows.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+  // Dedupe by composite (did, machineId) key, preserving freshest-first.
+  const seen = new Set<string>();
+  const out: ModelMachine[] = [];
+  for (const p of rows) {
+    const m: ModelMachine = { did: p.did, ...(p.machineId ? { machineId: p.machineId } : {}) };
+    const k = machineKey(m);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(m);
+  }
+  return out;
+}
+
+/** One image slot's collected outcome from {@link runMultiImageDispatch}. */
+export interface ImageDispatchSlot {
+  index: number;
+  images: { mime: string; data: string }[];
+  receiptUri: string | null;
+  providerCredit?: ProviderCredit;
+  error?: DispatchErrorCode;
+}
+
+/** Requester-side multi-image orchestrator (cocore invariant #5: no advisor
+ *  coordinator — the requester fans out). Runs `outputCount` independent
+ *  image jobs, each pinned to a DISTINCT provider machine when the pool
+ *  allows, sharing one `batchId` and splitting the price ceiling. Returns
+ *  one slot per output (its own job + receipt). Falls back to reusing
+ *  machines when fewer than `outputCount` exist; hard-fails only when zero
+ *  machines serve the model. Runs slots concurrently.
+ *
+ *  `n === 1` callers should use {@link runDispatch} directly — this exists
+ *  for the `n > 1` path. */
+export async function runMultiImageDispatch(
+  base: DispatchInputs,
+  outputCount: number,
+): Promise<ImageDispatchSlot[]> {
+  const config = cocoreConfig();
+  // Honor an explicit pin: a caller that named a DID fans out across THAT
+  // DID's machines only, never crossing to others.
+  const allowed = base.targetProviderDid
+    ? new Set([base.targetProviderDid])
+    : base.allowedProviderDids;
+  const machines = await listModelMachines(config.advisorUrl, base.model, allowed);
+  if (machines.length === 0) {
+    // No machine serves the model — surface a single not-found-style slot
+    // error rather than publishing doomed jobs.
+    return Array.from({ length: outputCount }, (_, index) => ({
+      index,
+      images: [],
+      receiptUri: null,
+      error: "no-providers-for-model" as DispatchErrorCode,
+    }));
+  }
+
+  const batchId = randomBatchId();
+  const perSlotAmount = Math.max(1, Math.floor(base.priceCeiling.amount / outputCount));
+
+  const slotPromises = Array.from({ length: outputCount }, async (_unused, index) => {
+    // Round-robin across distinct machines; when fewer machines than slots
+    // exist this reuses them (the documented pool-exhaustion fallback).
+    const machine = machines[index % machines.length]!;
+    const inputs: DispatchInputs = {
+      ...base,
+      targetProviderDid: machine.did,
+      ...(machine.machineId ? { targetMachineId: machine.machineId } : {}),
+      batchId,
+      outputIndex: index,
+      outputCount,
+      priceCeiling: { ...base.priceCeiling, amount: perSlotAmount },
+    };
+    const slot: ImageDispatchSlot = { index, images: [], receiptUri: null };
+    for await (const ev of runDispatch(inputs)) {
+      if (ev.kind === "chunk") {
+        if (ev.channel === "image") slot.images.push({ mime: ev.mime, data: ev.data });
+      } else if (ev.kind === "complete") {
+        slot.receiptUri = ev.receiptUri || null;
+        slot.providerCredit = ev.providerCredit;
+      } else if (ev.kind === "error") {
+        slot.error = ev.code;
+      }
+    }
+    return slot;
+  });
+  return Promise.all(slotPromises);
+}
+
+/** 16 random bytes, lowercase hex — the job record's `batchId` shape. */
+function randomBatchId(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 function decodeBase64(s: string): Uint8Array {
@@ -543,6 +684,9 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         maxTokensOut: input.maxTokensOut,
         priceCeiling: input.priceCeiling,
         exchangeDid: config.exchangeDid,
+        ...(input.batchId ? { batchId: input.batchId } : {}),
+        ...(input.outputIndex !== undefined ? { outputIndex: input.outputIndex } : {}),
+        ...(input.outputCount !== undefined ? { outputCount: input.outputCount } : {}),
       },
     });
   } catch (e) {
@@ -600,6 +744,7 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         { payoutsEligibleDids: null, selfLoopExempt: null },
         input.targetProviderDid ? undefined : input.allowedProviderDids,
         excludeDids,
+        input.targetMachineId,
       );
     } catch (e) {
       // On the first attempt this is the genuine "nothing matches"
@@ -656,6 +801,9 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         ...(input.inputFormat ? { inputFormat: input.inputFormat } : {}),
         sessionId,
         targetProviderDid: candidate.did,
+        // Pin the exact machine when the row carries an id — the multi-image
+        // fan-out relies on each slot landing on its chosen machine.
+        ...(candidate.machineId ? { targetMachineId: candidate.machineId } : {}),
       }),
     });
 
