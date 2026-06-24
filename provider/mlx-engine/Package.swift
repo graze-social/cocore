@@ -25,6 +25,13 @@ let package = Package(
         // swift-transformers transitively. Pinned to a release for
         // reproducibility (the known-good set depends on a stable build).
         .package(url: "https://github.com/ml-explore/mlx-swift-examples", from: "2.21.0"),
+        // Direct deps so the diffusion engine can `import MLX` (eval/MLXArray)
+        // and `import Hub` (HubApi). Constraints match mlx-swift-examples' own
+        // so the resolved version graph is shared (single MLX build).
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers",
+            .upToNextMinor(from: "1.0.0")),
     ],
     targets: [
         .target(
@@ -33,6 +40,12 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-examples"),
                 .product(name: "MLXVLM", package: "mlx-swift-examples"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-examples"),
+                // In-process diffusion (image generation) — SDXL-Turbo / SD-2.1.
+                // The confidential image engine (DiffusionEngine.swift) runs this
+                // entirely inside the measured binary.
+                .product(name: "StableDiffusion", package: "mlx-swift-examples"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/CoCoreMLX",
             publicHeadersPath: "include"

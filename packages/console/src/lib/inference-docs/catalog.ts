@@ -33,6 +33,12 @@ const CHAT_BODY = {
   max_tokens: 256,
 };
 
+const IMAGE_GEN_BODY = {
+  model: "stub-flux",
+  prompt: "a watercolor fox",
+  n: 1,
+};
+
 export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
   {
     id: "inference-api-chat-completions",
@@ -141,6 +147,93 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
       { kind: "text", param: "max_tokens", label: "max_tokens", placeholder: "256" },
     ],
     example: { body: CHAT_BODY, canRun: false },
+  },
+  {
+    id: "inference-api-images-generations",
+    navLabel: "images/generations",
+    method: "POST",
+    path: "/images/generations",
+    description:
+      'OpenAI-compatible text-to-image. Routes to an attested provider serving the requested image model. Returns inline base64 only (response_format "b64_json"); "url" is rejected. n (1–4) fans out one job + receipt per image. The provider/machine that served each image is named in x_cocore.',
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "prompt", type: "string", required: true },
+      { name: "n", type: "integer" },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "stub-flux" },
+      { kind: "text", param: "prompt", label: "prompt", placeholder: "a watercolor fox" },
+      { kind: "text", param: "n", label: "n", placeholder: "1" },
+    ],
+    example: { body: IMAGE_GEN_BODY, canRun: false },
+  },
+  {
+    id: "inference-api-images-edits",
+    navLabel: "images/edits",
+    method: "POST",
+    path: "/images/edits",
+    description:
+      "OpenAI-compatible image edit (img2img). multipart/form-data with model, prompt, image (the reference), and n. The reference image is sealed into a messages-v1 envelope alongside the prompt. Returns inline base64 only.",
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "prompt", type: "string", required: true },
+      { name: "image", type: "file", required: true },
+      { name: "n", type: "integer" },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "stub-flux" },
+      { kind: "text", param: "prompt", label: "prompt", placeholder: "make it a watercolor" },
+    ],
+    example: { body: { model: "stub-flux", prompt: "make it a watercolor" }, canRun: false },
+  },
+  {
+    id: "inference-api-private-images-generations",
+    navLabel: "private/images/generations",
+    method: "POST",
+    path: "/private/images/generations",
+    description:
+      "Same request shape as images/generations, but routing is limited to providers run by DIDs on your friends list.",
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "prompt", type: "string", required: true },
+      { name: "n", type: "integer" },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "stub-flux" },
+      { kind: "text", param: "prompt", label: "prompt", placeholder: "a watercolor fox" },
+      { kind: "text", param: "n", label: "n", placeholder: "1" },
+    ],
+    example: { body: IMAGE_GEN_BODY, canRun: false },
+  },
+  {
+    id: "inference-api-verified-images-generations",
+    navLabel: "verified/images/generations",
+    method: "POST",
+    path: "/verified/images/generations",
+    description:
+      'Same request shape as images/generations, but routing is limited to providers whose attestation is cryptographically verified. Set min_trust to "hardware-attested" (default) or "confidential". Fails closed with no_verified_providers when none qualify.',
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "prompt", type: "string", required: true },
+      { name: "min_trust", type: "string" },
+      { name: "n", type: "integer" },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "stub-flux" },
+      { kind: "text", param: "prompt", label: "prompt", placeholder: "a watercolor fox" },
+      {
+        kind: "text",
+        param: "min_trust",
+        label: "min_trust",
+        placeholder: "hardware-attested",
+      },
+      { kind: "text", param: "n", label: "n", placeholder: "1" },
+    ],
+    example: { body: IMAGE_GEN_BODY, canRun: false },
   },
 ];
 

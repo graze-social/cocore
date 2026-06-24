@@ -291,6 +291,19 @@ if [[ "$COCORE_SIGN_ID" == "-" ]]; then
   [[ "$COCORE_BUILD_APNS" == "1" ]] && die "COCORE_BUILD_APNS=1 needs a Developer ID identity (the confidential worker can't be ad-hoc signed). Install a Developer ID cert or unset COCORE_BUILD_APNS."
   bold "==> ad-hoc codesign (no Developer ID identity)"
   note "Gatekeeper will warn on other Macs; install a Developer ID cert for distribution."
+  # Native build: sign the nested code objects (the engine dylib + the
+  # mlx.metallib, which `codesign` treats as nested code) explicitly FIRST.
+  # The deep app sign below can otherwise fail with "code object is not signed
+  # at all / In subcomponent mlx.metallib". No hardened-runtime/library-
+  # validation flags here — this is a best-effort ad-hoc build (the confidential
+  # tier needs Developer ID + library validation, handled in the else branch).
+  if [[ "$COCORE_BUILD_NATIVE" == "1" ]]; then
+    codesign --force --sign - "$APP/Contents/MacOS/libCoCoreMLX.dylib" 2>&1 | sed 's/^/  /' \
+      || die "codesign (libCoCoreMLX.dylib, ad-hoc) failed"
+    codesign --force --sign - "$APP/Contents/MacOS/mlx.metallib" 2>&1 | sed 's/^/  /' \
+      || die "codesign (mlx.metallib, ad-hoc) failed"
+    note "signed native MLX engine dylib + metallib (ad-hoc)"
+  fi
   codesign --force --deep --sign - "$APP" 2>&1 | sed 's/^/  /' || die "codesign failed"
   note "signed (ad-hoc)"
 else

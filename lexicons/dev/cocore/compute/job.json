@@ -41,6 +41,28 @@
             "format": "uri",
             "description": "Optional URL where the encrypted prompt blob can be fetched. May be a PDS blob (at://...) or any other content-addressed URL. The commitment is what matters; this is a convenience pointer."
           },
+          "outputFormat": {
+            "type": "string",
+            "knownValues": ["text", "images-v1"],
+            "description": "Optional requester hint for the output shape the job expects. Absent/`text`: the requester expects a UTF-8 answer (current behavior). `images-v1`: the requester expects the provider's receipt outputCommitment to cover a canonical images envelope (see dev.cocore.compute.receipt#main outputFormat). Purely a hint so providers that don't understand the requested output format reject the job rather than mis-serving it; the receipt's outputFormat is authoritative for what was actually produced."
+          },
+          "batchId": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 32,
+            "description": "Optional lowercase hex UUID (16 bytes) tying sibling jobs that originate from one user request — e.g. a multi-image request fanned out across distinct provider machines. Each sibling still gets its OWN job + receipt (a receipt strong-refs exactly one job); batchId is for indexers/UX correlation only, never authoritative for settlement."
+          },
+          "outputIndex": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional 0-based index of this job within its batch (see batchId). Present only on batched jobs."
+          },
+          "outputCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4,
+            "description": "Optional total number of sibling outputs requested in the batch (see batchId). Same value on every sibling. Present only on batched jobs."
+          },
           "maxTokensOut": {
             "type": "integer",
             "minimum": 1,

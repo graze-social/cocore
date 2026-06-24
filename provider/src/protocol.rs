@@ -271,6 +271,11 @@ pub enum ChunkChannel {
     #[default]
     Content,
     Reasoning,
+    /// A generated-image chunk. The sealed plaintext is the canonical JSON
+    /// part `{ "data": "<base64>", "mime": "image/png", "type": "image" }`
+    /// for one image. Emitted by image-generation models; absent on the
+    /// wire for every text/reasoning chunk, so it stays additive.
+    Image,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,5 +375,21 @@ mod tests {
         // And it round-trips back.
         let back: InferenceChunk = serde_json::from_str(&s).unwrap();
         assert_eq!(back.channel, ChunkChannel::Reasoning);
+    }
+
+    #[test]
+    fn image_channel_serializes_and_round_trips() {
+        // The image channel is additive: it's emitted on the wire (it's not
+        // the default) and deserializes back to the same variant.
+        let img = InferenceChunk {
+            session_id: "s".into(),
+            seq: 3,
+            channel: ChunkChannel::Image,
+            ciphertext: vec![9],
+        };
+        let s = serde_json::to_string(&img).unwrap();
+        assert!(s.contains("\"channel\":\"image\""), "got: {s}");
+        let back: InferenceChunk = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.channel, ChunkChannel::Image);
     }
 }

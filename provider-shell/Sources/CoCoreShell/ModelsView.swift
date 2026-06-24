@@ -405,13 +405,18 @@ final class ModelManager: ObservableObject {
     /// can show a real weight footprint; results whose weights exceed the
     /// resource budget are sorted to the bottom (the UI disables them) rather
     /// than dropped. Empty on any error (the UI shows "no results").
-    nonisolated static func searchModels(_ query: String) async -> [CatalogResult] {
+    nonisolated static func searchModels(_ query: String, kind: ModelKind = .text) async -> [CatalogResult] {
         let q = query.trimmingCharacters(in: .whitespaces)
+        // Image models (FLUX/SDXL) aren't tagged `mlx` on HF and have their own
+        // pipeline tag — the agent serves them via mflux (subprocess) or the
+        // native SD engine, by repo id. Text models keep the `mlx` library
+        // filter so every hit is loadable by the vllm-mlx chat engine.
+        let filter = kind == .image ? "pipeline_tag=text-to-image" : "filter=mlx"
         guard !q.isEmpty,
             let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
             let url = URL(
                 string: "https://huggingface.co/api/models?search=\(encoded)"
-                    + "&filter=mlx&sort=downloads&direction=-1&limit=20")
+                    + "&\(filter)&sort=downloads&direction=-1&limit=20")
         else { return [] }
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
@@ -526,6 +531,56 @@ final class ModelManager: ObservableObject {
         ]
         if supported.contains(where: id.contains) { return .capable }
         return .unknown
+    }
+
+    /// What a model produces — used by the "Add a model" Text/Image filter.
+    /// Mirrors the agent's `is_image_model` heuristic (provider/src/engines).
+    enum ModelKind: String, CaseIterable, Identifiable {
+        case text = "Text"
+        case image = "Image"
+        var id: String { rawValue }
+    }
+
+    /// Classify a model id by what it produces. Image markers stay in sync
+    /// with the Rust `IMAGE_MODEL_MARKERS` + the console `inferModelKind`.
+    nonisolated static func kind(of nsid: String) -> ModelKind {
+        let id = nsid.lowercased()
+        let imageMarkers = [
+            "flux", "sdxl", "stable-diffusion", "stable_diffusion", "diffusion", "dall",
+            "midjourney", "imagen", "stub-flux", "sd-2", "sd2",
+        ]
+        return imageMarkers.contains(where: id.contains) ? .image : .text
+    }
+
+    /// Curated image-generation models for the "Add a model" Image tab. Each
+    /// runs on a specific framework, which decides where it can serve:
+    ///   * `stub-flux`  — StubEngine (always; zero RAM smoke test).
+    ///   * FLUX         — the mflux subprocess (any build).
+    ///   * SDXL / SD-2.1 — the in-process native-MLX diffusion engine. This
+    ///     runs whenever the build ships the native worker (the standard app
+    ///     does), at the best-effort tier — and is verified-confidential only
+    ///     when the owner turns confidential mode on. So they're listed and
+    ///     addable; Add is disabled only on a build with no native worker.
+    /// Mirrors the Rust `RATES` image entries.
+    static let imageCatalog: [CatalogEntry] = [
+        CatalogEntry(nsid: "stub-flux", label: "Stub (image smoke test)", minRamGB: 0, recommended: false, blurb: "Emits a fixed 1×1 PNG — no GPU. Proves the image path end-to-end."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-schnell", label: "FLUX.1 schnell", minRamGB: 16, recommended: true, blurb: "Fast 4-step FLUX image generation (via mflux)."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-dev", label: "FLUX.1 dev", minRamGB: 24, recommended: false, blurb: "Higher-quality FLUX image generation (via mflux)."),
+        CatalogEntry(nsid: "stabilityai/sdxl-turbo", label: "SDXL-Turbo", minRamGB: 12, recommended: false, blurb: "Fast 2-step image gen. Runs in-process (native MLX)."),
+        CatalogEntry(nsid: "stabilityai/stable-diffusion-2-1-base", label: "Stable Diffusion 2.1", minRamGB: 12, recommended: false, blurb: "Classic SD image gen. Runs in-process (native MLX)."),
+    ]
+
+    /// True for image models that run ONLY on the in-process native-MLX
+    /// diffusion engine (SDXL / Stable-Diffusion) — i.e. they need the native
+    /// worker binary, regardless of tier. Mirrors the Rust
+    /// `is_image_model(m) && !is_flux_model(m)`; `stub-flux` and the FLUX
+    /// (mflux) models are excluded.
+    nonisolated static func isNativeOnlyImage(_ nsid: String) -> Bool {
+        guard kind(of: nsid) == .image else { return false }
+        let m = nsid.lowercased()
+        if m == "stub-flux" { return false }
+        let isFlux = m.contains("flux") || m.contains("schnell")
+        return !isFlux
     }
 
     /// The recommended (latest & greatest) subset of the catalog mirror.
@@ -996,6 +1051,9 @@ struct ModelsView: View {
     @State private var searchResults: [ModelManager.CatalogResult] = []
     @State private var searching = false
     @State private var searchTask: Task<Void, Never>?
+    /// Whether "Add a model" is browsing Text or Image models. Switches the HF
+    /// search query and the curated suggestions shown.
+    @State private var addKind: ModelManager.ModelKind = .text
     /// Live recommended set from the console (falls back to the mirror).
     /// Drives the "Latest" badges; loaded once on appear.
     @State private var recommendedNSIDs: Set<String> = Set(ModelManager.recommendedCatalog.map { $0.nsid })
@@ -1011,10 +1069,11 @@ struct ModelsView: View {
             return
         }
         searching = true
+        let kind = addKind
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
             if Task.isCancelled { return }
-            let results = await ModelManager.searchModels(query)
+            let results = await ModelManager.searchModels(query, kind: kind)
             if Task.isCancelled { return }
             searchResults = results
             searching = false
@@ -1150,19 +1209,46 @@ struct ModelsView: View {
                     // placeholder).
                     TextField(
                         "Search", text: $searchQuery,
-                        prompt: Text("Search HuggingFace for MLX models…")
+                        prompt: Text(
+                            addKind == .image
+                                ? "Search HuggingFace for image models…"
+                                : "Search HuggingFace for MLX models…")
                     )
                     .labelsHidden()
                     .textFieldStyle(.roundedBorder)
                     if searching { ProgressView().controlSize(.small) }
+
+                    // Text vs Image filter, sitting to the RIGHT of the search
+                    // field. Borderless menu + a rounded filled background so it
+                    // visually matches the rounded-border search box next to it.
+                    Picker("Kind", selection: $addKind) {
+                        ForEach(ModelManager.ModelKind.allCases) { k in
+                            Text(k.rawValue).tag(k)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
                 }
 
                 if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                    // No query: the curated, device-fit suggestions. Already-added
-                    // models are dropped — they live in "Active models" above.
-                    let suggestions = ModelManager.catalogForDevice.filter {
-                        !manager.models.contains($0.nsid)
-                    }
+                    // No query: the curated, device-fit suggestions for the
+                    // selected kind. Already-added models are dropped — they live
+                    // in "Active models" above.
+                    let base = addKind == .image
+                        ? ModelManager.imageCatalog
+                        : ModelManager.catalogForDevice
+                    let suggestions = base.filter { !manager.models.contains($0.nsid) }
                     ForEach(suggestions, id: \.nsid) { catalogRow($0) }
                 } else if searchResults.isEmpty && !searching {
                     Text("No MLX models found for “\(searchQuery.trimmingCharacters(in: .whitespaces))”.")
@@ -1191,10 +1277,13 @@ struct ModelsView: View {
                 Text("Add a model")
             } footer: {
                 sectionFooter(
-                    "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential ✓” models can serve in the confidential engine (Qwen2/Qwen3/Llama/Gemma/Phi-class). A “Best-effort only” model (newer Qwen3.5+/Gemma4/Llama4 archs) runs in a helper the operator can read — choosing one means this machine can't offer confidential guarantees to requestors for it."
+                    addKind == .image
+                        ? "Search HuggingFace for image-generation models, or pick a suggestion. SDXL-Turbo / SD-2.1 run in the in-process confidential engine; FLUX runs best-effort via the mflux helper. `stub-flux` is a zero-RAM smoke test."
+                        : "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential ✓” models can serve in the confidential engine (Qwen2/Qwen3/Llama/Gemma/Phi-class). A “Best-effort only” model (newer Qwen3.5+/Gemma4/Llama4 archs) runs in a helper the operator can read — choosing one means this machine can't offer confidential guarantees to requestors for it."
                 )
             }
             .onChange(of: searchQuery) { query in runSearch(query) }
+            .onChange(of: addKind) { _ in runSearch(searchQuery) }
 
             if manager.busy || manager.error != nil || manager.loadStatus != nil {
                 Section {
@@ -1449,6 +1538,14 @@ struct ModelsView: View {
         let fits = ModelManager.fitsBudget(item.minRamGB)
         let suggested = item.nsid == ModelManager.recommendedNSID
         let isLatest = recommendedNSIDs.contains(item.nsid)
+        // SDXL / SD image models run only on the in-process native diffusion
+        // engine, which lives in the native worker binary. The standard build
+        // ships it, so they're addable and serve at the best-effort tier
+        // (verified-confidential only when confidential mode is on). A build
+        // with no native worker can't run them at all → disable Add.
+        let nativeOnly = ModelManager.isNativeOnlyImage(item.nsid)
+        let hasNativeEngine = AgentSupervisor.hasNativeImageEngine()
+        let blockedNative = nativeOnly && !hasNativeEngine
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -1489,14 +1586,30 @@ struct ModelsView: View {
                 )
                 .font(.footnote)
                 .foregroundStyle(fits ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                if nativeOnly {
+                    Text(
+                        hasNativeEngine
+                            ? "Runs in-process (native MLX) — best-effort tier, verified confidential only when confidential mode is on (Status → Security)."
+                            : "This build can't run the in-process engine, so it can't serve this model."
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(blockedNative ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer()
             Button("Add") { Task { await manager.add(item.nsid) } }
                 .buttonStyle(.bordered)
                 .tint(Color(nsColor: .controlAccentColor))
-                .disabled(manager.busy || !fits || manager.models.contains(item.nsid))
+                .disabled(
+                    manager.busy || !fits || blockedNative || manager.models.contains(item.nsid)
+                )
+                .help(
+                    blockedNative
+                        ? "This image model needs the in-process native engine, which this build doesn't ship."
+                        : "")
         }
-        .opacity(fits ? 1 : 0.65)
+        .opacity(fits && !blockedNative ? 1 : 0.65)
     }
 
     /// One HuggingFace search result: the NSID, its download count, and Add.

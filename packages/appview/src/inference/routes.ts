@@ -31,10 +31,19 @@ import {
   hasImageParts,
   MESSAGES_V1,
 } from "@cocore/sdk/multimodal-envelope";
+import { isImageModel } from "@cocore/sdk/model-kind";
 
 import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { Store } from "../store.ts";
-import { type DispatchInputs, type ProfileForCredit, runDispatch } from "./dispatch.ts";
+import {
+  type DispatchDeps,
+  type DispatchEvent,
+  type DispatchInputs,
+  type ProfileForCredit,
+  type ProviderCredit,
+  runDispatch,
+  runMultiImageDispatch,
+} from "./dispatch.ts";
 
 export interface InferenceContext {
   /** Indexed record store — read for the provider-credit line. */
@@ -64,9 +73,13 @@ interface DispatchBody {
   maxTokensOut?: unknown;
   priceCeiling?: unknown;
   targetProviderDid?: unknown;
+  /** Number of outputs (image models); >1 fans out across machines. */
+  outputCount?: unknown;
 }
 
 type ParsedDispatch = Omit<DispatchInputs, "did">;
+
+const MAX_OUTPUT_COUNT = 4;
 
 function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   if (typeof body.model !== "string" || body.model.length === 0) return "model required";
@@ -92,6 +105,18 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   if (body.targetProviderDid !== undefined && typeof body.targetProviderDid !== "string") {
     return "targetProviderDid must be a string when provided";
   }
+  let outputCount: number | undefined;
+  if (body.outputCount !== undefined) {
+    if (
+      typeof body.outputCount !== "number" ||
+      !Number.isInteger(body.outputCount) ||
+      body.outputCount < 1 ||
+      body.outputCount > MAX_OUTPUT_COUNT
+    ) {
+      return `outputCount must be an integer between 1 and ${MAX_OUTPUT_COUNT}`;
+    }
+    outputCount = body.outputCount;
+  }
   // Build the messages-v1 envelope when the client sent images.
   let envelope: Pick<DispatchInputs, "payloadBytes" | "inputFormat"> = {};
   if (body.messages !== undefined) {
@@ -110,6 +135,7 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     ...(typeof body.targetProviderDid === "string"
       ? { targetProviderDid: body.targetProviderDid }
       : {}),
+    ...(outputCount !== undefined ? { outputCount } : {}),
   };
 }
 
@@ -184,6 +210,39 @@ function sseFrame(event: string, data: string): string {
   return `event: ${event}\ndata: ${data}\n\n`;
 }
 
+/** Run the multi-image fan-out and re-emit its slots as the same
+ *  DispatchEvent stream the single path produces: one image chunk per
+ *  generated image, then one aggregate complete (images-v1). Lets the SSE
+ *  serializer below handle both paths uniformly. */
+async function* multiImageEvents(
+  base: DispatchInputs,
+  deps: DispatchDeps,
+  outputCount: number,
+): AsyncGenerator<DispatchEvent> {
+  const slots = await runMultiImageDispatch(base, deps, outputCount);
+  let seq = 0;
+  const receiptUris: string[] = [];
+  let providerCredit: ProviderCredit | undefined;
+  for (const slot of slots) {
+    for (const img of slot.images) {
+      yield { kind: "chunk", seq: seq++, channel: "image", mime: img.mime, data: img.data };
+    }
+    if (slot.receiptUri) receiptUris.push(slot.receiptUri);
+    if (!providerCredit && slot.providerCredit) providerCredit = slot.providerCredit;
+  }
+  yield {
+    kind: "complete",
+    tokensIn: 0,
+    tokensOut: 0,
+    // Every image's receipt — clients/verifiers need all of them, not just
+    // the first (the single-dispatch field stays the first for back-compat).
+    receiptUri: receiptUris[0] ?? "",
+    ...(receiptUris.length > 1 ? { receiptUris } : {}),
+    outputFormat: "images-v1",
+    ...(providerCredit ? { providerCredit } : {}),
+  };
+}
+
 export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRouter<never, never> {
   return HttpRouter.empty.pipe(
     // `all` + method guard so a wrong-method request returns 405 (not the
@@ -223,15 +282,22 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
           });
         }
 
-        const events = runDispatch(
-          { did, ...parsed },
-          {
-            advisorUrl: ctx.advisorUrl,
-            exchangeDid: ctx.exchangeDid,
-            transport: sessionTransport(session, ctx.bridgeUrl),
-            getProfile: storeProfileFetcher(ctx.store),
-          },
-        );
+        const deps = {
+          advisorUrl: ctx.advisorUrl,
+          exchangeDid: ctx.exchangeDid,
+          transport: sessionTransport(session, ctx.bridgeUrl),
+          getProfile: storeProfileFetcher(ctx.store),
+        };
+        // Multi-image fan-out (outputCount > 1) runs distinct-machine slots
+        // and re-emits their image chunks + one aggregate complete through the
+        // same SSE shape; n === 1 is the normal single dispatch. Only IMAGE
+        // models fan out — `outputCount > 1` on a text model would run N
+        // completions, discard the text, and falsely claim images-v1, so it's
+        // ignored (single dispatch) for non-image models.
+        const events =
+          parsed.outputCount && parsed.outputCount > 1 && isImageModel(parsed.model)
+            ? multiImageEvents({ did, ...parsed }, deps, parsed.outputCount)
+            : runDispatch({ did, ...parsed }, deps);
 
         const encoder = new TextEncoder();
         const body = Stream.fromAsyncIterable(events, (e) => e).pipe(
@@ -252,12 +318,13 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
               );
             }
             if (ev.kind === "chunk") {
-              return encoder.encode(
-                sseFrame(
-                  "chunk",
-                  JSON.stringify({ seq: ev.seq, channel: ev.channel, text: ev.text }),
-                ),
-              );
+              // Image chunks carry { mime, data } instead of text; relay the
+              // shape verbatim so the client can render the generated image.
+              const payload =
+                ev.channel === "image"
+                  ? { seq: ev.seq, channel: ev.channel, mime: ev.mime, data: ev.data }
+                  : { seq: ev.seq, channel: ev.channel, text: ev.text };
+              return encoder.encode(sseFrame("chunk", JSON.stringify(payload)));
             }
             if (ev.kind === "complete") {
               return encoder.encode(
@@ -267,6 +334,8 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
                     tokensIn: ev.tokensIn,
                     tokensOut: ev.tokensOut,
                     receiptUri: ev.receiptUri,
+                    ...(ev.receiptUris ? { receiptUris: ev.receiptUris } : {}),
+                    ...(ev.outputFormat ? { outputFormat: ev.outputFormat } : {}),
                     ...(ev.providerCredit ? { providerCredit: ev.providerCredit } : {}),
                   }),
                 ),

@@ -28,6 +28,10 @@
 #   COCORE_PYTHON_VENV       venv path (default: $HOME/.cocore/python)
 #   COCORE_PYTHON_VERSION    Python version uv installs (default: 3.12)
 #   COCORE_VLLM_MLX_VERSION  optional vllm-mlx pin (default: latest)
+#   COCORE_MFLUX_VERSION     optional mflux pin (default: latest); the
+#                            diffusion backend the image engine spawns
+#   COCORE_SKIP_MFLUX        set to 1 to skip the (large) mflux install on
+#                            machines that won't serve image models
 #   COCORE_UV                path to a pre-installed uv binary; if
 #                            unset, we install it under $HOME/.local/bin
 #
@@ -42,6 +46,8 @@ readonly DEFAULT_VENV="$HOME/.cocore/python"
 COCORE_PYTHON_VENV="${COCORE_PYTHON_VENV:-$DEFAULT_VENV}"
 COCORE_PYTHON_VERSION="${COCORE_PYTHON_VERSION:-3.12}"
 COCORE_VLLM_MLX_VERSION="${COCORE_VLLM_MLX_VERSION:-}"
+COCORE_MFLUX_VERSION="${COCORE_MFLUX_VERSION:-}"
+COCORE_SKIP_MFLUX="${COCORE_SKIP_MFLUX:-}"
 COCORE_UV="${COCORE_UV:-}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -124,6 +130,26 @@ install_packages() {
     exit 3
   fi
   note "vllm-mlx + uvicorn + hf_transfer installed at $COCORE_PYTHON_VENV"
+
+  # mflux is the MLX diffusion backend the image engine
+  # (cocore_image_server.py) spawns for FLUX.1 image generation. It pulls
+  # in MLX + Pillow + safetensors and is multi-hundred-MB, so it can be
+  # skipped on chat-only machines via COCORE_SKIP_MFLUX=1.
+  if [[ "$COCORE_SKIP_MFLUX" == "1" ]]; then
+    note "COCORE_SKIP_MFLUX=1 — skipping mflux (image models won't be servable)"
+  else
+    local mflux_pkg="mflux"
+    if [[ -n "$COCORE_MFLUX_VERSION" ]]; then
+      mflux_pkg="mflux==$COCORE_MFLUX_VERSION"
+    fi
+    phase "install mflux (image-generation backend)"
+    if ! "$COCORE_UV" pip install --python "$COCORE_PYTHON_VENV/bin/python" \
+          "$mflux_pkg" >&2; then
+      warn "uv pip install $mflux_pkg failed — image models won't be servable, but chat models still work"
+    else
+      note "mflux installed at $COCORE_PYTHON_VENV"
+    fi
+  fi
 }
 
 verify() {

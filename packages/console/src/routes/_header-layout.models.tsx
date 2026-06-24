@@ -20,6 +20,7 @@ import {
 import { modelDirectoryRouteQueryOptions } from "@/components/models/models.functions.ts";
 import { OperatorChip } from "@/components/profile/OperatorChip.tsx";
 import { TrustTierBadge } from "@/components/TrustTierBadge.tsx";
+import { inferModelKind } from "@/lib/model-kind.shared.ts";
 import { Button } from "@/design-system/button";
 import { CopyToClipboardButton } from "@/design-system/copy-to-clipboard-button";
 import { Flex } from "@/design-system/flex";
@@ -608,22 +609,6 @@ export const Route = createFileRoute("/_header-layout/models")({
     ],
   }),
 });
-
-function inferModelKind(modelId: string): Exclude<ModelKind, "all"> {
-  const m = modelId.toLowerCase();
-  // The `stub` model is the network's hello-world health check, not
-  // a real inference target. Bucket it as "test" so the catalog
-  // labels it clearly and the detail pane can swap in the
-  // network-heartbeat explanation.
-  if (m === "stub") return "test";
-  if (/(whisper|wav2lip|\btts\b|audio|speech)/.test(m)) return "audio";
-  if (/(video|cogvideo|svd|animate|\bwan\b)/.test(m)) return "video";
-  if (/(flux|sdxl|\bsd[\d.-]|stable|diffusion|dall|midjourney|imagen|\bimg\b)/.test(m))
-    return "image";
-  if (/(llama|mistral|gpt|qwen|gemma|phi|mixtral|chat|instruct|claude|\bo1\b|embed)/.test(m))
-    return "text";
-  return "other";
-}
 
 function kindBadgeStyle(kind: Exclude<ModelKind, "all">) {
   switch (kind) {

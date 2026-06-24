@@ -43,7 +43,7 @@ vi.mock("@/lib/inference-dispatch.server.ts", async (importOriginal) => {
   };
 });
 
-import { handleChatCompletions } from "./openai-routes.server.ts";
+import { handleChatCompletions, handleImagesGenerations } from "./openai-routes.server.ts";
 
 function streamRequest(body: Record<string, unknown>): Request {
   return new Request("https://console.test/v1/chat/completions", {
@@ -91,5 +91,51 @@ describe("handleChatCompletions wire contract", () => {
     const res = await handleChatCompletions(req);
     expect(res.status).toBe(401);
     expect(res.headers.get("content-type") ?? "").toMatch(/application\/json/);
+  });
+});
+
+function imageRequest(body: Record<string, unknown>): Request {
+  return new Request("https://console.test/v1/images/generations", {
+    method: "POST",
+    headers: { authorization: "Bearer cocore-testkey", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("handleImagesGenerations", () => {
+  test("happy path returns OpenAI images JSON with b64_json data", async () => {
+    state.events = [
+      { kind: "chunk", seq: 0, channel: "image", mime: "image/png", data: "AAAA" },
+      {
+        kind: "complete",
+        tokensIn: 1,
+        tokensOut: 1,
+        receiptUri: "at://r",
+        outputFormat: "images-v1",
+      },
+    ];
+    const res = await handleImagesGenerations(
+      imageRequest({ model: "stub-flux", prompt: "a fox" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { b64_json: string }[] };
+    expect(body.data[0]?.b64_json).toBe("AAAA");
+  });
+
+  test("rejects a non-image model with 400 model_not_supported_for_images", async () => {
+    const res = await handleImagesGenerations(imageRequest({ model: "stub", prompt: "a fox" }));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: { code?: string } };
+    expect(body.error?.code).toBe("model_not_supported_for_images");
+  });
+
+  test("bad API key is a 401", async () => {
+    const req = new Request("https://console.test/v1/images/generations", {
+      method: "POST",
+      headers: { authorization: "Bearer nope", "content-type": "application/json" },
+      body: JSON.stringify({ model: "stub-flux", prompt: "x" }),
+    });
+    const res = await handleImagesGenerations(req);
+    expect(res.status).toBe(401);
   });
 });

@@ -114,6 +114,56 @@ A `dev.cocore.compute.receipt` record commits to, at minimum:
   edge with a clear error.
 - **Money:** integer minor units plus an ISO 4217 (or `XBT`/`XSAT`-style)
   currency code. No floats anywhere near prices.
+- **Effect-TS (backend and async TypeScript):** use Effect for server-side
+  and async orchestration in `packages/appview`, `packages/console` (server),
+  `packages/exchange` (HTTP edges), `infra/*`, and `@cocore/o11y`. This does
+  not apply to the Rust provider, the SDK client library, browser bundles, or
+  pure synchronous helpers with no IO.
+
+  **In scope:** HTTP servers (`HttpRouter`), infra processes, console server
+  functions / middleware / API routes, config at startup, long-lived
+  supervision (firehose, WebSocket lifecycle) when touched.
+
+  **Out of scope:** `provider/` (Rust), `packages/sdk` publish/verify/
+  firehose, client components and `*.tsx` bundles.
+
+  **Patterns:**
+  - Orchestrate with `Effect.gen` and `yield*`; use `return yield*` for
+    typed failures.
+  - One `makeRuntime` per process (`packages/o11y/src/runtime.ts`); run work
+    through `runTraced(runtime, "operation.name", effect)` at HTTP/TanStack/
+    framework boundaries instead of scattering `Effect.runPromise`.
+  - HTTP handlers return `Effect` programs via `@effect/platform` `HttpRouter`;
+    reuse helpers from `packages/o11y/src/http.ts` (`jsonBody`, `searchParams`,
+    `ok`, `err`, `makeNodeHandler`).
+  - Inject shared clients with `Effect.Service` + `Layer` (see
+    `packages/console/src/integrations/appview/appview.server.ts`); compose
+    into `AppLayer` passed to `makeRuntime`.
+  - Model errors with `Data.TaggedError` (or `Schema.TaggedError` at
+    serialization boundaries); handle with `Effect.catchTag` / `Effect.either`
+    — not `try/catch` inside `Effect.gen`.
+  - Load env with `Config.*` and `Redacted` at startup (see
+    `infra/services/src/main.ts`).
+  - Wrap third-party Promise APIs in colocated `*Effect` adapters using
+    `Effect.async`; avoid new `Effect.tryPromise` / `Effect.promise` in console
+    server code (see `.cursor/rules/console-effect-ts.mdc`).
+  - Add `Effect.withSpan` on non-trivial programs; span attributes are IDs,
+    counts, and hashes only — never prompt/output content or secrets.
+
+  **Console placement:** Effect programs live in `*.server.ts`, route
+  `server.handlers`, and `middleware/*.server.ts`; TanStack `createServerFn`
+  handlers in `*.functions.ts` call `runTraced` at the boundary. Client code
+  uses TanStack Query options only (see `.cursor/rules/console-tanstack-api.mdc`).
+
+  **Agent routing:** for nontrivial Effect work (services/layers, typed errors,
+  Config, concurrency, `@effect/vitest`), read and follow
+  `.claude/skills/effect-ts/SKILL.md` — especially
+  `references/critical-rules.md` before writing.
+
+  **Migration:** legacy Promise/async code remains in places (SDK, some appview
+  dispatch, advisor WebSocket internals). New backend work and substantive
+  refactors should move to Effect at the service boundary; do not rewrite
+  untouched modules just to satisfy this convention.
 
 ## Things to avoid
 
@@ -123,6 +173,13 @@ A `dev.cocore.compute.receipt` record commits to, at minimum:
   behavior changes explicit via a new NSID.
 - Inlining attestation blobs into receipts.
 - Coupling the provider agent to a specific AppView's URL.
+- Raw `async`/`await` orchestration in new backend handlers when the logic is
+  non-trivial — use Effect programs and run them at the framework boundary.
+- `try/catch` for Effect failure paths inside `Effect.gen`.
+- Ad-hoc `Effect.tryPromise` bridges where a named `*Effect` + `Effect.async`
+  adapter is clearer.
+- Making pure helpers or lexicon/SDK utilities effectful without an IO/runtime
+  reason.
 
 ## Running things
 
@@ -153,5 +210,7 @@ On first use, Claude Code may prompt to approve project-scoped servers; see
 2. Update the lexicon first. Open a PR with _only_ the lexicon change and
    a short rationale.
 3. Once the lexicon lands, update generated types, then provider, then the
-   AppView workspace (`packages/appview`), then SDKs, in that order. The provider must be able to write
-   valid records before any consumer assumes they exist.
+   AppView workspace (`packages/appview`), then SDKs, in that order. The
+   provider must be able to write valid records before any consumer assumes
+   they exist. TypeScript backend changes in appview, infra, console, and
+   exchange HTTP paths should follow the Effect-TS conventions above.

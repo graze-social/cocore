@@ -38,6 +38,11 @@ pub struct ReceiptInputs {
     pub model: String,
     pub input_commitment: String,
     pub output_commitment: String,
+    /// How to interpret the plaintext output bytes `output_commitment`
+    /// covers. `None`/`"text"` = UTF-8 answer text (legacy); `"images-v1"`
+    /// = canonical images envelope bytes. Mirrors the lexicon
+    /// `dev.cocore.compute.receipt#main.outputFormat`.
+    pub output_format: Option<String>,
     /// SHA-256 hex over the exact sealed bytes delivered to the
     /// requester. Lets a requester confirm the ciphertext they received
     /// is the one this receipt's signature commits to.
@@ -82,6 +87,8 @@ pub struct ReceiptRecord {
     pub model: String,
     pub inputCommitment: String,
     pub outputCommitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputFormat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputCipherCommitment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +152,12 @@ pub fn build(
     // record's `skip_serializing_if = None` — the signed `unsigned`
     // value MUST canonicalise to the same bytes the verifier derives
     // from the published record (minus enclaveSignature).
+    if let Some(f) = &inputs.output_format {
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("outputFormat".into(), Value::String(f.clone()));
+    }
     if let Some(c) = &inputs.output_cipher_commitment {
         unsigned
             .as_object_mut()
@@ -186,6 +199,7 @@ pub fn build(
             model: inputs.model,
             inputCommitment: inputs.input_commitment,
             outputCommitment: inputs.output_commitment,
+            outputFormat: inputs.output_format,
             outputCipherCommitment: inputs.output_cipher_commitment,
             reasoningCommitment: inputs.reasoning_commitment,
             params: inputs.params,
@@ -231,6 +245,7 @@ mod tests {
             model: "llama-3.1-70b".into(),
             input_commitment: "a".repeat(64),
             output_commitment: "b".repeat(64),
+            output_format: None,
             output_cipher_commitment: None,
             reasoning_commitment: None,
             params: None,
@@ -309,6 +324,36 @@ mod tests {
         let sig = Signature::from_der(&sig_der).unwrap();
         vk.verify(&message, &sig)
             .expect("signature must verify with reasoningCommitment present");
+    }
+
+    #[test]
+    fn output_format_present_only_when_set_and_is_signed() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+
+        // Absent by default — a text job omits outputFormat.
+        let (rec, _) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
+        let body = serde_json::to_value(&rec).unwrap();
+        assert!(body.get("outputFormat").is_none());
+
+        // Present + signed for an images-v1 job.
+        let mut inputs = fixture(chrono::Utc::now());
+        inputs.output_format = Some("images-v1".into());
+        let (rec, _) = build(inputs, &*signer).unwrap();
+        let mut signed = serde_json::to_value(&rec).unwrap();
+        assert_eq!(signed["outputFormat"], json!("images-v1"));
+        signed.as_object_mut().unwrap().remove("enclaveSignature");
+        let message = to_canonical_bytes(&signed).unwrap();
+        let sig_der = B64.decode(rec.enclaveSignature.as_bytes()).unwrap();
+        let pub_raw = B64.decode(signer.public_key_b64()).unwrap();
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        uncompressed[1..].copy_from_slice(&pub_raw);
+        let point = EncodedPoint::from_bytes(uncompressed).unwrap();
+        let vk = VerifyingKey::from_encoded_point(&point).unwrap();
+        let sig = Signature::from_der(&sig_der).unwrap();
+        vk.verify(&message, &sig)
+            .expect("signature must verify with outputFormat present");
     }
 
     #[test]

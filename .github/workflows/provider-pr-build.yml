@@ -98,10 +98,17 @@ jobs:
         # COCORE_PR_BUILD=1 gives the app a PR-only bundle id so it gets its own
         # UserDefaults suite — otherwise it inherits a prod install's persisted
         # console/advisor override and ignores the baked PR URLs (talks to prod).
+        # COCORE_BUILD_NATIVE=1 builds the OUTER binary with --features native_mlx
+        # so the in-process MLX engine ships in the PR build — this is what lets
+        # a PR build serve native-only image models (SDXL / Stable-Diffusion) at
+        # best-effort. native_mlx needs only the Metal toolchain (CI has Xcode)
+        # and CAN be ad-hoc signed; unlike the apns confidential worker, which
+        # can't (so APNS stays off for PR builds).
         env:
           COCORE_CONSOLE_URL: ${{ steps.stack.outputs.console_url }}
           COCORE_ADVISOR_URL: ${{ steps.stack.outputs.advisor_url }}
           COCORE_PR_BUILD: "1"
+          COCORE_BUILD_NATIVE: "1"
         run: COCORE_SIGN_ID=- bash scripts/build-mac-app.sh
 
       - name: Verify the CLI has no Python linkage

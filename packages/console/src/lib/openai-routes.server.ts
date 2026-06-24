@@ -24,11 +24,16 @@ import { runTraced } from "@/lib/o11y.server.ts";
 import { restoreAtprotoSessionEffect } from "@/integrations/auth/atproto.server.ts";
 import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-session.server.ts";
 import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
-import { type DispatchInputs, runDispatch } from "@/lib/inference-dispatch.server.ts";
+import {
+  type DispatchInputs,
+  runDispatch,
+  runMultiImageDispatch,
+} from "@/lib/inference-dispatch.server.ts";
 import { listMyFriendDids } from "@/lib/friends.server.ts";
 import {
   buildJobInput,
   bufferedResponse,
+  dispatchErrorToHttpResponse,
   jsonError,
   type OpenAiChatRequest,
   parseRequest,
@@ -37,6 +42,17 @@ import {
 } from "@/lib/openai-chat-completions.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
 import { buildModelDirectory } from "@/lib/model-directory.server.ts";
+import { isImageModel } from "@/lib/model-kind.shared.ts";
+import {
+  collectImageDispatch,
+  DEFAULT_IMAGE_STEPS,
+  editsJobInput,
+  generationsJobInput,
+  generationsResponse,
+  type ImageSlotResult,
+  parseEditsRequest,
+  parseGenerationsRequest,
+} from "@/lib/openai-images-generations.server.ts";
 import {
   parseTrustFloor,
   resolveVerifiedProviderDids,
@@ -293,6 +309,213 @@ export async function handleVerifiedChatCompletions(request: Request): Promise<R
     return streamingResponse(id, parsed.model, runDispatch(inputs));
   }
   return await bufferedResponse(id, parsed.model, runDispatch(inputs));
+}
+
+// ---------------------------------------------------------------------------
+// Images surface: POST /v1/images/generations (t2i) + /v1/images/edits (img2i)
+// across the open / friends-only / verified tiers. The same three handler
+// pairs as chat, mounted at the same three base paths.
+// ---------------------------------------------------------------------------
+
+type ImageTier = "open" | "private" | "verified";
+
+/** Resolve the candidate provider pool for an image request by tier.
+ *  Returns the allow-set (undefined = open network), or a ready-to-send
+ *  error Response (auth pool empty / lookup failure). */
+async function resolveImagePool(
+  tier: ImageTier,
+  auth: { did: string; oauthSession: OAuthSession },
+  model: string,
+  minTrust: unknown,
+): Promise<{ allowedProviderDids?: Set<string> } | Response> {
+  if (tier === "open") return {};
+  if (tier === "private") {
+    try {
+      return { allowedProviderDids: await listMyFriendDids(auth.oauthSession) };
+    } catch (e) {
+      return jsonError(
+        502,
+        `failed to load friend list: ${(e as Error).message}`,
+        "server_error",
+        "friend_list_failed",
+      );
+    }
+  }
+  // verified
+  let floor: TrustFloor = "hardware-attested";
+  if (minTrust !== undefined) {
+    const f = parseTrustFloor(minTrust);
+    if (!f) {
+      return jsonError(
+        400,
+        'min_trust must be "hardware-attested" or "confidential"',
+        "invalid_request_error",
+        "invalid_min_trust",
+      );
+    }
+    floor = f;
+  }
+  let allowedProviderDids: Set<string>;
+  try {
+    allowedProviderDids = await resolveVerifiedProviderDids(floor, model);
+  } catch (e) {
+    return jsonError(
+      502,
+      `failed to resolve verified providers: ${(e as Error).message}`,
+      "server_error",
+      "verified_lookup_failed",
+    );
+  }
+  if (allowedProviderDids.size === 0) {
+    return jsonError(
+      503,
+      `no provider is currently verified at the '${floor}' tier for model ${model}`,
+      "service_unavailable_error",
+      "no_verified_providers",
+    );
+  }
+  return { allowedProviderDids };
+}
+
+/** Run `n` image jobs and collect their slot results. Each slot is an
+ *  independent job + receipt. For `n === 1` it's a single dispatch; for
+ *  `n > 1` it delegates to {@link runMultiImageDispatch}, which fans the
+ *  slots out across DISTINCT provider machines (requester-side, no advisor
+ *  coordinator) and splits the price ceiling so total spend stays within
+ *  DEFAULT_PRICE_CEILING. */
+async function runImageSlots(base: DispatchInputs, n: number): Promise<ImageSlotResult[]> {
+  if (n === 1) {
+    return [await collectImageDispatch(runDispatch(base))];
+  }
+  const slots = await runMultiImageDispatch(base, n);
+  return slots.map((s) => ({
+    images: s.images,
+    receiptUri: s.receiptUri,
+    providerCredit: s.providerCredit,
+    error: s.error,
+  }));
+}
+
+/** Shape slot results into a response: 200 (full or partial success) when
+ *  at least one image landed, else the mapped HTTP error from the first
+ *  failing slot. */
+function imageSlotsToResponse(slots: ImageSlotResult[]): Response {
+  const haveImage = slots.some((s) => s.images.length > 0);
+  if (!haveImage) {
+    const firstError = slots.find((s) => s.error)?.error ?? "unknown";
+    const mapped = dispatchErrorToHttpResponse(firstError);
+    return jsonError(
+      mapped.status,
+      `image generation failed: ${mapped.code}`,
+      mapped.type,
+      mapped.code,
+    );
+  }
+  return generationsResponse(slots);
+}
+
+/** Core of `POST /v1/[tier/]images/generations` (text-to-image). */
+async function imagesGenerations(request: Request, tier: ImageTier): Promise<Response> {
+  const auth = await authenticate(request);
+  if (auth instanceof Response) return auth;
+
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch {
+    return jsonError(400, "Body must be JSON");
+  }
+  const parsed = parseGenerationsRequest(raw);
+  if (typeof parsed === "string") return jsonError(400, parsed);
+  if (!isImageModel(parsed.model)) {
+    return jsonError(
+      400,
+      `model '${parsed.model}' is not an image-generation model`,
+      "invalid_request_error",
+      "model_not_supported_for_images",
+    );
+  }
+
+  const pool = await resolveImagePool(
+    tier,
+    auth,
+    parsed.model,
+    (raw as { min_trust?: unknown }).min_trust,
+  );
+  if (pool instanceof Response) return pool;
+
+  const job = generationsJobInput(parsed.prompt);
+  const base: DispatchInputs = {
+    did: auth.did,
+    oauthSession: auth.oauthSession,
+    model: parsed.model,
+    prompt: parsed.prompt,
+    payloadBytes: job.payloadBytes,
+    inputFormat: job.inputFormat,
+    maxTokensOut: DEFAULT_IMAGE_STEPS,
+    priceCeiling: DEFAULT_PRICE_CEILING,
+    ...pool,
+  };
+  return imageSlotsToResponse(await runImageSlots(base, parsed.n));
+}
+
+/** Core of `POST /v1/[tier/]images/edits` (img2img). */
+async function imagesEdits(request: Request, tier: ImageTier): Promise<Response> {
+  const auth = await authenticate(request);
+  if (auth instanceof Response) return auth;
+
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return jsonError(400, "Body must be multipart/form-data");
+  }
+  const parsed = await parseEditsRequest(form);
+  if (typeof parsed === "string") return jsonError(400, parsed);
+  if (!isImageModel(parsed.model)) {
+    return jsonError(
+      400,
+      `model '${parsed.model}' is not an image-generation model`,
+      "invalid_request_error",
+      "model_not_supported_for_images",
+    );
+  }
+
+  const pool = await resolveImagePool(tier, auth, parsed.model, form.get("min_trust") ?? undefined);
+  if (pool instanceof Response) return pool;
+
+  const job = editsJobInput(parsed);
+  const base: DispatchInputs = {
+    did: auth.did,
+    oauthSession: auth.oauthSession,
+    model: parsed.model,
+    prompt: parsed.prompt,
+    payloadBytes: job.payloadBytes,
+    inputFormat: job.inputFormat,
+    maxTokensOut: DEFAULT_IMAGE_STEPS,
+    priceCeiling: DEFAULT_PRICE_CEILING,
+    ...pool,
+  };
+  return imageSlotsToResponse(await runImageSlots(base, parsed.n));
+}
+
+export function handleImagesGenerations(request: Request): Promise<Response> {
+  return imagesGenerations(request, "open");
+}
+export function handlePrivateImagesGenerations(request: Request): Promise<Response> {
+  return imagesGenerations(request, "private");
+}
+export function handleVerifiedImagesGenerations(request: Request): Promise<Response> {
+  return imagesGenerations(request, "verified");
+}
+export function handleImagesEdits(request: Request): Promise<Response> {
+  return imagesEdits(request, "open");
+}
+export function handlePrivateImagesEdits(request: Request): Promise<Response> {
+  return imagesEdits(request, "private");
+}
+export function handleVerifiedImagesEdits(request: Request): Promise<Response> {
+  return imagesEdits(request, "verified");
 }
 
 function jsonResponse(payload: unknown): Response {

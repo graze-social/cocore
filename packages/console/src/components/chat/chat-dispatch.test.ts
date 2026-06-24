@@ -96,6 +96,31 @@ describe("dispatchChatTurn channel routing", () => {
     assert.equal(sentBody["prompt"], "hi");
   });
 
+  test("image chunks route to onImage and populate result.images", async () => {
+    const sse = [
+      `event: meta\ndata: ${JSON.stringify({ providerDid: "did:plc:p", jobUri: "at://j" })}\n\n`,
+      `event: chunk\ndata: ${JSON.stringify({ seq: 0, channel: "image", mime: "image/png", data: "aGVsbG8=" })}\n\n`,
+      `event: complete\ndata: ${JSON.stringify({ tokensIn: 5, tokensOut: 6, receiptUri: "at://r", outputFormat: "images-v1" })}\n\n`,
+    ].join("");
+    globalThis.fetch = async () => sseResponse(sse);
+
+    const images: Array<{ mime: string; data: string }> = [];
+    const content: string[] = [];
+    const result = await dispatchChatTurn({
+      model: "stub-flux",
+      prompt: "a red apple",
+      maxTokensOut: 16,
+      onChunk: (t) => content.push(t),
+      onImage: (img) => images.push(img),
+    });
+
+    assert.deepEqual(images, [{ mime: "image/png", data: "aGVsbG8=" }]);
+    assert.deepEqual(result.images, [{ mime: "image/png", data: "aGVsbG8=" }]);
+    assert.equal(result.outputFormat, "images-v1");
+    assert.equal(result.text, ""); // no text on an image turn
+    assert.deepEqual(content, []);
+  });
+
   test("a chunk with no channel defaults to the answer (content)", async () => {
     const sse =
       `event: chunk\ndata: ${JSON.stringify({ seq: 0, text: "plain" })}\n\n` +

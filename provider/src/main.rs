@@ -792,12 +792,15 @@ async fn prepare_native_confidential_model() {
         tracing::info!("native MLX model already configured via env; skipping download probe");
         return;
     }
-    // Choose the model: the owner's first non-`stub` desiredModels, else the
-    // small default. The native engine serves a single model.
+    // Choose the model: the owner's first non-`stub`, non-IMAGE desiredModels,
+    // else the small default. This wires the native CHAT engine, so image
+    // models (which the build_engines image branch routes to the native
+    // DIFFUSION engine separately) must be skipped — otherwise an image-only
+    // config would pick e.g. `sdxl-turbo` and fail to load it as an LLM.
     let model = read_my_desired_models()
         .await
         .into_iter()
-        .find(|m| m != "stub")
+        .find(|m| m != "stub" && !cocore_provider::engines::is_image_model(m))
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     // Resolve the venv interpreter the install script bootstrapped.
@@ -1860,6 +1863,12 @@ fn build_engines(
     use cocore_provider::engines::stub::StubEngine;
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
+    // The image-generation smoke target. The StubEngine emits a fixed 1×1
+    // PNG for it (no GPU/diffusion backend), so every machine can serve it
+    // — this is the always-available image counterpart to `stub` and proves
+    // the image channel + images-v1 receipt path end-to-end. Real image
+    // models route to the diffusion engines (Phase 8/10) instead.
+    registry.register("stub-flux", std::sync::Arc::new(StubEngine));
 
     // A confidential machine's native engine failed to come up. Surfaced as
     // the serve's engineFault so the console shows an honest "couldn't serve
@@ -1928,6 +1937,55 @@ fn build_engines(
                          the in-process engine can't serve it. The machine is online but only \
                          serving the no-op `stub` engine; it will recover once the weights finish \
                          downloading and it restarts."
+                    ),
+                    models: vec![model.clone()],
+                    at: chrono::Utc::now(),
+                });
+            }
+        }
+    }
+
+    // WS-ENGINE (image): the native in-process MLX DIFFUSION engine. Same
+    // opt-in/feature-gated shape as the LLM native engine above; configure an
+    // image model id + its local snapshot dir and image generation runs
+    // entirely inside the measured binary (flips inProcessBackend true and
+    // makes the confidential tier reachable for image models). When set and
+    // loadable it is PREFERRED over the subprocess image engine for that id
+    // (registered here first; the configured loop below skips ids the registry
+    // already serves).
+    #[cfg(feature = "native_mlx")]
+    if let Ok(model) = std::env::var("COCORE_NATIVE_MLX_IMAGE_MODEL") {
+        use cocore_provider::engines::native_mlx_image::NativeMlxImageEngine;
+        use cocore_provider::engines::Engine;
+        // The weight-cache dir is optional: the in-process SD presets download
+        // to the default Hub cache when it's unset.
+        let dir = std::env::var("COCORE_NATIVE_MLX_IMAGE_MODEL_DIR").unwrap_or_default();
+        match NativeMlxImageEngine::load(&model, std::path::PathBuf::from(dir)) {
+            Ok(engine) if engine.ready() => {
+                tracing::info!(model = %model, "loaded native in-process MLX diffusion engine (confidential-capable)");
+                registry.register(model, std::sync::Arc::new(engine));
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    model = %model,
+                    "native MLX diffusion engine loaded but metallib not located; not registering (confidential image tier unavailable)"
+                );
+                native_fault = Some(EngineFault {
+                    code: "native-metallib-missing".to_string(),
+                    message: format!(
+                        "The confidential (in-process MLX) diffusion engine for `{model}` loaded \
+                         but its signed Metal kernel library couldn't be located, so it won't serve."
+                    ),
+                    models: vec![model.clone()],
+                    at: chrono::Utc::now(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, model = %model, "failed to load native MLX diffusion engine");
+                native_fault = Some(EngineFault {
+                    code: "native-load-failed".to_string(),
+                    message: format!(
+                        "The confidential (in-process MLX) diffusion engine couldn't load `{model}`: {e}"
                     ),
                     models: vec![model.clone()],
                     at: chrono::Utc::now(),
@@ -2064,8 +2122,94 @@ fn build_engines(
     let mut failed: Vec<String> = vec![];
     let mut saw_venv_missing = false;
     let mut last_err: Option<String> = None;
+    // Image models with no engine on THIS (best-effort) build — SDXL / SD-class
+    // ids that only the native confidential diffusion engine can serve. Tracked
+    // separately so the fault is honest ("needs the confidential build") instead
+    // of the misleading generic "not in MLX format" message. (On a native_mlx
+    // build these route to the in-process engine instead, so this stays empty.)
+    #[cfg_attr(feature = "native_mlx", allow(unused_mut))]
+    let mut confidential_only_image: Vec<String> = vec![];
 
     for model in &configured {
+        // Smoke-test stubs (`stub`, `stub-flux`) are always served by the
+        // StubEngine registered above; never spawn a Python subprocess for
+        // them even if an operator pins one explicitly.
+        if cocore_provider::pricing::is_smoke_test_model(model) {
+            continue;
+        }
+        // A native in-process engine already registered for this id (the
+        // confidential diffusion or LLM engine) is PREFERRED — don't spawn a
+        // subprocess that would overwrite it.
+        if registry.for_model(model).is_some() {
+            tracing::info!(model = %model, "model already served by a native in-process engine; skipping subprocess");
+            continue;
+        }
+        // Image-generation models load the diffusion subprocess engine
+        // (`cocore_image_server.py` / mflux), not the vllm-mlx chat engine.
+        // Routing is by the catalog-authoritative `is_image_model`.
+        if cocore_provider::engines::is_image_model(model) {
+            // Run each image model on the RIGHT framework. The mflux subprocess
+            // is FLUX-only; SDXL / Stable-Diffusion-class models run ONLY in the
+            // native in-process diffusion engine (the MLX-Swift StableDiffusion
+            // backend). So a non-FLUX image model goes to the native engine on a
+            // confidential (native_mlx) build, and on a best-effort build it has
+            // no engine at all → an honest fault (never mflux, which would fail
+            // every load with a cryptic error).
+            if !cocore_provider::engines::is_flux_model(model) {
+                #[cfg(feature = "native_mlx")]
+                {
+                    use cocore_provider::engines::native_mlx_image::NativeMlxImageEngine;
+                    use cocore_provider::engines::Engine;
+                    // Weights download to the default Hub cache (empty dir).
+                    match NativeMlxImageEngine::load(model, std::path::PathBuf::new()) {
+                        Ok(engine) if engine.ready() => {
+                            tracing::info!(model = %model, "image-generation native in-process engine ready");
+                            registry.register(model.clone(), std::sync::Arc::new(engine));
+                        }
+                        Ok(_) => {
+                            last_err = Some(format!(
+                                "native diffusion engine for {model} loaded but its metallib couldn't be located"
+                            ));
+                            tracing::warn!(model = %model, "inference engine load failed");
+                            failed.push(model.clone());
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("{e:#}"));
+                            tracing::warn!(model = %model, error = %e, "native diffusion engine load failed");
+                            failed.push(model.clone());
+                        }
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "native_mlx"))]
+                {
+                    tracing::warn!(
+                        model = %model,
+                        "image model needs the confidential native engine; the best-effort mflux subprocess (FLUX-only) can't serve it"
+                    );
+                    confidential_only_image.push(model.clone());
+                    failed.push(model.clone());
+                    continue;
+                }
+            }
+            match start_image_engine_with_recovery(model, &venv_python) {
+                Ok(engine) => {
+                    tracing::info!(model = %model, "image-generation subprocess engine ready");
+                    registry.register(model.clone(), std::sync::Arc::new(engine));
+                }
+                Err(EngineStartFailure::VenvMissing) => {
+                    saw_venv_missing = true;
+                    tracing::warn!(model = %model, reason = "venv-missing", "inference engine load failed");
+                    failed.push(model.clone());
+                }
+                Err(EngineStartFailure::Failed(err)) => {
+                    last_err = Some(err);
+                    tracing::warn!(model = %model, "inference engine load failed");
+                    failed.push(model.clone());
+                }
+            }
+            continue;
+        }
         match start_engine_with_recovery(model, &venv_python) {
             Ok(engine) => {
                 tracing::info!(model = %model, "inference subprocess engine ready");
@@ -2150,6 +2294,31 @@ fn build_engines(
                  `mlx-community/Qwen2.5-VL-7B-Instruct-4bit` or \
                  `mlx-community/Qwen2.5-VL-3B-Instruct-4bit` — then start serving again.",
                 failed.join(", "),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
+    } else if !confidential_only_image.is_empty()
+        && failed.iter().all(|m| confidential_only_image.contains(m))
+    {
+        // Every failure is an image model with no best-effort engine (SDXL /
+        // Stable-Diffusion). Give an honest fault instead of the generic
+        // "not in MLX format" one — the weights are fine, this build just
+        // can't serve them.
+        tracing::warn!(
+            models = ?confidential_only_image,
+            "image model(s) need the confidential build's native diffusion engine; serving stub only"
+        );
+        EngineFault {
+            code: "image-model-needs-confidential".to_string(),
+            message: format!(
+                "The image model(s) [{}] (SDXL / Stable-Diffusion class) run only in the \
+                 in-process native diffusion engine, which ships in the CONFIDENTIAL build. \
+                 This is the standard best-effort build, which generates images via the FLUX \
+                 path (mflux) only. The machine is online but only serving the no-op `stub` \
+                 engine. Fix: use a FLUX image model — `black-forest-labs/FLUX.1-schnell` — \
+                 or `stub-flux` for a no-GPU smoke test, then start serving again.",
+                confidential_only_image.join(", "),
             ),
             models: all_unserved,
             at: chrono::Utc::now(),
@@ -2288,6 +2457,59 @@ fn start_engine_with_recovery(
                 backoff_s = backoff.as_secs(),
                 "retrying inference engine load after backoff"
             );
+            std::thread::sleep(backoff);
+        }
+    }
+    if !venv_python.exists() {
+        Err(EngineStartFailure::VenvMissing)
+    } else {
+        Err(EngineStartFailure::Failed(
+            last_err.unwrap_or_else(|| "unknown error".to_string()),
+        ))
+    }
+}
+
+/// Image-generation counterpart of [`start_engine_with_recovery`]. Same
+/// bounded-retry/backoff lifecycle, but constructs an
+/// [`ImageSubprocessEngine`](cocore_provider::engines::image_subprocess::ImageSubprocessEngine)
+/// (mflux diffusion over `/generate`) instead of the vllm-mlx chat engine.
+fn start_image_engine_with_recovery(
+    model: &str,
+    venv_python: &std::path::Path,
+) -> std::result::Result<
+    cocore_provider::engines::image_subprocess::ImageSubprocessEngine,
+    EngineStartFailure,
+> {
+    use cocore_provider::engines::image_subprocess::ImageSubprocessEngine;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=ENGINE_START_MAX_ATTEMPTS {
+        if !venv_python.exists() {
+            last_err = Some(format!("venv python missing at {}", venv_python.display()));
+            tracing::warn!(
+                model = %model,
+                attempt,
+                python = %venv_python.display(),
+                "venv python missing; the installer may still be provisioning it — will retry after backoff"
+            );
+        } else {
+            match ImageSubprocessEngine::new(model, venv_python.to_path_buf()) {
+                Ok(engine) => match engine.start() {
+                    Ok(()) => return Ok(engine),
+                    Err(e) => {
+                        let err = format!("{e:#}");
+                        tracing::warn!(model = %model, attempt, error = %err, "image subprocess failed to start; will retry");
+                        last_err = Some(err);
+                    }
+                },
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    tracing::warn!(model = %model, attempt, error = %err, "could not construct image subprocess engine; will retry");
+                    last_err = Some(err);
+                }
+            }
+        }
+        if attempt < ENGINE_START_MAX_ATTEMPTS {
+            let backoff = ENGINE_START_BACKOFF * attempt;
             std::thread::sleep(backoff);
         }
     }

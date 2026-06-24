@@ -230,7 +230,25 @@ final class AgentSupervisor {
         // native-only, so we must not inject subprocess models).
         let tier = Self.probeTier()
         let confidential = (tier == "attested-confidential")
-        guard let bin = Self.serveBinary(tier: tier) else {
+        // Native-only image models (SDXL / Stable-Diffusion) need the in-process
+        // diffusion engine. If the OUTER binary is native (PR builds), it serves
+        // them directly at best-effort — no worker. Otherwise the only binary
+        // with the engine is the nested apns worker, so use it even on a
+        // best-effort machine: it serves best-effort when desiredTier isn't
+        // confidential, but has the native engine so SDXL/SD run (just not
+        // verified confidential). FLUX + chat stay on the subprocess engines.
+        let needsNativeImage = Self.configuredModelsNeedNativeImage()
+        let mainIsNative = Self.mainBinaryIsNative()
+        let bin: URL?
+        if confidential {
+            bin = Self.confidentialWorkerBinary() ?? Self.locateBinary()
+        } else if needsNativeImage, !mainIsNative, let worker = Self.confidentialWorkerBinary() {
+            bin = worker
+        } else {
+            // Main binary — native (serves SDXL best-effort directly) or lean.
+            bin = Self.serveBinary(tier: tier)
+        }
+        guard let bin else {
             NSLog("cocore: provider binary not found")
             return
         }
@@ -730,5 +748,36 @@ final class AgentSupervisor {
     /// surface that rather than spin waiting for a verification that can't come.
     nonisolated static func hasConfidentialWorker() -> Bool {
         confidentialWorkerBinary() != nil
+    }
+
+    /// True when the OUTER (main) binary itself ships the in-process MLX engine
+    /// — i.e. it was built with `--features native_mlx`, which colocates
+    /// `libCoCoreMLX.dylib` next to the `cocore` CLI. Such a build serves
+    /// native-only image models (SDXL / SD) directly at best-effort, with no
+    /// confidential worker needed. (PR builds turn this on; prod keeps the outer
+    /// app lean and ships the engine in the nested apns worker instead.)
+    nonisolated static func mainBinaryIsNative() -> Bool {
+        let dylib = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/libCoCoreMLX.dylib")
+        return FileManager.default.fileExists(atPath: dylib.path)
+    }
+
+    /// True when SOME binary in this app can run the in-process native
+    /// diffusion engine — the native outer build OR the nested apns worker.
+    /// Drives whether SDXL / SD image models are servable here.
+    nonisolated static func hasNativeImageEngine() -> Bool {
+        mainBinaryIsNative() || hasConfidentialWorker()
+    }
+
+    /// True when any configured (UserDefaults) model needs the in-process
+    /// native diffusion engine — SDXL / Stable-Diffusion. Those run only in the
+    /// native worker binary, so `spawnChild` uses the worker for them even on a
+    /// best-effort machine (serving best-effort, just with the native engine
+    /// available). FLUX / chat models don't need it.
+    nonisolated static func configuredModelsNeedNativeImage() -> Bool {
+        let models = (UserDefaults.standard.string(forKey: "inferenceModels") ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return models.contains { ModelManager.isNativeOnlyImage($0) }
     }
 }

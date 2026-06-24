@@ -9,8 +9,18 @@
 
 use anyhow::Result;
 
-use crate::engines::{DeltaChannel, Engine, GenerateRequest, GenerateResponse};
+use crate::engines::{
+    encode_image_delta, is_image_model, DeltaChannel, Engine, GenerateRequest, GenerateResponse,
+};
 use crate::pricing;
+
+/// A fixed, valid 1×1 PNG (transparent pixel), base64-encoded. The stub
+/// image path emits exactly this for any image-generation request — it
+/// proves the protocol, receipts, and chat UX end-to-end without any GPU
+/// or diffusion backend. Real pixels arrive with the Phase 8 subprocess /
+/// Phase 10 native engines.
+const STUB_PNG_B64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 pub struct StubEngine;
 
@@ -66,6 +76,38 @@ impl Engine for StubEngine {
         request: &GenerateRequest,
         on_delta: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
     ) -> Result<GenerateResponse> {
+        // Image-generation models (e.g. `stub-flux`): emit one fixed PNG on
+        // the image channel instead of echoing text. The prompt — t2i raw
+        // text or the last user turn of a `messages-v1` envelope — is read
+        // only to size the token estimate; the pixels are constant.
+        if is_image_model(&request.model) {
+            let prompt_bytes: Vec<u8> = request
+                .messages
+                .iter()
+                .map(|m| m.content_text())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes();
+            let has_reference = request.messages.iter().any(|m| m.has_images());
+            on_delta(
+                DeltaChannel::Image,
+                &encode_image_delta("image/png", STUB_PNG_B64),
+            )?;
+            let tokens_in = pricing::estimate_tokens(&prompt_bytes);
+            // Output "tokens" for an image are a byte-estimate over the
+            // emitted image payload until step-based pricing lands.
+            let tokens_out = pricing::estimate_tokens(STUB_PNG_B64.as_bytes());
+            tracing::debug!(
+                model = %request.model,
+                has_reference,
+                "stub image engine emitted fixed 1x1 PNG"
+            );
+            return Ok(GenerateResponse {
+                text: String::new(),
+                tokens_in,
+                tokens_out,
+            });
+        }
         let resp = self.generate_once(request)?;
         // Slice the stub reply so local/dev runs exercise multi-chunk
         // relay even without a real tokenizer backend.
