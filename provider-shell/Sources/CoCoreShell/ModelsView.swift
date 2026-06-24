@@ -1184,17 +1184,20 @@ struct ModelsView: View {
             }
 
             Section {
-                // Text vs Image filter. Switches the HF search query and the
-                // curated suggestions below.
-                Picker("Kind", selection: $addKind) {
-                    ForEach(ModelManager.ModelKind.allCases) { k in
-                        Text(k.rawValue).tag(k)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-
                 HStack(spacing: 8) {
+                    // Text vs Image filter as an inline dropdown sitting with the
+                    // search field. Switches the HF query + the curated
+                    // suggestions below. `.fixedSize` keeps it compact so the
+                    // search box takes the rest of the row.
+                    Picker("Kind", selection: $addKind) {
+                        ForEach(ModelManager.ModelKind.allCases) { k in
+                            Text(k.rawValue).tag(k)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+
                     // labelsHidden + prompt: a plain full-width search box with
                     // an in-field placeholder, not a Form label/value row (which
                     // would push the typed text to the right and wrap the
