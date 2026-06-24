@@ -22,9 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::engines::{
-    encode_image_delta, DeltaChannel, Engine, GenerateRequest, GenerateResponse,
-};
+use crate::engines::{encode_image_delta, DeltaChannel, Engine, GenerateRequest, GenerateResponse};
 use crate::pricing;
 
 /// Embedded image-server wrapper, written to disk at first spawn (same
@@ -155,7 +153,10 @@ impl ImageSubprocessEngine {
             }
             if now.duration_since(started) > READY_HARD_CAP {
                 let _ = child.kill();
-                bail!("image subprocess for {} did not become ready within the hard cap", self.model_id);
+                bail!(
+                    "image subprocess for {} did not become ready within the hard cap",
+                    self.model_id
+                );
             }
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -203,15 +204,18 @@ impl ImageSubprocessEngine {
     /// Hand-rolled HTTP/1.1 POST against the UDS (same approach as the chat
     /// engine — avoids pulling in an async HTTP client for one route).
     fn http_post_uds(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("connecting to image socket {}", self.socket_path.display()))?;
+        let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
+            format!("connecting to image socket {}", self.socket_path.display())
+        })?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
         let head = format!(
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        stream.write_all(head.as_bytes()).context("writing request head")?;
+        stream
+            .write_all(head.as_bytes())
+            .context("writing request head")?;
         stream.write_all(body).context("writing request body")?;
         stream.flush().ok();
 
@@ -234,7 +238,10 @@ impl ImageSubprocessEngine {
             .ok_or_else(|| anyhow!("could not parse status from {status_line:?}"))?;
         if !(200..300).contains(&status) {
             // Never log the body — an error response may echo the prompt.
-            bail!("image engine returned HTTP {status} ({} body bytes elided)", body_bytes.len());
+            bail!(
+                "image engine returned HTTP {status} ({} body bytes elided)",
+                body_bytes.len()
+            );
         }
         Ok(body_bytes.to_vec())
     }
@@ -503,7 +510,10 @@ mod tests {
     #[test]
     fn parse_generate_response_rejects_empty_and_malformed() {
         assert!(ImageSubprocessEngine::parse_generate_response(br#"{"images":[]}"#).is_err());
-        assert!(ImageSubprocessEngine::parse_generate_response(br#"{"images":[{"mime":"x"}]}"#).is_err());
+        assert!(
+            ImageSubprocessEngine::parse_generate_response(br#"{"images":[{"mime":"x"}]}"#)
+                .is_err()
+        );
         assert!(ImageSubprocessEngine::parse_generate_response(b"not json").is_err());
     }
 }

@@ -84,9 +84,7 @@ impl NativeMlxImageEngine {
             ffi::cocore_mlx_load_diffusion_model(c_id.as_ptr(), c_dir.as_ptr(), &mut handle)
         };
         if rc != 0 || handle.is_null() {
-            anyhow::bail!(
-                "cocore_mlx_load_diffusion_model failed (rc={rc}) for model {model_id}"
-            );
+            anyhow::bail!("cocore_mlx_load_diffusion_model failed (rc={rc}) for model {model_id}");
         }
         let mut buf = [0u8; 65];
         let hrc = unsafe {
@@ -249,7 +247,10 @@ impl Engine for NativeMlxImageEngine {
         unsafe { ffi::cocore_mlx_free_buffer(out_png) };
 
         let data_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        on_delta(DeltaChannel::Image, &encode_image_delta("image/png", &data_b64))?;
+        on_delta(
+            DeltaChannel::Image,
+            &encode_image_delta("image/png", &data_b64),
+        )?;
         Ok(GenerateResponse {
             text: String::new(),
             tokens_in: if tin > 0 {
@@ -302,7 +303,10 @@ mod tests {
 
         let req = GenerateRequest {
             model: "flux".into(),
-            messages: vec![crate::engines::Message::text("user", "a red apple on a table")],
+            messages: vec![crate::engines::Message::text(
+                "user",
+                "a red apple on a table",
+            )],
             max_tokens: 4,
             temperature: None,
             top_p: None,

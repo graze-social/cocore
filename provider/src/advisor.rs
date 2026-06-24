@@ -22,9 +22,9 @@
 use crate::canonical::to_canonical_bytes;
 use crate::crypto::ProviderKeypair;
 use crate::engines::{decode_image_delta, DeltaChannel, Engine, EngineRegistry};
-use crate::images_envelope::{build_images_envelope_bytes, EnvelopeImage};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
+use crate::images_envelope::{build_images_envelope_bytes, EnvelopeImage};
 use crate::pds::PdsClient;
 use crate::pricing;
 use crate::protocol::{

@@ -43,8 +43,7 @@ mod tests {
     // asserted on the TS side (packages/sdk/src/images-envelope.test.ts). A
     // divergence in either canonicalizer is caught here.
     const FIXTURE_CANONICAL: &str = r#"{"images":[{"data":"aGVsbG8=","mime":"image/png"}],"v":1}"#;
-    const FIXTURE_SHA256: &str =
-        "87727768fff8767ca20fdc4880a22a2899216722d446d498da395ef1ada58681";
+    const FIXTURE_SHA256: &str = "87727768fff8767ca20fdc4880a22a2899216722d446d498da395ef1ada58681";
 
     #[test]
     fn canonical_bytes_match_cross_language_fixture() {
