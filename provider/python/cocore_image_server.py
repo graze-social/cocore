@@ -120,14 +120,25 @@ def _resolve_flux_name(model: str) -> str:
     """Map an agent-supplied model id to an mflux model name. mflux's
     built-in names are ``schnell`` (fast, 4 steps) and ``dev`` (slower,
     higher quality); a full HF path is also accepted by recent mflux.
+
+    mflux serves FLUX models ONLY. A non-FLUX image id (SDXL /
+    Stable-Diffusion) is rejected with a clear error rather than handed to
+    mflux's FLUX loader, which would fail cryptically — SDXL/SD run only in
+    the native (confidential) diffusion engine, never here.
     """
     m = model.lower()
     if "schnell" in m:
         return "schnell"
     if "dev" in m:
         return "dev"
-    # Pass the id through; recent mflux resolves an HF repo path directly.
-    return model
+    if "flux" in m:
+        # A FLUX id without an explicit schnell/dev variant — default schnell.
+        return "schnell"
+    raise ValueError(
+        f"mflux serves FLUX models only; '{model}' is not a FLUX model. "
+        "SDXL / Stable-Diffusion-class image models require the confidential "
+        "(native MLX) build, not the mflux subprocess."
+    )
 
 
 class _FluxBackend:

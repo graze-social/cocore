@@ -552,17 +552,18 @@ final class ModelManager: ObservableObject {
         return imageMarkers.contains(where: id.contains) ? .image : .text
     }
 
-    /// Curated image-generation models for the "Add a model" Image tab. The
-    /// SDXL/SD entries are confidential-capable (in-process native MLX); the
-    /// FLUX entries serve on the best-effort subprocess path (mflux);
-    /// `stub-flux` is the zero-RAM smoke test. Mirrors the Rust `RATES` image
-    /// entries + `stub-flux`.
+    /// Curated image-generation models for the "Add a model" Image tab. Only
+    /// models this build can actually SERVE: `stub-flux` (StubEngine, zero
+    /// RAM) and FLUX (the mflux subprocess). SDXL / SD-2.1 are deliberately
+    /// NOT here — they run only in the in-process native-MLX engine, which
+    /// ships in the confidential build and is configured by the operator, not
+    /// the GUI add flow. Offering them here on a normal (best-effort) build
+    /// would route them to mflux — which is FLUX-only — and every load would
+    /// fail. Mirrors the servable subset of the Rust `RATES` image entries.
     static let imageCatalog: [CatalogEntry] = [
         CatalogEntry(nsid: "stub-flux", label: "Stub (image smoke test)", minRamGB: 0, recommended: false, blurb: "Emits a fixed 1×1 PNG — no GPU. Proves the image path end-to-end."),
-        CatalogEntry(nsid: "stabilityai/sdxl-turbo", label: "SDXL-Turbo", minRamGB: 12, recommended: true, blurb: "Fast 2-step image gen. Runs in the confidential engine."),
-        CatalogEntry(nsid: "stabilityai/stable-diffusion-2-1-base", label: "Stable Diffusion 2.1", minRamGB: 12, recommended: false, blurb: "Classic SD image gen. Confidential-capable."),
-        CatalogEntry(nsid: "black-forest-labs/FLUX.1-schnell", label: "FLUX.1 schnell", minRamGB: 16, recommended: true, blurb: "Fast 4-step FLUX (best-effort, via mflux)."),
-        CatalogEntry(nsid: "black-forest-labs/FLUX.1-dev", label: "FLUX.1 dev", minRamGB: 24, recommended: false, blurb: "Higher-quality FLUX (best-effort, via mflux)."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-schnell", label: "FLUX.1 schnell", minRamGB: 16, recommended: true, blurb: "Fast 4-step FLUX image generation (via mflux)."),
+        CatalogEntry(nsid: "black-forest-labs/FLUX.1-dev", label: "FLUX.1 dev", minRamGB: 24, recommended: false, blurb: "Higher-quality FLUX image generation (via mflux)."),
     ]
 
     /// The recommended (latest & greatest) subset of the catalog mirror.

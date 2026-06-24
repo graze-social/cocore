@@ -130,18 +130,21 @@ pub const RATES: &[ModelRate] = &[
         recommended: true,
         modality: Modality::Image,
     },
-    // In-process diffusion models for the confidential tier (native MLX /
+    // In-process diffusion models for the confidential tier ONLY (native MLX /
     // CoCoreMLX dylib). These are the two the MLX-Swift StableDiffusion library
-    // ships — they run entirely inside the measured binary, unlike the Flux
-    // entries above which serve on the best-effort subprocess path.
+    // ships — they run entirely inside the measured binary. They have NO engine
+    // on a best-effort build (the mflux subprocess is FLUX-only), so they are
+    // NOT `recommended`: they must be configured via COCORE_NATIVE_MLX_IMAGE_MODEL
+    // on a native build, never added to the normal model list on a best-effort
+    // one (where they'd route to mflux and fail every load).
     ModelRate {
         model_id: "stabilityai/sdxl-turbo",
         input_per_mtok: 1_000_000,
         output_per_mtok: 1_000_000,
         currency: "CC",
         min_ram_gb: 12,
-        description: "SDXL-Turbo — fast 2-step image gen; confidential-capable",
-        recommended: true,
+        description: "SDXL-Turbo — fast 2-step image gen; confidential build only",
+        recommended: false,
         modality: Modality::Image,
     },
     ModelRate {
@@ -150,7 +153,7 @@ pub const RATES: &[ModelRate] = &[
         output_per_mtok: 1_000_000,
         currency: "CC",
         min_ram_gb: 12,
-        description: "Stable Diffusion 2.1 — image gen; confidential-capable",
+        description: "Stable Diffusion 2.1 — image gen; confidential build only",
         recommended: false,
         modality: Modality::Image,
     },

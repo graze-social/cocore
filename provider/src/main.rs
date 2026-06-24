@@ -2119,6 +2119,11 @@ fn build_engines(
     let mut failed: Vec<String> = vec![];
     let mut saw_venv_missing = false;
     let mut last_err: Option<String> = None;
+    // Image models with no engine on THIS (best-effort) build — SDXL / SD-class
+    // ids that only the native confidential diffusion engine can serve. Tracked
+    // separately so the fault is honest ("needs the confidential build") instead
+    // of the misleading generic "not in MLX format" message.
+    let mut confidential_only_image: Vec<String> = vec![];
 
     for model in &configured {
         // Smoke-test stubs (`stub`, `stub-flux`) are always served by the
@@ -2138,6 +2143,20 @@ fn build_engines(
         // (`cocore_image_server.py` / mflux), not the vllm-mlx chat engine.
         // Routing is by the catalog-authoritative `is_image_model`.
         if cocore_provider::engines::is_image_model(model) {
+            // The mflux subprocess is FLUX-only. A non-FLUX image model
+            // (SDXL / Stable-Diffusion) has no engine on this best-effort build
+            // — it runs only in the native confidential diffusion engine. Don't
+            // spawn mflux for it (every load would fail with a cryptic error);
+            // record it as confidential-only so the fault is honest.
+            if !cocore_provider::engines::is_flux_model(model) {
+                tracing::warn!(
+                    model = %model,
+                    "image model needs the confidential native engine; the best-effort mflux subprocess (FLUX-only) can't serve it"
+                );
+                confidential_only_image.push(model.clone());
+                failed.push(model.clone());
+                continue;
+            }
             match start_image_engine_with_recovery(model, &venv_python) {
                 Ok(engine) => {
                     tracing::info!(model = %model, "image-generation subprocess engine ready");
@@ -2240,6 +2259,31 @@ fn build_engines(
                  `mlx-community/Qwen2.5-VL-7B-Instruct-4bit` or \
                  `mlx-community/Qwen2.5-VL-3B-Instruct-4bit` — then start serving again.",
                 failed.join(", "),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
+    } else if !confidential_only_image.is_empty()
+        && failed.iter().all(|m| confidential_only_image.contains(m))
+    {
+        // Every failure is an image model with no best-effort engine (SDXL /
+        // Stable-Diffusion). Give an honest fault instead of the generic
+        // "not in MLX format" one — the weights are fine, this build just
+        // can't serve them.
+        tracing::warn!(
+            models = ?confidential_only_image,
+            "image model(s) need the confidential build's native diffusion engine; serving stub only"
+        );
+        EngineFault {
+            code: "image-model-needs-confidential".to_string(),
+            message: format!(
+                "The image model(s) [{}] (SDXL / Stable-Diffusion class) run only in the \
+                 in-process native diffusion engine, which ships in the CONFIDENTIAL build. \
+                 This is the standard best-effort build, which generates images via the FLUX \
+                 path (mflux) only. The machine is online but only serving the no-op `stub` \
+                 engine. Fix: use a FLUX image model — `black-forest-labs/FLUX.1-schnell` — \
+                 or `stub-flux` for a no-GPU smoke test, then start serving again.",
+                confidential_only_image.join(", "),
             ),
             models: all_unserved,
             at: chrono::Utc::now(),

@@ -462,9 +462,21 @@ pub fn is_image_model(model: &str) -> bool {
         Some(modality) => modality == crate::pricing::Modality::Image,
         None => {
             let lower = model.to_ascii_lowercase();
-            IMAGE_MODEL_MARKERS.iter().any(|marker| lower.contains(marker))
+            IMAGE_MODEL_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
         }
     }
+}
+
+/// Whether an image model is a FLUX-family model the mflux subprocess engine
+/// can serve. mflux is FLUX-only: SDXL / Stable-Diffusion-class image models
+/// have NO subprocess engine and run only in the native (confidential) MLX
+/// diffusion engine. The registry uses this so it never spawns mflux for a
+/// model it can't load (which would fail every attempt with a cryptic error).
+pub fn is_flux_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("flux") || lower.contains("schnell") || lower.contains("dev")
 }
 
 /// Wire form of a generated-image delta passed through the engine's text
@@ -1000,6 +1012,17 @@ mod tests {
         // a plain off-catalog chat id stays text.
         assert!(!is_image_model("stub"));
         assert!(!is_image_model("mlx-community/Qwen2.5-7B-Instruct-4bit"));
+    }
+
+    #[test]
+    fn flux_models_distinguished_from_other_image_models() {
+        // FLUX ids the mflux subprocess can serve.
+        assert!(is_flux_model("black-forest-labs/FLUX.1-schnell"));
+        assert!(is_flux_model("black-forest-labs/FLUX.1-dev"));
+        assert!(is_flux_model("some-org/my-flux-finetune"));
+        // SDXL / SD are image models but NOT mflux-servable (native-only).
+        assert!(!is_flux_model("stabilityai/sdxl-turbo"));
+        assert!(!is_flux_model("stabilityai/stable-diffusion-2-1-base"));
     }
 
     #[test]
