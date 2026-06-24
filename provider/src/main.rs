@@ -792,12 +792,15 @@ async fn prepare_native_confidential_model() {
         tracing::info!("native MLX model already configured via env; skipping download probe");
         return;
     }
-    // Choose the model: the owner's first non-`stub` desiredModels, else the
-    // small default. The native engine serves a single model.
+    // Choose the model: the owner's first non-`stub`, non-IMAGE desiredModels,
+    // else the small default. This wires the native CHAT engine, so image
+    // models (which the build_engines image branch routes to the native
+    // DIFFUSION engine separately) must be skipped — otherwise an image-only
+    // config would pick e.g. `sdxl-turbo` and fail to load it as an LLM.
     let model = read_my_desired_models()
         .await
         .into_iter()
-        .find(|m| m != "stub")
+        .find(|m| m != "stub" && !cocore_provider::engines::is_image_model(m))
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     // Resolve the venv interpreter the install script bootstrapped.
@@ -2122,7 +2125,9 @@ fn build_engines(
     // Image models with no engine on THIS (best-effort) build — SDXL / SD-class
     // ids that only the native confidential diffusion engine can serve. Tracked
     // separately so the fault is honest ("needs the confidential build") instead
-    // of the misleading generic "not in MLX format" message.
+    // of the misleading generic "not in MLX format" message. (On a native_mlx
+    // build these route to the in-process engine instead, so this stays empty.)
+    #[cfg_attr(feature = "native_mlx", allow(unused_mut))]
     let mut confidential_only_image: Vec<String> = vec![];
 
     for model in &configured {
@@ -2143,19 +2148,49 @@ fn build_engines(
         // (`cocore_image_server.py` / mflux), not the vllm-mlx chat engine.
         // Routing is by the catalog-authoritative `is_image_model`.
         if cocore_provider::engines::is_image_model(model) {
-            // The mflux subprocess is FLUX-only. A non-FLUX image model
-            // (SDXL / Stable-Diffusion) has no engine on this best-effort build
-            // — it runs only in the native confidential diffusion engine. Don't
-            // spawn mflux for it (every load would fail with a cryptic error);
-            // record it as confidential-only so the fault is honest.
+            // Run each image model on the RIGHT framework. The mflux subprocess
+            // is FLUX-only; SDXL / Stable-Diffusion-class models run ONLY in the
+            // native in-process diffusion engine (the MLX-Swift StableDiffusion
+            // backend). So a non-FLUX image model goes to the native engine on a
+            // confidential (native_mlx) build, and on a best-effort build it has
+            // no engine at all → an honest fault (never mflux, which would fail
+            // every load with a cryptic error).
             if !cocore_provider::engines::is_flux_model(model) {
-                tracing::warn!(
-                    model = %model,
-                    "image model needs the confidential native engine; the best-effort mflux subprocess (FLUX-only) can't serve it"
-                );
-                confidential_only_image.push(model.clone());
-                failed.push(model.clone());
-                continue;
+                #[cfg(feature = "native_mlx")]
+                {
+                    use cocore_provider::engines::native_mlx_image::NativeMlxImageEngine;
+                    use cocore_provider::engines::Engine;
+                    // Weights download to the default Hub cache (empty dir).
+                    match NativeMlxImageEngine::load(model, std::path::PathBuf::new()) {
+                        Ok(engine) if engine.ready() => {
+                            tracing::info!(model = %model, "image-generation native in-process engine ready");
+                            registry.register(model.clone(), std::sync::Arc::new(engine));
+                        }
+                        Ok(_) => {
+                            last_err = Some(format!(
+                                "native diffusion engine for {model} loaded but its metallib couldn't be located"
+                            ));
+                            tracing::warn!(model = %model, "inference engine load failed");
+                            failed.push(model.clone());
+                        }
+                        Err(e) => {
+                            last_err = Some(format!("{e:#}"));
+                            tracing::warn!(model = %model, error = %e, "native diffusion engine load failed");
+                            failed.push(model.clone());
+                        }
+                    }
+                    continue;
+                }
+                #[cfg(not(feature = "native_mlx"))]
+                {
+                    tracing::warn!(
+                        model = %model,
+                        "image model needs the confidential native engine; the best-effort mflux subprocess (FLUX-only) can't serve it"
+                    );
+                    confidential_only_image.push(model.clone());
+                    failed.push(model.clone());
+                    continue;
+                }
             }
             match start_image_engine_with_recovery(model, &venv_python) {
                 Ok(engine) => {
