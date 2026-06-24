@@ -20,6 +20,19 @@
 //! exchange's tokenRate continues to match what receipts get stamped
 //! with.
 
+/// What a catalog model produces. Drives which engine load path the
+/// registry selects. Additive: new output kinds (audio, video) can be
+/// appended without breaking existing entries. `Text` is the default for
+/// chat/instruct models (including vision models, which take image INPUT
+/// but answer in text); `Image` marks text-to-image / img2img models that
+/// emit an `images-v1` receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Modality {
+    #[default]
+    Text,
+    Image,
+}
+
 /// One model the agent can plausibly serve, plus its per-token rate
 /// and the rough RAM budget it expects to have. The hardware budget
 /// drives `models_for_machine`: an 8GB Mac mini doesn't pretend it
@@ -40,6 +53,13 @@ pub struct ModelRate {
     pub output_per_mtok: u64,
     pub currency: &'static str,
     pub min_ram_gb: u32,
+    /// What this model PRODUCES. Authoritative for engine routing — a
+    /// catalog entry's declared modality beats any id-string heuristic, so
+    /// a chat model that happens to contain "flux" in its name is never
+    /// mis-routed to the image path, and a new image model is classified
+    /// the moment it's added here regardless of its id. (Vision/image
+    /// INPUT capability stays a separate detector, `is_vision_model`.)
+    pub modality: Modality,
     /// One-line human-readable hint surfaced by the CLI picker and the
     /// console's `/start` model selector. Not part of any on-wire
     /// format — this is purely UX copy, can change without breaking
@@ -70,6 +90,20 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 0,
         description: "echo-only smoke-test target; not a real model",
         recommended: false,
+        modality: Modality::Text,
+    },
+    // Image-generation smoke-test target. The StubEngine emits a fixed
+    // 1×1 PNG (no GPU / diffusion backend), so any machine can serve it —
+    // useful for exercising the image channel + images-v1 receipt path.
+    ModelRate {
+        model_id: "stub-flux",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 0,
+        description: "stub image-gen smoke test; emits a fixed 1x1 PNG",
+        recommended: false,
+        modality: Modality::Image,
     },
     // ---- Current rotation (recommended) -------------------------------
     // The "latest & greatest" set the Secure Mode upgrade urges providers
@@ -85,6 +119,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 4,
         description: "Qwen3.5 0.8B — fast, low quality; fits any Apple Silicon",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-2B-MLX-4bit",
@@ -94,6 +129,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 6,
         description: "Qwen3.5 2B — small but coherent; good on 8GB",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -103,6 +139,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Qwen3.5 4B — balanced default for 8GB+ Macs",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/gemma-4-e4b-it-4bit",
@@ -112,6 +149,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Gemma 4 E4B — efficient multimodal-class; 8GB+",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -121,6 +159,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 16,
         description: "Qwen3.5 9B — strong general-purpose; 16GB+ recommended",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.6-27B-4bit",
@@ -130,6 +169,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 24,
         description: "Qwen3.6 27B — frontier-class dense; 24GB+",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -139,6 +179,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 32,
         description: "Qwen3.6 35B-A3B MoE — fast for its size; 32GB+",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit",
@@ -148,6 +189,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 64,
         description: "Llama 4 Scout 17B×16E MoE — heavyweight; 64GB+",
         recommended: true,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-122B-A10B-4bit",
@@ -157,6 +199,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 96,
         description: "Qwen3.5 122B-A10B MoE — flagship; 96GB+ Mac Studio/Ultra",
         recommended: true,
+        modality: Modality::Text,
     },
     // ---- Legacy catalog (still servable; not recommended) -------------
     // Kept so a machine that already pinned one of these keeps its RAM
@@ -170,6 +213,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 4,
         description: "Qwen 0.5B (legacy) — fast, low quality",
         recommended: false,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-3B-Instruct-4bit",
@@ -179,6 +223,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Qwen 3B (legacy) — small but coherent",
         recommended: false,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-7B-Instruct-4bit",
@@ -188,6 +233,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 16,
         description: "Qwen 7B (legacy) — strong general-purpose",
         recommended: false,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/gemma-3-4b-it-qat-4bit",
@@ -197,6 +243,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Gemma 3 4B QAT (legacy) — balanced for 8GB+",
         recommended: false,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-32B-Instruct-4bit",
@@ -206,6 +253,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 32,
         description: "Qwen 32B (legacy) — frontier-class",
         recommended: false,
+        modality: Modality::Text,
     },
     ModelRate {
         model_id: "mlx-community/Llama-3.3-70B-Instruct-4bit",
@@ -215,19 +263,38 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 64,
         description: "Llama 3.3 70B (legacy) — heavyweight",
         recommended: false,
+        modality: Modality::Text,
     },
 ];
 
-/// Catalog entries this machine can plausibly run, excluding the stub
-/// (which is always-loaded; adding it via `models add` is a no-op).
-/// Used by `cocore agent models add` (no arg → interactive picker)
-/// and mirrored TS-side for the `/start` web picker. Order matches
-/// `RATES` order so the menu walks small → large.
+/// Catalog entries this machine can plausibly run, excluding the smoke-test
+/// stubs (`stub`, `stub-flux`) — they're always-served by the StubEngine, so
+/// adding one via `models add` is a no-op. Used by `cocore agent models add`
+/// (no arg → interactive picker) and mirrored TS-side for the `/start` web
+/// picker. Order matches `RATES` order so the menu walks small → large.
 pub fn pickable_for_machine(ram_gb: u32) -> Vec<&'static ModelRate> {
     RATES
         .iter()
-        .filter(|m| m.model_id != "stub" && m.min_ram_gb <= ram_gb)
+        .filter(|m| !is_smoke_test_model(m.model_id) && m.min_ram_gb <= ram_gb)
         .collect()
+}
+
+/// The always-available smoke-test models the StubEngine serves on any
+/// machine: `stub` (echo text) and `stub-flux` (fixed 1×1 PNG). They're
+/// advertised everywhere but never offered as a pickable "real" model.
+pub fn is_smoke_test_model(model_id: &str) -> bool {
+    matches!(model_id, "stub" | "stub-flux")
+}
+
+/// The declared output modality for a catalog model id, or `None` for an
+/// off-catalog (custom) model the catalog says nothing about. Callers that
+/// need a yes/no answer for an unknown id fall back to an id heuristic
+/// (see `engines::is_image_model`).
+pub fn modality_for(model_id: &str) -> Option<Modality> {
+    RATES
+        .iter()
+        .find(|r| r.model_id == model_id)
+        .map(|r| r.modality)
 }
 
 /// The catalog RAM floor for a model id, or `None` for an off-catalog
@@ -490,9 +557,10 @@ mod tests {
 
     #[test]
     fn models_for_machine_filters_by_ram() {
-        // 0GB: only `stub`. Used for guards / boundary cases.
+        // 0GB: only the always-available smoke-test stubs (`stub` echo +
+        // `stub-flux` image). Used for guards / boundary cases.
         let zero = models_for_machine(0);
-        assert_eq!(zero, vec!["stub"]);
+        assert_eq!(zero, vec!["stub", "stub-flux"]);
 
         // 8GB M1: stub + the 0.5B + the 3B + the gemma-3-4b. The 7B
         // and bigger are filtered out so the advisor never routes
@@ -561,6 +629,7 @@ mod tests {
             min_ram_gb: 0,
             description: "synthetic test rate",
             recommended: false,
+            modality: Modality::Text,
         };
         // 1M input × 1000 / 1M = 1000 cents = $10
         assert_eq!(price_minor(r, 1_000_000, 0), 1_000);
@@ -572,8 +641,8 @@ mod tests {
 
     #[test]
     fn pickable_for_machine_excludes_stub_and_filters_by_ram() {
-        // stub is always-loaded so it's not in the picker. 0GB: only
-        // stub fits, so the pickable list is empty.
+        // The smoke-test stubs are always-loaded so they're not in the
+        // picker. 0GB: only those fit, so the pickable list is empty.
         let zero = pickable_for_machine(0);
         assert!(
             zero.is_empty(),
@@ -587,6 +656,7 @@ mod tests {
         assert!(eight.contains(&"mlx-community/gemma-3-4b-it-qat-4bit"));
         assert!(!eight.contains(&"mlx-community/Qwen2.5-7B-Instruct-4bit"));
         assert!(!eight.contains(&"stub"));
+        assert!(!eight.contains(&"stub-flux"));
 
         // 64GB: everything except stub.
         let sixty_four: Vec<&str> = pickable_for_machine(64)

@@ -1860,6 +1860,12 @@ fn build_engines(
     use cocore_provider::engines::stub::StubEngine;
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
+    // The image-generation smoke target. The StubEngine emits a fixed 1×1
+    // PNG for it (no GPU/diffusion backend), so every machine can serve it
+    // — this is the always-available image counterpart to `stub` and proves
+    // the image channel + images-v1 receipt path end-to-end. Real image
+    // models route to the diffusion engines (Phase 8/10) instead.
+    registry.register("stub-flux", std::sync::Arc::new(StubEngine));
 
     // A confidential machine's native engine failed to come up. Surfaced as
     // the serve's engineFault so the console shows an honest "couldn't serve

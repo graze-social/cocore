@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod engines;
 pub mod error;
 pub mod hypervisor;
+pub mod images_envelope;
 // `inference` (the PyO3 Python-sandbox module) was removed in v0.6.0
 // alongside the rest of the in-process Python design. See
 // `engines::subprocess` for the replacement (out-of-process Python via

@@ -39,6 +39,7 @@ fn writes_cross_lang_fixture() {
         // New optional fields stay None here so the pinned canonical bytes
         // (and the cross-language golden fixture) are unchanged — both are
         // skip-serialized when absent.
+        output_format: None,
         output_cipher_commitment: None,
         reasoning_commitment: None,
         params: None,

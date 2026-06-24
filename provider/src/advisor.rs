@@ -21,7 +21,8 @@
 
 use crate::canonical::to_canonical_bytes;
 use crate::crypto::ProviderKeypair;
-use crate::engines::{DeltaChannel, Engine, EngineRegistry};
+use crate::engines::{decode_image_delta, DeltaChannel, Engine, EngineRegistry};
+use crate::images_envelope::{build_images_envelope_bytes, EnvelopeImage};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
 use crate::pds::PdsClient;
@@ -63,6 +64,16 @@ impl Drop for ZeroizeOnDrop {
             m.zeroize_content();
         }
     }
+}
+
+/// A plaintext delta crossing the blocking-engine → async-seal bridge.
+/// Text and reasoning tokens travel as `Text`; image-generation engines,
+/// which can't fit `(mime, base64)` through the text sink, encode it on
+/// [`DeltaChannel::Image`] and it arrives here as a structured `Image`
+/// ready to seal as a chunk and accumulate into the images-v1 envelope.
+enum StreamDelta {
+    Text(DeltaChannel, String),
+    Image { mime: String, data_b64: String },
 }
 
 /// Bundles the long-lived state that
@@ -1027,13 +1038,24 @@ async fn handle_inference_request_inner(
     // thread and bridge plaintext deltas back to this async task,
     // which seals each delta and forwards it to the advisor
     // immediately (live path) or collects frames for tests.
-    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel::<(DeltaChannel, String)>();
+    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel::<StreamDelta>();
     let engine_for_blocking = engine.clone();
     let engine_handle = tokio::task::spawn_blocking(move || {
         let guard = ZeroizeOnDrop(request);
         engine_for_blocking.generate_stream(&guard.0, &mut |channel, delta| {
+            // Image-generation engines can't carry (mime, base64) through the
+            // text sink, so they encode it as a small JSON string on the
+            // `Image` channel; decode it back to a structured delta here so
+            // the seal loop can build the chunk plaintext + the images-v1
+            // envelope. Text/reasoning deltas pass through verbatim.
+            let item = if channel == DeltaChannel::Image {
+                let (mime, data_b64) = decode_image_delta(delta)?;
+                StreamDelta::Image { mime, data_b64 }
+            } else {
+                StreamDelta::Text(channel, delta.to_string())
+            };
             plain_tx
-                .send((channel, delta.to_string()))
+                .send(item)
                 .map_err(|_| anyhow::anyhow!("stream bridge closed"))?;
             Ok(())
         })
@@ -1045,6 +1067,10 @@ async fn handle_inference_request_inner(
     // commitment, and each chunk is tagged with its channel for the requester.
     let mut reply = Zeroizing::new(String::new());
     let mut reasoning = Zeroizing::new(String::new());
+    // Images produced on the image channel, in order, for the images-v1
+    // output envelope. Non-empty only for image-generation models; when set,
+    // outputCommitment covers the envelope instead of the answer text.
+    let mut images: Vec<EnvelopeImage> = Vec::new();
     let mut all_ciphertext = Vec::new();
     let mut seq = 0u32;
 
@@ -1060,14 +1086,44 @@ async fn handle_inference_request_inner(
     loop {
         tokio::select! {
             maybe = plain_rx.recv() => {
-                let Some((channel, delta)) = maybe else { break };
-                match channel {
-                    DeltaChannel::Content => reply.push_str(&delta),
-                    DeltaChannel::Reasoning => reasoning.push_str(&delta),
-                }
+                let Some(item) = maybe else { break };
+                // Resolve each delta to the plaintext bytes we seal and the
+                // wire channel we tag the chunk with. Text/reasoning seal the
+                // raw token bytes; an image seals a canonical JSON part
+                // { type:"image", mime, data } and is accumulated for the
+                // images-v1 output envelope.
+                let (plaintext_bytes, chunk_channel): (Vec<u8>, ChunkChannel) = match item {
+                    StreamDelta::Text(channel, delta) => {
+                        match channel {
+                            DeltaChannel::Content => reply.push_str(&delta),
+                            DeltaChannel::Reasoning => reasoning.push_str(&delta),
+                            // The image channel never travels as text.
+                            DeltaChannel::Image => {}
+                        }
+                        let chunk_channel = match channel {
+                            DeltaChannel::Content => ChunkChannel::Content,
+                            DeltaChannel::Reasoning => ChunkChannel::Reasoning,
+                            DeltaChannel::Image => ChunkChannel::Image,
+                        };
+                        (delta.into_bytes(), chunk_channel)
+                    }
+                    StreamDelta::Image { mime, data_b64 } => {
+                        let part = serde_json::json!({
+                            "type": "image",
+                            "mime": mime,
+                            "data": data_b64,
+                        })
+                        .to_string();
+                        images.push(EnvelopeImage {
+                            mime,
+                            data_b64,
+                        });
+                        (part.into_bytes(), ChunkChannel::Image)
+                    }
+                };
                 let ct = match ctx
                     .encryption
-                    .seal_to(&req.requester_pub_key, delta.as_bytes())
+                    .seal_to(&req.requester_pub_key, &plaintext_bytes)
                 {
                     Ok(ct) => ct,
                     Err(e) => {
@@ -1080,10 +1136,6 @@ async fn handle_inference_request_inner(
                     }
                 };
                 all_ciphertext.extend_from_slice(&ct);
-                let chunk_channel = match channel {
-                    DeltaChannel::Content => ChunkChannel::Content,
-                    DeltaChannel::Reasoning => ChunkChannel::Reasoning,
-                };
                 push_frame(
                     live_tx.as_ref(),
                     &mut collected,
@@ -1153,7 +1205,19 @@ async fn handle_inference_request_inner(
 
     let completed_at = Utc::now();
     let input_commitment = sha256_hex(&plaintext);
-    let output_commitment = sha256_hex(reply.as_bytes());
+    // outputCommitment covers the answer text by default; for an
+    // image-generation job it covers the canonical images-v1 envelope bytes
+    // instead, and the receipt's outputFormat says so. This mirrors the
+    // messages-v1 INPUT invariant: the commitment is over the exact bytes a
+    // verifier can reconstruct from the delivered images.
+    let (output_commitment, output_format) = if images.is_empty() {
+        (sha256_hex(reply.as_bytes()), None)
+    } else {
+        (
+            sha256_hex(&build_images_envelope_bytes(&images)),
+            Some("images-v1".to_string()),
+        )
+    };
     // The reasoning trace gets its own commitment, present only when the model
     // actually produced reasoning — keeps the answer's commitment independent
     // of thinking output.
@@ -1190,7 +1254,7 @@ async fn handle_inference_request_inner(
             attestation,
             input_commitment,
             output_commitment,
-            None,
+            output_format,
             Some(output_cipher_commitment),
             reasoning_commitment,
             Some(params),

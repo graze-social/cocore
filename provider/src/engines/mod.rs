@@ -340,6 +340,10 @@ pub enum DeltaChannel {
     #[default]
     Content,
     Reasoning,
+    /// A generated image. Carried out-of-band from the text `on_delta`
+    /// sink via [`ImageDelta`]; image-generation engines emit one of these
+    /// per produced image instead of text tokens.
+    Image,
 }
 
 const THINK_OPEN: &str = "<think>";
@@ -419,6 +423,70 @@ fn marker_at_boundary(haystack: &str, marker: &str) -> bool {
         search_from = start + 1;
     }
     false
+}
+
+/// Substrings that mark an image-generation (text-to-image / img2img) model.
+/// ONLY used for ids the pricing catalog says nothing about — for any
+/// catalog model the declared [`pricing::Modality`] is authoritative (see
+/// [`is_image_model`]). Mirrors the console heuristic in
+/// `packages/console/src/routes/_header-layout.models.tsx` (`inferModelKind`):
+/// `flux|sdxl|stable|diffusion|dall|midjourney|imagen`. The console regex also
+/// matches the short patterns `\bsd[\d.-]` and `\bimg\b`; we keep the
+/// distinctive multi-character markers here (a bare `sd`/`img` is too prone to
+/// false positives without the regex boundaries).
+const IMAGE_MODEL_MARKERS: &[&str] = &[
+    "flux",
+    "sdxl",
+    "stable",
+    "diffusion",
+    "dall",
+    "midjourney",
+    "imagen",
+];
+
+/// Whether `model` produces images (an `images-v1` receipt) rather than
+/// text — selects the image engine load path (stub / subprocess / native
+/// diffusion) in the engine registry.
+///
+/// The pricing catalog is the authoritative source: a known model's
+/// declared [`pricing::Modality`] decides it, so a chat model whose id
+/// happens to contain "flux" is never mis-routed and a freshly-added image
+/// model is classified the instant it lands in the catalog. Only for
+/// OFF-catalog ids (custom models the catalog can't speak to) do we fall
+/// back to the id-substring heuristic.
+pub fn is_image_model(model: &str) -> bool {
+    match crate::pricing::modality_for(model) {
+        Some(modality) => modality == crate::pricing::Modality::Image,
+        None => {
+            let lower = model.to_ascii_lowercase();
+            IMAGE_MODEL_MARKERS.iter().any(|marker| lower.contains(marker))
+        }
+    }
+}
+
+/// Wire form of a generated-image delta passed through the engine's text
+/// `on_delta` sink on [`DeltaChannel::Image`]. Image engines can't express
+/// `(mime, base64 data)` through a single `&str`, so they encode it as this
+/// compact JSON object and the advisor decodes it back to build the chunk
+/// plaintext and accumulate the `images-v1` envelope. Keeping one
+/// encode/decode pair here keeps the engine and advisor in lockstep.
+pub fn encode_image_delta(mime: &str, data_b64: &str) -> String {
+    serde_json::json!({ "mime": mime, "data": data_b64 }).to_string()
+}
+
+/// Decode an image delta produced by [`encode_image_delta`]. Returns
+/// `(mime, data_b64)`. Errors if the payload isn't the expected shape.
+pub fn decode_image_delta(s: &str) -> Result<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(s)?;
+    let mime = v
+        .get("mime")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| anyhow::anyhow!("image delta missing mime"))?;
+    let data = v
+        .get("data")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("image delta missing data"))?;
+    Ok((mime.to_string(), data.to_string()))
 }
 
 /// Splits a plaintext content stream into [`Content`](DeltaChannel::Content)
@@ -914,6 +982,53 @@ mod tests {
         ] {
             assert!(is_vision_model(id), "{id} should be vision");
         }
+    }
+
+    #[test]
+    fn image_models_classified_by_catalog_then_heuristic() {
+        // Catalog is authoritative: stub-flux is declared Modality::Image.
+        assert!(is_image_model("stub-flux"));
+        // Off-catalog ids fall back to the id heuristic.
+        assert!(is_image_model("black-forest-labs/FLUX.1-schnell"));
+        assert!(is_image_model("stabilityai/stable-diffusion-xl-base-1.0"));
+        // A catalog text model is never mis-routed even with a loud id; and
+        // a plain off-catalog chat id stays text.
+        assert!(!is_image_model("stub"));
+        assert!(!is_image_model("mlx-community/Qwen2.5-7B-Instruct-4bit"));
+    }
+
+    #[test]
+    fn image_delta_round_trips_through_the_wire_string() {
+        let s = encode_image_delta("image/png", "AAAA");
+        let (mime, data) = decode_image_delta(&s).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, "AAAA");
+        assert!(decode_image_delta("not json").is_err());
+    }
+
+    #[test]
+    fn stub_image_model_emits_one_image_delta_and_no_text() {
+        let req = GenerateRequest {
+            model: "stub-flux".into(),
+            messages: vec![Message::text("user", "a red apple")],
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+        };
+        let mut deltas: Vec<(DeltaChannel, String)> = Vec::new();
+        let resp = stub::StubEngine
+            .generate_stream(&req, &mut |ch, d| {
+                deltas.push((ch, d.to_string()));
+                Ok(())
+            })
+            .unwrap();
+        // Exactly one image delta, decodable, no text/reasoning.
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].0, DeltaChannel::Image);
+        let (mime, _data) = decode_image_delta(&deltas[0].1).unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(resp.text.is_empty());
+        assert!(resp.tokens_out > 0);
     }
 
     #[test]
