@@ -327,6 +327,36 @@ mod tests {
     }
 
     #[test]
+    fn output_format_present_only_when_set_and_is_signed() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+
+        // Absent by default — a text job omits outputFormat.
+        let (rec, _) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
+        let body = serde_json::to_value(&rec).unwrap();
+        assert!(body.get("outputFormat").is_none());
+
+        // Present + signed for an images-v1 job.
+        let mut inputs = fixture(chrono::Utc::now());
+        inputs.output_format = Some("images-v1".into());
+        let (rec, _) = build(inputs, &*signer).unwrap();
+        let mut signed = serde_json::to_value(&rec).unwrap();
+        assert_eq!(signed["outputFormat"], json!("images-v1"));
+        signed.as_object_mut().unwrap().remove("enclaveSignature");
+        let message = to_canonical_bytes(&signed).unwrap();
+        let sig_der = B64.decode(rec.enclaveSignature.as_bytes()).unwrap();
+        let pub_raw = B64.decode(signer.public_key_b64()).unwrap();
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        uncompressed[1..].copy_from_slice(&pub_raw);
+        let point = EncodedPoint::from_bytes(uncompressed).unwrap();
+        let vk = VerifyingKey::from_encoded_point(&point).unwrap();
+        let sig = Signature::from_der(&sig_der).unwrap();
+        vk.verify(&message, &sig)
+            .expect("signature must verify with outputFormat present");
+    }
+
+    #[test]
     fn signature_covers_cipher_commitment_and_params() {
         // With the new optional fields present, the enclaveSignature must
         // still verify against the published record (minus the signature),

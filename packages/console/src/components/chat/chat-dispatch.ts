@@ -35,6 +35,9 @@ export interface ChatDispatchInputs {
   /** Reasoning ("thinking") deltas, streamed on a separate channel from
    *  the answer so the UI can render them in a collapsible block. */
   onReasoning?: (text: string) => void;
+  /** A generated image produced by an image model, streamed on the image
+   *  channel. Same `{ mime, data }` shape as input images. */
+  onImage?: (image: ChatDispatchImage) => void;
 }
 
 /** Build the structured messages-v1 turns for a multimodal send: each
@@ -58,6 +61,11 @@ function buildMessages(
 export interface ChatDispatchResult {
   text: string;
   reasoning: string;
+  /** Images the provider generated (image models). Empty for text turns. */
+  images: ChatDispatchImage[];
+  /** Output shape the provider reported. `images-v1` when the answer
+   *  arrived on the image channel; absent/`text` for the legacy text path. */
+  outputFormat?: "text" | "images-v1";
   tokensIn: number;
   tokensOut: number;
   receiptUri: string | null;
@@ -156,6 +164,7 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
 
   let text = "";
   let reasoning = "";
+  const images: ChatDispatchImage[] = [];
   let providerDid: string | null = null;
 
   for await (const frame of readSse(res.body, inputs.signal)) {
@@ -170,15 +179,23 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
     } else if (frame.event === "chunk") {
       try {
         const chunk = JSON.parse(frame.data) as {
-          text: string;
-          channel?: "content" | "reasoning";
+          text?: string;
+          channel?: "content" | "reasoning" | "image";
+          mime?: string;
+          data?: string;
         };
-        if (chunk.channel === "reasoning") {
-          reasoning += chunk.text;
-          inputs.onReasoning?.(chunk.text);
+        if (chunk.channel === "image") {
+          if (typeof chunk.mime === "string" && typeof chunk.data === "string") {
+            const image = { mime: chunk.mime, data: chunk.data };
+            images.push(image);
+            inputs.onImage?.(image);
+          }
+        } else if (chunk.channel === "reasoning") {
+          reasoning += chunk.text ?? "";
+          inputs.onReasoning?.(chunk.text ?? "");
         } else {
-          text += chunk.text;
-          inputs.onChunk?.(chunk.text);
+          text += chunk.text ?? "";
+          inputs.onChunk?.(chunk.text ?? "");
         }
       } catch {
         // skip malformed chunk
@@ -188,10 +205,13 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
         tokensIn: number;
         tokensOut: number;
         receiptUri: string;
+        outputFormat?: "text" | "images-v1";
       };
       return {
         text,
         reasoning,
+        images,
+        ...(parsed.outputFormat ? { outputFormat: parsed.outputFormat } : {}),
         tokensIn: parsed.tokensIn,
         tokensOut: parsed.tokensOut,
         receiptUri: parsed.receiptUri ?? null,

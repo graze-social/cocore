@@ -273,6 +273,37 @@ describe("POST /jobs", () => {
     expect(lines[2]).toContain('"receiptUri":"at://receipt"');
   });
 
+  it("relays an image-channel chunk verbatim", async () => {
+    const fp = fakeProvider(h.registry, "did:plc:p1", "pub-p1");
+
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub-flux",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+    });
+
+    await vi.waitFor(() => expect(fp.sent.length).toBeGreaterThan(0), { timeout: 1_000 });
+
+    // A provider serving an image model emits a chunk tagged channel:"image";
+    // the advisor must forward the channel untouched (it never reads the
+    // sealed plaintext).
+    h.sessions.write("test-session", {
+      type: "chunk",
+      sessionId: "test-session",
+      seq: 0,
+      channel: "image",
+      ciphertext: [7, 8, 9],
+    });
+    h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 2, receiptUri: "at://receipt" });
+
+    const lines = await linesP;
+    expect(lines[1]).toContain("event: chunk");
+    expect(lines[1]).toContain('"channel":"image"');
+  });
+
   it("preflights and fails over from an unresponsive provider to a live one", async () => {
     // A wedged machine (doesn't answer the preflight ping) that's the
     // freshest candidate, plus a healthy one.

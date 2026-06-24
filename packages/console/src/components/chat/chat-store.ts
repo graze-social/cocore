@@ -47,6 +47,10 @@ export interface ChatMessage {
    *  count is the durable marker so we always know images existed even after
    *  the cached bytes are evicted (then we show a "had image" indicator). */
   imageCount?: number;
+  /** Assistant turns: how many images this turn GENERATED (image models).
+   *  Same durable-marker role as `imageCount` for user turns; the bytes live
+   *  in IndexedDB under the assistant-output namespace (see chat-images.ts). */
+  generatedImageCount?: number;
   createdAt: string;
 }
 

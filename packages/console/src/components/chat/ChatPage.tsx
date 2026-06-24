@@ -40,6 +40,7 @@ import { ChatMarkdown } from "@/components/chat/chat-markdown.tsx";
 import { ThinkingDisclosure } from "@/components/chat/chat-thinking.tsx";
 import { modelDirectoryRouteQueryOptions } from "@/components/models/models.functions.ts";
 import { formatTokensCompact } from "@/lib/token-display.ts";
+import { isImageModel } from "@/lib/model-kind.shared.ts";
 import type { ModelDirectoryEntry } from "@/lib/model-directory.server.ts";
 import { Button } from "@/design-system/button";
 import { Drawer, DrawerBody, DrawerHeader } from "@/design-system/drawer";
@@ -944,7 +945,10 @@ function machineLabel(m: ModelDirectoryEntry["machines"][number]): string {
  *  available (just-sent or rehydrated from IndexedDB), otherwise a "had
  *  image" indicator — while loading (undefined) it reads as the same neutral
  *  chip, and once we know the bytes are gone ("lost") it says so. */
-function renderUserImages(
+// Renders a turn's images (user uploads or assistant-generated output) from
+// the resolved thumbnail state, or a "had N images" marker when the bytes are
+// gone. Role-agnostic — both turn kinds cache bytes the same way.
+function renderTurnImages(
   msgId: string,
   count: number,
   state: string[] | "lost" | undefined,
@@ -1638,9 +1642,28 @@ export function ChatPage(): ReactElement {
             reasoning: (m.reasoning ?? "") + chunk,
           }));
         },
+        onImage: (image) => {
+          // Render the generated image immediately (reuse the same data-URL
+          // thumbnail path user-uploaded images use), keyed on the assistant
+          // message so it sits with the reply.
+          setMsgImages((prev) => ({
+            ...prev,
+            [assistantMsg.id]: [
+              ...(prev[assistantMsg.id] ?? []),
+              `data:${image.mime};base64,${image.data}`,
+            ],
+          }));
+        },
       });
+      // Persist any generated images: the durable count goes on the message
+      // (so a "had image" marker survives cache eviction) and the bytes go to
+      // IndexedDB under the assistant message's id.
+      if (result.images.length > 0 && chatStorageKey) {
+        void saveChatImages(did, assistantMsg.id, result.images, chatStorageKey);
+      }
       patchMessage(sessionId, assistantMsg.id, (m) => ({
         ...m,
+        ...(result.images.length > 0 ? { generatedImageCount: result.images.length } : {}),
         meta: {
           tokensIn: result.tokensIn,
           tokensOut: result.tokensOut,
@@ -1681,15 +1704,18 @@ export function ChatPage(): ReactElement {
   const spentTotal = sessions.reduce((sum, s) => sum + s.spentTokens, 0);
 
   const selectedModel = models.find((m) => m.modelId === modelId) ?? null;
+  const modelIsImage = modelId ? isImageModel(modelId) : false;
   const targetMachine = targetProviderDid
     ? (selectedModel?.machines.find((m) => m.did === targetProviderDid) ?? null)
     : null;
   const messages = active?.messages ?? [];
 
-  // Stable signature of the user turns that carry images, so the rehydrate
-  // effect re-runs only when that set changes (not on every render).
+  // Stable signature of the turns that carry images — user uploads
+  // (`imageCount`) AND assistant-generated images (`generatedImageCount`) —
+  // so the rehydrate effect re-runs only when that set changes. Both are
+  // cached in IndexedDB keyed by message id, so one loader handles both.
   const imageTurnIds = messages
-    .filter((m) => m.role === "user" && m.imageCount)
+    .filter((m) => (m.role === "user" && m.imageCount) || m.generatedImageCount)
     .map((m) => m.id)
     .join(",");
 
@@ -1917,7 +1943,7 @@ export function ChatPage(): ReactElement {
                 {messages.map((m) =>
                   m.role === "user" ? (
                     <div key={m.id} {...stylex.props(styles.userTurn)}>
-                      {m.imageCount ? renderUserImages(m.id, m.imageCount, msgImages[m.id]) : null}
+                      {m.imageCount ? renderTurnImages(m.id, m.imageCount, msgImages[m.id]) : null}
                       <div {...stylex.props(styles.msgUser)}>{m.text}</div>
                     </div>
                   ) : (
@@ -1945,7 +1971,20 @@ export function ChatPage(): ReactElement {
                             {m.reasoning ? (
                               <ThinkingDisclosure reasoning={m.reasoning} active={thinkingActive} />
                             ) : null}
-                            <ChatMarkdown streaming={answerActive} text={m.text} />
+                            {m.text ? (
+                              <ChatMarkdown streaming={answerActive} text={m.text} />
+                            ) : null}
+                            {/* Generated images: show live previews while
+                                streaming (msgImages populated by onImage) and
+                                the durable rehydrated set afterward. */}
+                            {(() => {
+                              const imgState = msgImages[m.id];
+                              if (!m.generatedImageCount && !imgState) return null;
+                              const count =
+                                m.generatedImageCount ??
+                                (Array.isArray(imgState) ? imgState.length : 1);
+                              return renderTurnImages(m.id, count, imgState);
+                            })()}
                           </div>
                           {m.meta ? (
                             <div {...stylex.props(styles.msgMeta)}>
@@ -2005,7 +2044,9 @@ export function ChatPage(): ReactElement {
                 value={draft}
                 placeholder={
                   modelId
-                    ? `message ${modelId}${targetMachine ? ` on ${machineLabel(targetMachine)}` : ""}…`
+                    ? modelIsImage
+                      ? `describe an image for ${modelId}${targetMachine ? ` on ${machineLabel(targetMachine)}` : ""}…`
+                      : `message ${modelId}${targetMachine ? ` on ${machineLabel(targetMachine)}` : ""}…`
                     : "no models online — nothing to message"
                 }
                 onChange={(e) => setDraft(e.target.value)}
