@@ -17,6 +17,7 @@
     "./verify-provider": "./src/verify-provider.ts",
     "./oauth-scope": "./src/oauth-scope.ts",
     "./p256": "./src/p256.ts",
+    "./provider-selection": "./src/provider-selection.ts",
     "./publish": "./src/publish.ts",
     "./resolve": "./src/resolve.ts",
     "./types": "./src/types.ts",

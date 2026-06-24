@@ -27,6 +27,7 @@
 
 import type { RecordTransport } from "@cocore/sdk/publish";
 import { submitJob } from "@cocore/sdk/publish";
+import { ownMachineCandidates } from "@cocore/sdk/provider-selection";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform";
 import { makeRuntime } from "@cocore/o11y";
 import { Effect } from "effect";
@@ -291,6 +292,7 @@ async function fetchProviders(advisorUrl: string): Promise<AdvisorProviderRow[]>
 async function pickProvider(
   advisorUrl: string,
   model: string,
+  requesterDid: string,
   targetDid: string | undefined,
   options: PickProviderOptions,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
@@ -316,6 +318,9 @@ async function pickProvider(
     if (!targetPasses) throw new ProviderPayoutsNotEligibleError(targetDid);
     return hit;
   }
+
+  const own = ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set());
+  if (own.length > 0) return own[0]!;
 
   const pool =
     excludeDids && excludeDids.size > 0
@@ -574,6 +579,7 @@ export async function* runDispatch(
       candidate = await pickProvider(
         deps.advisorUrl,
         input.model,
+        input.did,
         input.targetProviderDid,
         { payoutsEligibleDids: null, selfLoopExempt: null },
         excludeDids,
@@ -630,6 +636,7 @@ export async function* runDispatch(
         ...(input.inputFormat ? { inputFormat: input.inputFormat } : {}),
         sessionId,
         targetProviderDid: candidate.did,
+        // Pin the exact machine we sealed the prompt to, the only one that can unseal.
         ...(candidate.machineId ? { targetMachineId: candidate.machineId } : {}),
       }),
     });
