@@ -161,13 +161,23 @@ export class Exchange {
     // Fee math (in tokens, not USD). Self-loop receipts get the
     // policy's waiver — typically zero so the user pays nothing
     // extra to run on their own machine via the exchange.
+    //
+    // Pro-bono receipts are the explicit no-cut carve-out: the provider
+    // served the job for free (price.amount is 0, verified to be so by
+    // checkProBonoInvariant above), so the exchange takes no fee and the
+    // settlement is all zeros. Short-circuit BEFORE computeFeeWithSelfLoop —
+    // a non-zero fee floor (minMinor) on a zero-price receipt would otherwise
+    // drive providerShare negative and break amountCharged = payout + fee.
+    const isProBono = receiptIndexed.body.proBono === true;
     const isSelfLoop = jobRow.repo === receiptIndexed.repo;
-    const fee = computeFeeWithSelfLoop(
-      receiptIndexed.body.price.amount,
-      this.cfg.feePolicy,
-      this.cfg.selfLoop,
-      isSelfLoop,
-    );
+    const fee = isProBono
+      ? 0
+      : computeFeeWithSelfLoop(
+          receiptIndexed.body.price.amount,
+          this.cfg.feePolicy,
+          this.cfg.selfLoop,
+          isSelfLoop,
+        );
     const providerShare = receiptIndexed.body.price.amount - fee;
 
     // Build + publish the settlement. The processor reference tags

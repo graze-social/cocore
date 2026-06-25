@@ -509,6 +509,12 @@ final class AgentSupervisor {
         }
     }
 
+    // Coarse-location sharing is no longer a tray toggle: it's configured
+    // per-machine on the console (the `shareLocation` switch on the provider
+    // record). The agent reads that field off its own record at serve start and
+    // re-resolves / clears the coarse `region` accordingly — no local marker
+    // file, so there is nothing to apply from here.
+
     /// Apply the current per-model schedules (`COCORE_MODEL_SCHEDULES`) to the
     /// running agent and reload. Same mode split as the whole-app schedule:
     /// edit the plist + bounce (LaunchAgent), or restart the supervised child

@@ -59,6 +59,9 @@ fn writes_cross_lang_fixture() {
             uri: "at://did:plc:provider/dev.cocore.compute.attestation/x".into(),
             cid: "bafyatt".into(),
         },
+        // Off here too — a metered receipt omits proBono, keeping the pinned
+        // canonical bytes identical to a pre-proBono record.
+        pro_bono: false,
     };
     let (record, canonical) = build(inputs, &*signer).unwrap();
 

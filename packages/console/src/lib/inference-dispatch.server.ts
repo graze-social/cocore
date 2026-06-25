@@ -57,9 +57,13 @@ export interface DispatchInputs {
   /** OAuth session to publish records under. Required — every
    *  authoritative record must hit the user's PDS. */
   oauthSession: OAuthSession;
-  /** Restrict provider selection to this set of DIDs. Used by the
-   *  friends-only chat-completions endpoint, which fetches the
-   *  user's friend records from their PDS and passes the DID set
+  /** Restrict provider selection to this allow-set. Each entry is either a
+   *  bare DID — owner-granular, used by the friends-only + verified endpoints —
+   *  or a `${did}:${machineId}` composite — machine-granular, used by the
+   *  pro-bono path (the election is per provider record, so it must not widen
+   *  to an owner's other billed machines). {@link filterByAllowedDids} matches
+   *  either form. Used by the friends-only chat-completions endpoint, which
+   *  fetches the user's friend records from their PDS and passes the DID set
    *  through to constrain pickProvider.
    *
    *  Empty set is meaningful and DIFFERENT from `undefined`:
@@ -72,6 +76,12 @@ export interface DispatchInputs {
    *  per-machine inference dashboard, which is friends-aware
    *  already since the user chose their own machine.) */
   allowedProviderDids?: Set<string>;
+  /** Optional ISO 3166-1 alpha-2 country filter (uppercased). When set,
+   *  pickProvider keeps only candidates whose advertised `region` matches,
+   *  AFTER the model (and friends) filters so the diagnostic is precise.
+   *  Advisory routing: `region` is a provider self-claim, and a provider
+   *  that doesn't publish a region is never matched by a country filter. */
+  country?: string;
 }
 
 /** Distinct error types so the route layer can translate them into
@@ -144,6 +154,23 @@ export class TargetProviderNotConnectedError extends Error {
   }
 }
 
+export class NoProvidersForCountryError extends Error {
+  readonly model: string;
+  readonly country: string;
+  /** How many providers served the model (in any country) — so the caller
+   *  can tell "model X exists but not in country Y" from "no model X". */
+  readonly modelFitCount: number;
+  constructor(model: string, country: string, modelFitCount: number) {
+    super(
+      `no connected provider serving model '${model}' advertises country '${country}' (${modelFitCount} serve the model in other / unknown regions)`,
+    );
+    this.name = "NoProvidersForCountryError";
+    this.model = model;
+    this.country = country;
+    this.modelFitCount = modelFitCount;
+  }
+}
+
 /** Stable codes for the error event. Route layers translate these
  *  to OpenAI-shaped error envelopes with appropriate HTTP statuses
  *  (404 for unknown-model situations, 503 for advisor-side absence
@@ -156,6 +183,7 @@ export class TargetProviderNotConnectedError extends Error {
 export type DispatchErrorCode =
   | "no-providers-connected"
   | "no-providers-for-model"
+  | "no-providers-for-country"
   | "no-friends-available"
   | "no-friends-for-model"
   | "target-provider-not-connected"
@@ -271,6 +299,11 @@ interface AdvisorProviderRow {
   /** Human-readable label for this machine (e.g. "Mac-mini.local").
    *  Optional for legacy-agent compatibility. */
   machineLabel?: string;
+  /** Coarse, opt-in ISO 3166-1 alpha-2 country the provider advertises
+   *  (echoed from its provider record via the advisor Register frame).
+   *  Advisory self-claim; absent when the provider hasn't opted into
+   *  location sharing. Used for `country` routing. */
+  region?: string;
 }
 
 export interface PickProviderOptions {
@@ -307,12 +340,32 @@ export function filterByPayoutsEligibility<T extends { did: string }>(
  *  meaningful "filter everything out" signal that the caller
  *  should distinguish — the route layer turns that into
  *  NoFriendsAvailableError. */
-export function filterByAllowedDids<T extends { did: string }>(
+export function filterByAllowedDids<T extends { did: string; machineId?: string }>(
   candidates: T[],
   allowedDids: Set<string> | undefined,
 ): T[] {
   if (!allowedDids) return candidates;
-  return candidates.filter((c) => allowedDids.has(c.did));
+  // An entry is either a bare DID — owner-granular (friends / verified) — or a
+  // `${did}:${machineId}` composite — machine-granular (pro-bono, where the
+  // election is per provider record). Match either, so a pro-bono allow-set
+  // never widens to an owner's other, billed machines.
+  return candidates.filter(
+    (c) =>
+      allowedDids.has(c.did) || (c.machineId != null && allowedDids.has(`${c.did}:${c.machineId}`)),
+  );
+}
+
+/** Pure filter for country routing. `undefined`/empty country passes the
+ *  list through verbatim ("no country constraint"). Otherwise keeps only
+ *  candidates whose advertised `region` equals `country` (already uppercased
+ *  by the parse layer) — a provider that doesn't publish a region is never
+ *  matched, since a country request means "must be in this country." */
+export function filterByCountry<T extends { region?: string }>(
+  candidates: T[],
+  country: string | undefined,
+): T[] {
+  if (!country) return candidates;
+  return candidates.filter((c) => c.region === country);
 }
 
 export class ProviderPayoutsNotEligibleError extends Error {
@@ -334,6 +387,11 @@ async function pickProvider(
   targetMachineId: string | undefined,
   options: PickProviderOptions,
   allowedDids: Set<string> | undefined,
+  /** Optional ISO 3166-1 alpha-2 country filter (uppercased). Applied after
+   *  the model/friends filters in the open + friends paths. NOT applied to an
+   *  explicit `targetDid` (the user pinned that machine) or a self-loop pick
+   *  (it's the caller's own machine). */
+  country: string | undefined,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
    *  failed because they'd flapped out between the snapshot and the
    *  dispatch). Excluded from re-selection so failover lands on a
@@ -352,11 +410,12 @@ async function pickProvider(
     // a Mac Mini and a Linux box under the same owner DID are distinguished.
     // Fall back to DID-only if no machineId was specified (or for legacy rows
     // that predate the field).
-    const hit =
-      targetMachineId
-        ? (attested.find((p) => p.did === targetDid && p.machineId === targetMachineId) ??
-          attested.find((p) => p.did === targetDid))
-        : attested.find((p) => p.did === targetDid);
+    const hit = targetMachineId
+      ? (attested.find((p) => p.did === targetDid && p.machineId === targetMachineId) ??
+        // Fall back only to legacy rows that predate the machineId field; a row with
+        // a *different* machineId is a different machine and must not be silently selected.
+        attested.find((p) => p.did === targetDid && !p.machineId))
+      : attested.find((p) => p.did === targetDid);
     if (!hit) throw new TargetProviderNotConnectedError(targetDid);
     // Hard refusal on explicit target: surface why before the user
     // submits the (now doomed) job. We don't auto-fall-back to
@@ -394,9 +453,16 @@ async function pickProvider(
     if (friendFits.length === 0) {
       throw new NoFriendsForModelError(model, allowedDids.size, friendsConnected.length);
     }
-    const eligible = filterByPayoutsEligibility(friendFits, options);
+    const friendInCountry = filterByCountry(friendFits, country);
+    if (friendInCountry.length === 0) {
+      throw new NoProvidersForCountryError(model, country!, friendFits.length);
+    }
+    const eligible = filterByPayoutsEligibility(friendInCountry, options);
     if (eligible.length === 0) {
-      throw new ProviderPayoutsNotEligibleError(friendFits[0]!.did);
+      // Surface a DID from the post-country-filter list so the diagnostic
+      // points at a provider that's actually both model-fit and in-country,
+      // not one the country filter already excluded.
+      throw new ProviderPayoutsNotEligibleError(friendInCountry[0]!.did);
     }
     eligible.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
     return eligible[0]!;
@@ -406,15 +472,17 @@ async function pickProvider(
     (p) => p.supportedModels.length === 0 || p.supportedModels.includes(model),
   );
   if (fits.length === 0) throw new NoProvidersForModelError(model, attested.length);
-  const eligible = filterByPayoutsEligibility(fits, options);
+  const inCountry = filterByCountry(fits, country);
+  if (inCountry.length === 0) throw new NoProvidersForCountryError(model, country!, fits.length);
+  const eligible = filterByPayoutsEligibility(inCountry, options);
   if (eligible.length === 0) {
     // No payouts-eligible provider serves this model. Surface the
-    // first model-fit provider's DID so the caller can hint at
-    // who's blocking; that DID's record will explain why (no
+    // first model-fit, in-country provider's DID so the caller can
+    // hint at who's blocking; that DID's record will explain why (no
     // Stripe Connect under fiat semantics, etc.). Today this is
     // unreachable under closed-loop (payoutsEligibleDids is
     // always null) but the branch stays for the phase-two path.
-    throw new ProviderPayoutsNotEligibleError(fits[0]!.did);
+    throw new ProviderPayoutsNotEligibleError(inCountry[0]!.did);
   }
   eligible.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
   return eligible[0]!;
@@ -472,6 +540,7 @@ interface SseEvent {
 export function classifyDispatchError(e: unknown): DispatchErrorCode {
   if (e instanceof NoProvidersConnectedError) return "no-providers-connected";
   if (e instanceof NoProvidersForModelError) return "no-providers-for-model";
+  if (e instanceof NoProvidersForCountryError) return "no-providers-for-country";
   if (e instanceof NoFriendsAvailableError) return "no-friends-available";
   if (e instanceof NoFriendsForModelError) return "no-friends-for-model";
   if (e instanceof TargetProviderNotConnectedError) return "target-provider-not-connected";
@@ -605,6 +674,8 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         input.targetMachineId,
         { payoutsEligibleDids: null, selfLoopExempt: null },
         input.targetProviderDid ? undefined : input.allowedProviderDids,
+        // No country filter on an explicit pin — the user chose that machine.
+        input.targetProviderDid ? undefined : input.country,
         excludeDids,
       );
     } catch (e) {

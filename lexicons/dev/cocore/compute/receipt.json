@@ -104,6 +104,10 @@
             "type": "ref",
             "ref": "dev.cocore.compute.defs#tier",
             "description": "The confidentiality tier this job actually ran under. Set by the provider to `attested-confidential` only when the input was sealed to a verified, enclave-bound ephemeral session key AND served by a measured native engine under a hardware-attested posture; otherwise `best-effort`. A requester recomputes this from the receipt's attestation + sessionKeyCommitment rather than trusting the field. Optional / additive; absent equivalent to `best-effort`."
+          },
+          "proBono": {
+            "type": "boolean",
+            "description": "True when the provider served this job pro bono under its `dev.cocore.compute.provider.proBono` election — free, unmetered, no exchange cut. A pro-bono receipt MUST carry `price.amount: 0` and `tokens: { in: 0, out: 0 }`: the work is explicitly not counted, so neither figure is a billing claim. An exchange settling a `proBono: true` receipt takes no fee and moves no balance (`amountCharged`, `providerPayout`, and `exchangeFee` are all 0). Covered by `enclaveSignature` like every other field, so the carve-out is part of the signed, self-verifying record rather than an off-record side channel. Absent/false ≡ a normal metered, billable receipt. Optional / additive; pre-2026-06 readers ignore it and still see a well-formed zero-price receipt."
           }
         }
       }

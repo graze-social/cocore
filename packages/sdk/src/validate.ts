@@ -44,6 +44,30 @@ function err(out: Finding[], code: string, message: string): void {
   out.push({ severity: "error", code, message });
 }
 
+/** A `proBono: true` receipt is the explicit carve-out for free, unmetered
+ *  work: the provider commits to taking no payment and counting no tokens.
+ *  Enforce that invariant so a provider can't fly the pro-bono flag while
+ *  still charging — `price.amount` and both token counts MUST be zero. A
+ *  non-pro-bono receipt is unaffected. Shared by {@link verifyReceipt} and
+ *  {@link verifyForCharge}. */
+function checkProBonoInvariant(receipt: ReceiptRecord, findings: Finding[]): void {
+  if (receipt.proBono !== true) return;
+  if (receipt.price.amount !== 0) {
+    err(
+      findings,
+      "pro-bono-nonzero-price",
+      `receipt.proBono is true but price.amount is ${receipt.price.amount}, not 0`,
+    );
+  }
+  if (receipt.tokens.in !== 0 || receipt.tokens.out !== 0) {
+    err(
+      findings,
+      "pro-bono-nonzero-tokens",
+      `receipt.proBono is true but tokens are { in: ${receipt.tokens.in}, out: ${receipt.tokens.out} }, not zero`,
+    );
+  }
+}
+
 function ok(findings: Finding[]): boolean {
   return findings.every((f) => f.severity !== "error");
 }
@@ -83,6 +107,7 @@ export function verifyReceipt(
       `receipt.price.amount ${receipt.price.amount} exceeds priceCeiling ${job.priceCeiling.amount}`,
     );
   }
+  checkProBonoInvariant(receipt, findings);
 
   const completedAt = Date.parse(receipt.completedAt);
   const jobExpires = Date.parse(job.expiresAt);
@@ -282,6 +307,7 @@ export function verifyForCharge(ctx: PreChargeContext, inputs: PreChargeInputs):
       `receipt.price.amount ${receipt.price.amount} > authorization.ceiling ${authorization.ceiling.amount}`,
     );
   }
+  checkProBonoInvariant(receipt, findings);
   if (
     job.acceptedExchanges &&
     job.acceptedExchanges.length > 0 &&

@@ -24,7 +24,7 @@ use crate::crypto::ProviderKeypair;
 use crate::engines::{DeltaChannel, Engine, EngineRegistry};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
-use crate::pds::PdsClient;
+use crate::pds::{PdsClient, ProBonoPolicy};
 use crate::pricing;
 use crate::protocol::{
     AdvisorMessage, AttestationChallenge, AttestationResponse, ChunkChannel,
@@ -85,6 +85,12 @@ struct ServeContext<'a> {
     /// falling back to the stub (which would let the stub-engine's
     /// echo masquerade as a real model's reply).
     engines: &'a EngineRegistry,
+    /// The owner's pro-bono election, read from this machine's provider
+    /// record at serve start. A request from a requester this policy
+    /// matches is served free: the receipt carries `proBono: true` with a
+    /// zero price and zero token counts, and the exchange takes no cut.
+    /// An off / non-matching policy serves the job as a normal paid job.
+    pro_bono: &'a ProBonoPolicy,
 }
 
 impl AdvisorClient {
@@ -128,6 +134,10 @@ impl AdvisorClient {
         // that never registered for push — the corresponding `select!` arm is
         // then inert and the loop behaves exactly as before.
         mut push_rx: Option<&mut mpsc::UnboundedReceiver<String>>,
+        // The owner's pro-bono election, read from this machine's provider
+        // record at serve start. Threaded into `ServeContext` so each job
+        // can decide, per requester, whether to serve free + unmetered.
+        pro_bono: &ProBonoPolicy,
     ) -> Result<()> {
         tracing::info!(url = %self.url, "connecting to advisor");
         let (ws, _resp) =
@@ -174,6 +184,7 @@ impl AdvisorClient {
             pds,
             attestation,
             engines,
+            pro_bono,
         };
         // A shared reference the per-job futures copy in (each `async move`
         // would otherwise move `ctx` itself, leaving none for the next job).
@@ -1169,18 +1180,36 @@ async fn handle_inference_request_inner(
         topPMilli: None,
     };
 
+    // Pro bono decision: if the owner has elected to serve this requester
+    // for free, the job is explicitly NOT counted — we publish a receipt
+    // (the provider's PDS stays the source of truth for work done) but with
+    // zero tokens and a zero price, and flag it so the exchange takes no cut.
+    // A non-matching / off policy falls through to normal metering below.
+    let pro_bono = ctx.pro_bono.applies_to(&req.requester_did);
+
     let rate = pricing::rate_for(&req.model);
-    let tokens_in = if engine_tokens_in > 0 {
-        engine_tokens_in
+    let (tokens_in, tokens_out, price_minor) = if pro_bono {
+        tracing::info!(
+            session_id = %session_id,
+            requester = %req.requester_did,
+            mode = %ctx.pro_bono.mode,
+            "serving job pro bono — unmetered, zero price, no exchange cut",
+        );
+        (0u64, 0u64, 0u64)
     } else {
-        pricing::estimate_tokens(&plaintext)
+        let tokens_in = if engine_tokens_in > 0 {
+            engine_tokens_in
+        } else {
+            pricing::estimate_tokens(&plaintext)
+        };
+        let tokens_out = if engine_tokens_out > 0 {
+            engine_tokens_out
+        } else {
+            pricing::estimate_tokens(reply.as_bytes())
+        };
+        let price_minor = pricing::price_minor(rate, tokens_in, tokens_out);
+        (tokens_in, tokens_out, price_minor)
     };
-    let tokens_out = if engine_tokens_out > 0 {
-        engine_tokens_out
-    } else {
-        pricing::estimate_tokens(reply.as_bytes())
-    };
-    let price_minor = pricing::price_minor(rate, tokens_in, tokens_out);
 
     let (receipt_uri, receipt_commit) = match (req.job_cid.as_ref(), ctx.attestation) {
         (Some(job_cid), Some(attestation)) => publish_stub_receipt(
@@ -1201,6 +1230,7 @@ async fn handle_inference_request_inner(
                 amount: price_minor,
                 currency: rate.currency.into(),
             },
+            pro_bono,
         )
         .await
         .unwrap_or_default(),
@@ -1303,6 +1333,7 @@ async fn publish_stub_receipt(
     tokens_in: u64,
     tokens_out: u64,
     price: Money,
+    pro_bono: bool,
 ) -> std::result::Result<(String, Option<crate::pds::RepoCommit>), ()> {
     let inputs = ReceiptInputs {
         job: StrongRef {
@@ -1323,6 +1354,7 @@ async fn publish_stub_receipt(
         completed_at,
         price,
         attestation: attestation.clone(),
+        pro_bono,
     };
     let (record, _canonical) = match receipt::build(inputs, ctx.signer) {
         Ok(t) => t,
@@ -1661,6 +1693,15 @@ mod tests {
         })
     }
 
+    /// An "off" pro-bono policy shared by the test contexts below — no
+    /// requester is served pro bono, so these tests exercise the normal
+    /// metered path. Returned as `'static` so `ctx` can hand `ServeContext`
+    /// a reference without each call site owning a binding.
+    fn off_pro_bono() -> &'static ProBonoPolicy {
+        static P: std::sync::OnceLock<ProBonoPolicy> = std::sync::OnceLock::new();
+        P.get_or_init(ProBonoPolicy::default)
+    }
+
     fn ctx<'a>(
         signer: &'a dyn SigningIdentity,
         kp: &'a ProviderKeypair,
@@ -1674,6 +1715,7 @@ mod tests {
             pds,
             attestation,
             engines,
+            pro_bono: off_pro_bono(),
         }
     }
 

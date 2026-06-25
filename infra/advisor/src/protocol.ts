@@ -47,6 +47,11 @@ export interface Register {
    *  echoed from the signed attestation. Advisory — the advisor recomputes.
    *  Additive. */
   tier?: string;
+  /** Coarse, opt-in ISO 3166-1 alpha-2 country echoed from the provider
+   *  record's `region`, so the advisor's /providers list can route by
+   *  country without a PDS read. Advisory self-claim; absent when the owner
+   *  hasn't opted into location sharing. Additive. */
+  region?: string;
   /** APNs device token (hex) for the measured agent process, when it could
    *  register for remote notifications (confidential build + GUI session). The
    *  advisor sends the code-identity challenge here. Omitted on headless

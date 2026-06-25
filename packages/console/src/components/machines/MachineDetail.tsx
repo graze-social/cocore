@@ -34,6 +34,7 @@ import { Heading1, Heading4, InlineCode, LabelText, SmallBody } from "@/design-s
 
 import { Goober } from "@/components/Goober.tsx";
 import {
+  AdvancedSettingsDialogContent,
   ManageModelsDialogContent,
   RenameMachineDialogContent,
 } from "@/components/machines/MachinesDashboard.tsx";
@@ -44,8 +45,11 @@ import {
   setMyProviderDesiredModelsMutationOptions,
   setMyProviderDesiredTierMutationOptions,
   setMyProviderMachineLabelMutationOptions,
+  setMyProviderProBonoMutationOptions,
+  setMyProviderShareLocationMutationOptions,
 } from "@/components/machines/machines.functions.ts";
 import type { MachineWorkItem } from "@/components/machines/machines.server.ts";
+import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
 import { formatTokens } from "@/lib/token-display.ts";
 
 import type { Machine } from "./machines-data.ts";
@@ -326,6 +330,7 @@ export function MachineDetail({ rkey }: { rkey: string }) {
 
   const [manageModelsOpen, setManageModelsOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: myMachineDetailQueryOptions(rkey).queryKey });
@@ -356,6 +361,18 @@ export function MachineDetail({ rkey }: { rkey: string }) {
   // machine to exactly its prior behavior — nothing here breaks serving.
   const desiredTierM = useMutation({
     ...setMyProviderDesiredTierMutationOptions,
+    onSuccess: invalidate,
+  });
+  // Advanced, per-machine owner intents. Both write to the provider record;
+  // the agent re-derives behavior on its next serve. Share-location toggles
+  // the coarse country opt-in; pro-bono sets (or clears, via null) the
+  // free-serving policy. Same invalidate-on-success as every control above.
+  const shareLocationM = useMutation({
+    ...setMyProviderShareLocationMutationOptions,
+    onSuccess: invalidate,
+  });
+  const proBonoM = useMutation({
+    ...setMyProviderProBonoMutationOptions,
     onSuccess: invalidate,
   });
 
@@ -409,6 +426,8 @@ export function MachineDetail({ rkey }: { rkey: string }) {
             />
             <LabelText variant="secondary">{m.faultReason ? "fault" : m.state}</LabelText>
           </span>
+          <RegionFlag region={m.region} />
+          <ProBonoBadge mode={m.proBonoMode} />
         </div>
         <div {...stylex.props(styles.metaRow)}>
           <span>{m.gpu}</span>
@@ -479,6 +498,9 @@ export function MachineDetail({ rkey }: { rkey: string }) {
         </Button>
         <Button variant="outline" size="sm" onPress={() => setRenameOpen(true)}>
           Rename…
+        </Button>
+        <Button variant="outline" size="sm" onPress={() => setAdvancedOpen(true)}>
+          Advanced settings…
         </Button>
       </div>
 
@@ -703,6 +725,56 @@ export function MachineDetail({ rkey }: { rkey: string }) {
               },
             )
           }
+        />
+      </Dialog>
+
+      <Dialog
+        isOpen={advancedOpen}
+        onOpenChange={setAdvancedOpen}
+        trigger={
+          <button type="button" {...stylex.props(styles.hiddenTrigger)} tabIndex={-1} aria-hidden />
+        }
+      >
+        <AdvancedSettingsDialogContent
+          key={m.id}
+          machine={m}
+          isSharePending={shareLocationM.isPending}
+          isProBonoPending={proBonoM.isPending}
+          onShareLocation={(share) =>
+            shareLocationM.mutate(
+              { rkey: m.id, share },
+              {
+                onSuccess: () =>
+                  showToast(
+                    share
+                      ? `${m.alias}: sharing country on the next serve`
+                      : `${m.alias}: country sharing off`,
+                  ),
+                onError: (e) =>
+                  showToast(e instanceof Error ? e.message : "Could not update country sharing"),
+              },
+            )
+          }
+          onSaveProBono={(policy) =>
+            // mutateAsync so the dialog can await the write and roll its
+            // optimistic state back if it rejects.
+            proBonoM.mutateAsync(
+              { rkey: m.id, policy },
+              {
+                onSuccess: () =>
+                  showToast(
+                    policy === null
+                      ? `${m.alias}: pro bono off`
+                      : policy.mode === "any"
+                        ? `${m.alias}: serving everyone pro bono`
+                        : `${m.alias}: pro bono updated`,
+                  ),
+                onError: (e) =>
+                  showToast(e instanceof Error ? e.message : "Could not update pro bono"),
+              },
+            )
+          }
+          onClose={() => setAdvancedOpen(false)}
         />
       </Dialog>
     </Page.Root>

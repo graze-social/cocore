@@ -263,6 +263,36 @@ describe("ReceiptPipeline", () => {
     expect(recent[0]?.settlementUri).toMatch(/^at:\/\/exchange\/settlement\//);
   });
 
+  it("settles a pro-bono receipt without moving any tokens (no cut, unmetered)", async () => {
+    // A pro-bono receipt is free + unmetered: price.amount is 0 and the
+    // tokens are zero. The exchange settles it (audit trail), but the
+    // pipeline's token-movement guard (amount > 0) means the ledger never
+    // debits the requester or credits the provider — the carve-out for
+    // explicitly unlimited usage.
+    const jobUri = "at://did:plc:requester/dev.cocore.compute.job/probono";
+    const attUri = "at://did:plc:provider/dev.cocore.compute.attestation/att-probono";
+    const { exchange, ledgerApplied } = setup({
+      exchangeResolved: new Set([jobUri, attUri]),
+    });
+
+    const receipt = makeReceipt({
+      rkey: "pb1",
+      providerDid: "did:plc:provider",
+      requesterDid: "did:plc:requester",
+      jobUri,
+      attestationUri: attUri,
+      tokens: { in: 0, out: 0 },
+      price: { amount: 0, currency: "CC" },
+    });
+    store.upsert(receipt);
+    await firehose.dispatch(receipt);
+
+    // Settled (the settlement record is the audit trail) ...
+    expect(exchange.settled).toEqual([receipt.uri]);
+    // ... but no balance moved: the ledger was never touched.
+    expect(ledgerApplied).toEqual([]);
+  });
+
   it("parks a receipt on resolve-failed and retries when the missing dep arrives", async () => {
     const jobUri = "at://did:plc:requester/dev.cocore.compute.job/job2";
     const attUri = "at://did:plc:provider/dev.cocore.compute.attestation/att2";

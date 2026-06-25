@@ -179,6 +179,55 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
+  /v1/probono/chat/completions:
+    post:
+      tags: [Inference]
+      operationId: createProBonoChatCompletion
+      summary: Create a chat completion (pro-bono / free routing)
+      description: >
+        The pro-bono completion path. Identical wire format to
+        `/v1/chat/completions`, but routing is constrained to providers whose
+        `proBono` policy elects to serve THIS requester for free — either
+        `mode: any` (the provider serves everyone pro bono) or `mode: direct`
+        with the caller's DID in the provider's allowlist. A matched job is
+        served unmetered at zero price and the exchange takes no cut, so a
+        requester with **no token balance** can still get a completion. The
+        resulting receipt carries `proBono: true` with `price.amount: 0` and
+        `tokens: { in: 0, out: 0 }`.
+
+
+        The optional `country` field still narrows by region. Fails closed with
+        `no_pro_bono_providers` (503) when no connected provider currently
+        offers the caller pro bono, rather than silently billing the job — use
+        `/v1/chat/completions` for a normal paid request. Also available at the
+        legacy path `/api/v1/probono/chat/completions`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "200":
+          description: "A completion (or an SSE stream when `stream: true`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatCompletion" }
+            text/event-stream:
+              schema: { type: string }
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "503":
+          description: No connected provider currently offers you pro bono (`no_pro_bono_providers`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /v1/models:
     get:
       tags: [Directory]
@@ -304,6 +353,19 @@ components:
           type: integer
           minimum: 1
           default: 1024
+        country:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: >-
+            Optional ISO 3166-1 alpha-2 country code (e.g. `US`). When set, the
+            request is routed only to providers advertising a matching coarse
+            `region` on their provider record. Advisory routing, not a
+            guarantee: `region` is a provider self-claim, and a provider that
+            isn't sharing its location is never matched. Returns 503
+            (`no_providers_for_country`) when the model exists but no provider
+            in that country currently serves it.
+          example: US
         temperature:
           type: number
           description: Accepted for OpenAI compatibility; honoring is provider-dependent.
@@ -418,6 +480,15 @@ components:
                   machineLabel: { type: string, nullable: true }
                   chip: { type: string, nullable: true }
                   ramGB: { type: integer, nullable: true }
+                  region:
+                    type: string
+                    nullable: true
+                    description: >-
+                      Coarse, opt-in country (ISO 3166-1 alpha-2) the machine
+                      published on its provider record, or null when it isn't
+                      sharing location. Advisory self-claim — match it with the
+                      `country` field on chat-completions requests.
+                    example: US
                   lastSeen: { type: string, format: date-time, nullable: true }
                   activity: { $ref: "#/components/schemas/ActivityWindows" }
             activity: { $ref: "#/components/schemas/ActivityWindows" }

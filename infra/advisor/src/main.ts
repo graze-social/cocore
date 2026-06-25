@@ -259,6 +259,8 @@ async function main(): Promise<void> {
             chip: p.chip,
             ramGb: p.ramGb,
             supportedModels: p.supportedModels,
+            // Coarse, opt-in country (advisory self-claim) for country routing.
+            region: p.region,
             encryptionPubKey: p.encryptionPubKey,
             attestationUri: p.attestationUri,
             lastSeen: new Date(p.lastSeen).toISOString(),

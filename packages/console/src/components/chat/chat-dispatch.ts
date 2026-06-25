@@ -32,6 +32,12 @@ export interface ChatDispatchInputs {
   /** Specific machine under targetProviderDid. null/undefined → any machine
    *  for that DID. Ignored when targetProviderDid is not set. */
   targetMachineId?: string | null;
+  /** Optional ISO 3166-1 alpha-2 country (e.g. "US"). When set, routes only to
+   *  providers advertising that coarse region. Advisory. */
+  country?: string | null;
+  /** When true, route ONLY to providers whose pro-bono policy serves this
+   *  requester for free (the pro-bono completion path). */
+  proBono?: boolean;
   signal?: AbortSignal;
   onMeta?: (meta: { providerDid: string; jobUri: string }) => void;
   onChunk?: (text: string) => void;
@@ -145,6 +151,8 @@ export async function dispatchChatTurn(inputs: ChatDispatchInputs): Promise<Chat
       ...(inputs.targetProviderDid && inputs.targetMachineId
         ? { targetMachineId: inputs.targetMachineId }
         : {}),
+      ...(inputs.country ? { country: inputs.country } : {}),
+      ...(inputs.proBono ? { proBono: true } : {}),
     }),
     ...(inputs.signal ? { signal: inputs.signal } : {}),
   });

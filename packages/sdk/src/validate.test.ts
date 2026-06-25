@@ -119,6 +119,49 @@ test("missing signature fails", () => {
   assert.ok(r.findings.some((f) => f.code === "no-signature"));
 });
 
+test("pro-bono receipt with zero price and zero tokens verifies", () => {
+  // The carve-out for explicitly unlimited usage: free + unmetered.
+  const r = verifyReceipt(
+    fixtureReceipt({
+      proBono: true,
+      price: { amount: 0, currency: "USD" },
+      tokens: { in: 0, out: 0 },
+    }),
+    fixtureJob(),
+    fixtureAttestation(),
+  );
+  assert.equal(r.ok, true, JSON.stringify(r.findings));
+});
+
+test("pro-bono receipt that still charges is rejected", () => {
+  // A provider can't fly the pro-bono flag while billing.
+  const r = verifyReceipt(
+    fixtureReceipt({
+      proBono: true,
+      price: { amount: 50, currency: "USD" },
+      tokens: { in: 0, out: 0 },
+    }),
+    fixtureJob(),
+    fixtureAttestation(),
+  );
+  assert.equal(r.ok, false);
+  assert.ok(r.findings.some((f) => f.code === "pro-bono-nonzero-price"));
+});
+
+test("pro-bono receipt that still meters tokens is rejected", () => {
+  const r = verifyReceipt(
+    fixtureReceipt({
+      proBono: true,
+      price: { amount: 0, currency: "USD" },
+      tokens: { in: 32, out: 128 },
+    }),
+    fixtureJob(),
+    fixtureAttestation(),
+  );
+  assert.equal(r.ok, false);
+  assert.ok(r.findings.some((f) => f.code === "pro-bono-nonzero-tokens"));
+});
+
 const fixtureAuth = (
   overrides: Partial<PaymentAuthorizationRecord> = {},
 ): PaymentAuthorizationRecord => ({

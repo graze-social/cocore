@@ -49,6 +49,9 @@ type ProviderRecordBody = {
   supportedModels?: string[];
   desiredModels?: string[];
   engineFault?: EngineFaultBody;
+  shareLocation?: boolean;
+  region?: string;
+  proBono?: { mode?: string; dids?: string[] };
 };
 
 type ReceiptRecordBody = {
@@ -98,7 +101,23 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
       ? o.desiredModels.filter((m): m is string => typeof m === "string")
       : undefined,
     engineFault: parseEngineFault(o.engineFault),
+    shareLocation: typeof o.shareLocation === "boolean" ? o.shareLocation : undefined,
+    region: typeof o.region === "string" ? o.region : undefined,
+    proBono: parseProBono(o.proBono),
   };
+}
+
+/** Parse the provider record's `proBono` policy (mode + optional DID
+ *  allowlist), tolerating malformed shapes (treated as off). */
+function parseProBono(raw: unknown): { mode?: string; dids?: string[] } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const mode = typeof o.mode === "string" ? o.mode : undefined;
+  if (mode !== "any" && mode !== "direct") return undefined;
+  const dids = Array.isArray(o.dids)
+    ? o.dids.filter((d): d is string => typeof d === "string")
+    : undefined;
+  return { mode, ...(dids && dids.length > 0 ? { dids } : {}) };
 }
 
 function parseEngineFault(raw: unknown): EngineFaultBody | undefined {
@@ -678,6 +697,13 @@ export function providerRowsToMachines(
       faultCode: body.engineFault?.code,
       faultReason: body.engineFault?.message,
       faultModels: body.engineFault?.models,
+      shareLocation: body.shareLocation,
+      region: body.region,
+      proBonoMode:
+        body.proBono?.mode === "any" || body.proBono?.mode === "direct"
+          ? body.proBono.mode
+          : undefined,
+      proBonoDids: body.proBono?.dids,
     };
 
     if (body.active === false) {

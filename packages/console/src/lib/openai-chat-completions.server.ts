@@ -48,6 +48,11 @@ export interface OpenAiChatRequest {
   stream?: unknown;
   max_tokens?: unknown;
   user?: unknown;
+  /** Optional ISO 3166-1 alpha-2 country code (e.g. "US"). When set, the
+   *  request is routed only to providers that publish a matching coarse
+   *  `region` on their provider record. Advisory routing, not a guarantee:
+   *  the region is a provider self-claim (see the provider lexicon). */
+  country?: unknown;
 }
 
 export interface ParsedRequest {
@@ -55,6 +60,9 @@ export interface ParsedRequest {
   messages: ChatMessage[];
   stream: boolean;
   maxTokens: number;
+  /** Normalized ISO 3166-1 alpha-2 country filter (uppercased), or
+   *  undefined when the caller didn't request country routing. */
+  country?: string;
 }
 
 const DEFAULT_MAX_TOKENS = 1024;
@@ -199,7 +207,16 @@ export function parseRequest(raw: OpenAiChatRequest): ParsedRequest | string {
     maxTokens = raw.max_tokens;
   }
   const stream = typeof raw.stream === "boolean" ? raw.stream : false;
-  return { model: raw.model, messages, stream, maxTokens };
+  let country: string | undefined;
+  // `null` (an explicit "no country") is treated the same as absent, so a
+  // client that sends `country: null` isn't rejected with a misleading 400.
+  if (raw.country !== undefined && raw.country !== null) {
+    if (typeof raw.country !== "string" || !/^[A-Za-z]{2}$/.test(raw.country.trim())) {
+      return "country must be a 2-letter ISO 3166-1 alpha-2 code";
+    }
+    country = raw.country.trim().toUpperCase();
+  }
+  return { model: raw.model, messages, stream, maxTokens, country };
 }
 
 /** The flattened text of one message's content (image parts contribute
@@ -384,6 +401,15 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
       // 404 here lines up with what clients expect when they ask
       // for a model the API doesn't know about.
       return { status: 404, type: "invalid_request_error", code: "model_not_found" };
+    case "no-providers-for-country":
+      // The model exists but no provider in the requested country serves it.
+      // 503 (capacity-shaped, retryable) rather than 404 — the model IS known,
+      // there's just no provider in that region right now.
+      return {
+        status: 503,
+        type: "service_unavailable_error",
+        code: "no_providers_for_country",
+      };
     case "no-friends-available":
       return {
         status: 503,

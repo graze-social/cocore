@@ -55,6 +55,14 @@ pub struct ReceiptInputs {
     pub completed_at: DateTime<Utc>,
     pub price: Money,
     pub attestation: StrongRef,
+    /// True when this job was served pro bono under the provider's
+    /// `proBono` election — free, unmetered, no exchange cut. When set,
+    /// the caller MUST pass `price.amount == 0` and `tokens_in ==
+    /// tokens_out == 0`; the work is explicitly not counted. Emitted as
+    /// `proBono: true` and covered by the enclave signature so the
+    /// carve-out is part of the signed record. `false` omits the field
+    /// entirely (a normal metered receipt).
+    pub pro_bono: bool,
 }
 
 /// Sampling parameters committed to in a receipt. Integer-only because
@@ -95,6 +103,12 @@ pub struct ReceiptRecord {
     pub completedAt: String,
     pub price: MoneyValue,
     pub attestation: StrongRefValue,
+    /// Present (as `true`) only when this job was served pro bono.
+    /// Omitted on a normal metered receipt so the byte layout — and
+    /// thus the signed canonical form — is identical to a pre-proBono
+    /// record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub proBono: bool,
     /// Base64 of the DER-encoded ECDSA-P256 signature over the
     /// canonical bytes of every other field in this record.
     pub enclaveSignature: String,
@@ -171,6 +185,15 @@ pub fn build(
             .unwrap()
             .insert("outputCipherURL".into(), Value::String(url.clone()));
     }
+    // Only emit `proBono` when true, mirroring the typed record's
+    // `skip_serializing_if` — a normal receipt canonicalises to the
+    // exact bytes a pre-proBono verifier derives.
+    if inputs.pro_bono {
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("proBono".into(), Value::Bool(true));
+    }
     let canonical = to_canonical_bytes(&unsigned)?;
     let sig = signer
         .sign(&canonical)
@@ -204,6 +227,7 @@ pub fn build(
                 uri: inputs.attestation.uri,
                 cid: inputs.attestation.cid,
             },
+            proBono: inputs.pro_bono,
             enclaveSignature: B64.encode(&sig),
         },
         canonical,
@@ -247,6 +271,7 @@ mod tests {
                 uri: "at://did:plc:p/dev.cocore.compute.attestation/1".into(),
                 cid: "bafyatt".into(),
             },
+            pro_bono: false,
         }
     }
 
@@ -348,6 +373,46 @@ mod tests {
         let sig = Signature::from_der(&sig_der).unwrap();
         vk.verify(&message, &sig)
             .expect("signature must verify with cipher commitment + params present");
+    }
+
+    #[test]
+    fn pro_bono_field_present_and_signed_when_set() {
+        let signer = load_or_create_identity().unwrap();
+
+        // A normal receipt omits proBono entirely — byte-identical to a
+        // pre-proBono record so old verifiers see the same canonical form.
+        let (rec, _) = build(fixture(chrono::Utc::now()), &*signer).unwrap();
+        let body = serde_json::to_value(&rec).unwrap();
+        assert!(body.get("proBono").is_none());
+
+        // A pro-bono receipt: free + unmetered, so price and tokens are zero.
+        let mut inputs = fixture(chrono::Utc::now());
+        inputs.pro_bono = true;
+        inputs.tokens_in = 0;
+        inputs.tokens_out = 0;
+        inputs.price = Money {
+            amount: 0,
+            currency: "CC".into(),
+        };
+        let (rec, _) = build(inputs, &*signer).unwrap();
+        let mut signed = serde_json::to_value(&rec).unwrap();
+        assert_eq!(signed["proBono"], json!(true));
+        assert_eq!(signed["price"]["amount"], json!(0));
+        assert_eq!(signed["tokens"], json!({ "in": 0, "out": 0 }));
+
+        // The flag is covered by the signature (verifies against record minus sig).
+        signed.as_object_mut().unwrap().remove("enclaveSignature");
+        let message = to_canonical_bytes(&signed).unwrap();
+        let sig_der = B64.decode(rec.enclaveSignature.as_bytes()).unwrap();
+        let pub_raw = B64.decode(signer.public_key_b64()).unwrap();
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        uncompressed[1..].copy_from_slice(&pub_raw);
+        let point = EncodedPoint::from_bytes(uncompressed).unwrap();
+        let vk = VerifyingKey::from_encoded_point(&point).unwrap();
+        let sig = Signature::from_der(&sig_der).unwrap();
+        vk.verify(&message, &sig)
+            .expect("signature must verify with proBono present");
     }
 
     #[test]

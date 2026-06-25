@@ -163,6 +163,12 @@ pub struct Register {
     /// eligibility from cdHash ∈ known-good + challenge-verified SIP. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// Coarse, opt-in ISO 3166-1 alpha-2 country echoed from the provider
+    /// record's `region`, so the advisor's `/providers` list can route by
+    /// country without reading the PDS. Advisory self-claim; `None` when the
+    /// owner hasn't opted into location sharing. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// APNs device token (hex) for this machine's measured agent process, when
     /// it could register for remote notifications (a logged-in GUI session with
     /// the push entitlement). Lets the advisor send the APNs code-identity

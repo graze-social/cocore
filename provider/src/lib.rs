@@ -23,6 +23,7 @@ pub mod crypto;
 pub mod diagnostics;
 pub mod engines;
 pub mod error;
+pub mod geoip;
 pub mod hypervisor;
 // `inference` (the PyO3 Python-sandbox module) was removed in v0.6.0
 // alongside the rest of the in-process Python design. See

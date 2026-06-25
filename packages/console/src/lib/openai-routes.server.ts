@@ -26,6 +26,7 @@ import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-s
 import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
 import { type DispatchInputs, runDispatch } from "@/lib/inference-dispatch.server.ts";
 import { listMyFriendDids } from "@/lib/friends.server.ts";
+import { resolveProBonoProviderKeys } from "@/lib/pro-bono.server.ts";
 import {
   buildJobInput,
   bufferedResponse,
@@ -140,6 +141,7 @@ export async function handleChatCompletions(request: Request): Promise<Response>
     inputFormat: payload.inputFormat,
     maxTokensOut: parsed.maxTokens,
     priceCeiling: DEFAULT_PRICE_CEILING,
+    country: parsed.country,
   };
 
   if (parsed.stream) {
@@ -202,6 +204,7 @@ export async function handlePrivateChatCompletions(request: Request): Promise<Re
     // pickProvider surfaces NoFriendsAvailableError and the buffered/
     // streaming responders map that to a 503 (no_friends_available).
     allowedProviderDids,
+    country: parsed.country,
   };
 
   if (parsed.stream) {
@@ -287,6 +290,82 @@ export async function handleVerifiedChatCompletions(request: Request): Promise<R
     // Same mechanism as the friends path, but the set is the proof-backed
     // verified-provider list rather than the caller's friends.
     allowedProviderDids,
+    country: parsed.country,
+  };
+
+  if (parsed.stream) {
+    return streamingResponse(id, parsed.model, runDispatch(inputs));
+  }
+  return await bufferedResponse(id, parsed.model, runDispatch(inputs));
+}
+
+/** POST /v1/probono/chat/completions — the pro-bono completion path. Routes
+ *  ONLY to providers whose `proBono` policy elects to serve THIS requester for
+ *  free (`mode: any`, or `mode: direct` with the caller's DID listed). A
+ *  matched job is served unmetered at zero price with no exchange cut, so a
+ *  requester with no token balance can still get a completion. Identical wire
+ *  format to `/v1/chat/completions` (and `country` still narrows by region).
+ *  Fails CLOSED with a 503 when no connected provider currently offers the
+ *  caller pro bono, rather than silently falling back to a billed job. Same
+ *  `allowedProviderDids` mechanism as the friends + verified paths. */
+export async function handleProBonoChatCompletions(request: Request): Promise<Response> {
+  const auth = await authenticate(request);
+  if (auth instanceof Response) return auth;
+
+  let raw: OpenAiChatRequest;
+  try {
+    raw = (await request.json()) as OpenAiChatRequest;
+  } catch {
+    return jsonError(400, "Body must be JSON");
+  }
+  const parsed = parseRequest(raw);
+  if (typeof parsed === "string") return jsonError(400, parsed);
+
+  // Resolve the specific MACHINES that currently serve this DID pro bono BEFORE
+  // submitting the job (composite `did:machineId` keys — pro bono is per-machine,
+  // so we can't widen to an owner's other billed machines). A lookup failure
+  // surfaces as a transport error (so the caller can tell "nobody offers me pro
+  // bono" from "the AppView coughed").
+  let allowedProviderDids: Set<string>;
+  try {
+    allowedProviderDids = await resolveProBonoProviderKeys(auth.did);
+  } catch (e) {
+    return jsonError(
+      502,
+      `failed to resolve pro-bono providers: ${(e as Error).message}`,
+      "server_error",
+      "pro_bono_lookup_failed",
+    );
+  }
+  if (allowedProviderDids.size === 0) {
+    return jsonError(
+      503,
+      "no provider currently offers you pro-bono compute; use /v1/chat/completions for a normal (billed) request",
+      "service_unavailable_error",
+      "no_pro_bono_providers",
+    );
+  }
+
+  const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, "")}`;
+  let payload: Awaited<ReturnType<typeof buildJobInput>>;
+  try {
+    payload = await buildJobInput(parsed.messages);
+  } catch (e) {
+    return jsonError(400, `failed to prepare input: ${(e as Error).message}`);
+  }
+  const inputs: DispatchInputs = {
+    did: auth.did,
+    oauthSession: auth.oauthSession,
+    model: parsed.model,
+    prompt: "",
+    payloadBytes: payload.payloadBytes,
+    inputFormat: payload.inputFormat,
+    maxTokensOut: parsed.maxTokens,
+    priceCeiling: DEFAULT_PRICE_CEILING,
+    // Constrain routing to providers that serve this requester free — same
+    // gate as the friends/verified paths, just a different allow-set.
+    allowedProviderDids,
+    country: parsed.country,
   };
 
   if (parsed.stream) {

@@ -99,6 +99,11 @@ A `dev.cocore.compute.receipt` record commits to, at minimum:
 - `sig` — provider signature (already implicit at the repo layer; this field
   is for any _additional_ enclave-bound signature the provider wants to
   publish alongside the repo signature)
+- `proBono` — optional bool, present (`true`) only when the provider served
+  the job pro bono under its `provider.proBono` election: free, unmetered, no
+  exchange cut. A pro bono receipt MUST carry `price.amount: 0` and
+  `tokens: { in: 0, out: 0 }`, and the exchange settles it with all-zero
+  amounts. Absent/false is a normal metered, billable receipt.
 
 ## Conventions
 

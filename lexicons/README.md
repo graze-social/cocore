@@ -65,6 +65,65 @@ calls beyond the federated AT Protocol layer:
 Any failure in this chain invalidates the unit of work without requiring
 agreement from any other party.
 
+## Pro bono receipts
+
+A provider can elect to serve work **pro bono** — free, unmetered, and with
+no exchange cut — via the `proBono` policy on its
+`dev.cocore.compute.provider` record:
+
+- `proBono.mode: "any"` serves every requester pro bono.
+- `proBono.mode: "direct"` serves only the requester DIDs in `proBono.dids`
+  (the owner's direct pro bono relationships) and bills everyone else
+  normally. An absent policy, or an unknown `mode`, means pro bono is off —
+  readers fail closed to paid.
+
+Pro bono is purely **additive**: a requester the policy doesn't cover is
+still served as a normal paid job, so opting in never costs the machine paid
+work. The election is the provider's alone — there is no central pro bono
+registry, consistent with the no-coordinator invariant.
+
+When a provider serves a job pro bono it still publishes a signed receipt
+(the provider's PDS stays the source of truth for work done), but the receipt
+carries `proBono: true` and, by invariant, `price.amount: 0` and
+`tokens: { in: 0, out: 0 }` — the work is explicitly not counted, so neither
+figure is a billing claim. The flag is covered by `enclaveSignature`, so the
+carve-out is part of the signed, self-verifying record rather than an
+off-record side channel. A verifier MUST reject a `proBono: true` receipt
+whose price or token counts are non-zero. An exchange settling such a receipt
+takes no fee and moves no balance: `amountCharged`, `providerPayout`, and
+`exchangeFee` are all `0`.
+
+The `proBono` policy is **owner-written intent** (set from the console / a
+management UI), preserved by the agent across re-publishes like
+`desiredModels` / `desiredTier`. A requester can deliberately seek out a free
+machine via the **pro-bono completion path** (`/v1/probono/chat/completions`),
+which routes only to providers whose policy serves that requester; because a
+pro-bono receipt moves no balance, a requester with no token balance can still
+be served there.
+
+## Coarse location (region)
+
+A machine can **opt in** to publishing its coarse country, an ISO 3166-1
+alpha-2 code, so requesters can route to nearby compute:
+
+- `shareLocation` (boolean) on the `dev.cocore.compute.provider` record is the
+  owner's opt-in, set from the console. Owner-written intent, preserved by the
+  agent across re-publishes (like `proBono` / `desiredTier`).
+- When `shareLocation` is on, the agent resolves the machine's country from a
+  best-effort public-IP geolocation at serve start and stamps `region`
+  (plus `regionSource` and `regionObservedAt`), refreshed on every serve. When
+  it is off, those fields are omitted, so opting out drops the value on the
+  next re-publish.
+
+`region` is **advisory and self-asserted** (same trust posture as `tier`): a
+VPN or proxy moves it, and there is no signed-location primitive, so a verifier
+MUST NOT gate anything security-relevant on it. It exists purely as a routing
+hint. Requesters narrow by it with the `country` parameter on the completions
+endpoints; a provider that isn't sharing a region is never matched by a country
+filter, and the request fails closed (`no_providers_for_country`) rather than
+silently routing elsewhere. The advisor echoes `region` from the record so
+country routing needs no PDS read.
+
 ## Federation invariants
 
 These two properties together are what "no privileged operator" means in

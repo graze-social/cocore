@@ -10,10 +10,12 @@ import { describe, test } from "vitest";
 import {
   classifyDispatchError,
   filterByAllowedDids,
+  filterByCountry,
   filterByPayoutsEligibility,
   NoFriendsAvailableError,
   NoFriendsForModelError,
   NoProvidersConnectedError,
+  NoProvidersForCountryError,
   NoProvidersForModelError,
   ProviderPayoutsNotEligibleError,
   TargetProviderNotConnectedError,
@@ -91,6 +93,22 @@ describe("filterByAllowedDids", () => {
     const out = filterByAllowedDids([A, B], new Set(["did:plc:carol", "did:plc:alice"]));
     assert.deepEqual(out, [A]);
   });
+
+  test("a `did:machineId` composite matches only that machine (pro-bono granularity)", () => {
+    // Same owner DID, two machines — one pro bono, one not. A composite key
+    // must match ONLY the pro-bono machine, never widen to the billed one.
+    const m1 = { did: "did:plc:alice", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:alice", machineId: "rkeyB" };
+    const out = filterByAllowedDids([m1, m2], new Set(["did:plc:alice:rkeyA"]));
+    assert.deepEqual(out, [m1]);
+  });
+
+  test("a bare DID still matches every machine of that owner (friends/verified)", () => {
+    const m1 = { did: "did:plc:alice", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:alice", machineId: "rkeyB" };
+    const out = filterByAllowedDids([m1, m2], new Set(["did:plc:alice"]));
+    assert.deepEqual(out, [m1, m2]);
+  });
 });
 
 describe("classifyDispatchError", () => {
@@ -142,5 +160,36 @@ describe("structured error messages carry operational context", () => {
     assert.match(e.message, /gemma-3/);
     assert.match(e.message, /2 connected friends/);
     assert.match(e.message, /5 friends total/);
+  });
+
+  test("NoProvidersForCountryError mentions the model, country, and model-fit count", () => {
+    const e = new NoProvidersForCountryError("gemma-3", "US", 4);
+    assert.match(e.message, /gemma-3/);
+    assert.match(e.message, /US/);
+    assert.match(e.message, /4 serve the model/);
+    assert.equal(classifyDispatchError(e), "no-providers-for-country");
+  });
+});
+
+describe("filterByCountry — country routing", () => {
+  const US = { did: "did:plc:alice", region: "US" };
+  const DE = { did: "did:plc:bob", region: "DE" };
+  const noRegion: { did: string; region?: string } = { did: "did:plc:carol" };
+
+  test("undefined country passes the list through verbatim", () => {
+    assert.deepEqual(filterByCountry([US, DE, noRegion], undefined), [US, DE, noRegion]);
+  });
+
+  test("keeps only candidates whose region matches", () => {
+    assert.deepEqual(filterByCountry([US, DE, noRegion], "US"), [US]);
+    assert.deepEqual(filterByCountry([US, DE, noRegion], "DE"), [DE]);
+  });
+
+  test("a provider with no region is never matched by a country filter", () => {
+    assert.deepEqual(filterByCountry([noRegion], "US"), []);
+  });
+
+  test("no provider in the requested country yields an empty list", () => {
+    assert.deepEqual(filterByCountry([US, DE], "FR"), []);
   });
 });

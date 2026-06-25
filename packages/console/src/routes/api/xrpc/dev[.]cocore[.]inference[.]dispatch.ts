@@ -30,6 +30,7 @@ import {
   isDispatchForwardConfigured,
 } from "@/lib/inference-dispatch-forward.server.ts";
 import { runDispatch } from "@/lib/inference-dispatch.server.ts";
+import { resolveProBonoProviderKeys } from "@/lib/pro-bono.server.ts";
 import { getAtprotoSessionForRequest } from "@/middleware/auth.server.ts";
 
 interface DispatchBody {
@@ -43,6 +44,11 @@ interface DispatchBody {
   priceCeiling?: unknown;
   targetProviderDid?: unknown;
   targetMachineId?: unknown;
+  /** Optional ISO 3166-1 alpha-2 country to route by (advisory region match). */
+  country?: unknown;
+  /** When true, route ONLY to providers whose `proBono` policy serves this
+   *  requester for free (the pro-bono completion path). */
+  proBono?: unknown;
 }
 
 interface ParsedDispatch {
@@ -56,6 +62,11 @@ interface ParsedDispatch {
   /** Specific machine under targetProviderDid. Only forwarded when
    *  targetProviderDid is also set. */
   targetMachineId?: string;
+  /** Normalized ISO 3166-1 alpha-2 country filter (uppercased). */
+  country?: string;
+  /** True when the caller requested the pro-bono path. Resolved to an
+   *  `allowedProviderDids` allow-set in the handler (needs the requester DID). */
+  proBono: boolean;
 }
 
 function parseDispatch(body: DispatchBody): ParsedDispatch | string {
@@ -85,6 +96,18 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   if (body.targetMachineId !== undefined && typeof body.targetMachineId !== "string") {
     return "targetMachineId must be a string when provided";
   }
+  let country: string | undefined;
+  // `null` (an explicit "no country") is treated the same as absent, so a
+  // client that sends `country: null` isn't rejected with a misleading 400.
+  if (body.country !== undefined && body.country !== null) {
+    if (typeof body.country !== "string" || !/^[A-Za-z]{2}$/.test(body.country.trim())) {
+      return "country must be a 2-letter ISO 3166-1 alpha-2 code";
+    }
+    country = body.country.trim().toUpperCase();
+  }
+  if (body.proBono !== undefined && typeof body.proBono !== "boolean") {
+    return "proBono must be a boolean when provided";
+  }
   // `messages` is optional; only validated (and only matters) when images
   // ride along. An explicitly-present-but-malformed value is a 400.
   let messages: EnvelopeMessage[] | undefined;
@@ -105,6 +128,8 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     ...(typeof body.targetProviderDid === "string" && typeof body.targetMachineId === "string"
       ? { targetMachineId: body.targetMachineId }
       : {}),
+    ...(country ? { country } : {}),
+    proBono: body.proBono === true,
   };
 }
 
@@ -135,18 +160,52 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
         const parsed = parseDispatch(body);
         if (typeof parsed === "string") return json({ error: parsed }, 400);
 
+        // The pro-bono path: route ONLY to the specific machines whose policy
+        // serves this requester free. We resolve WHICH machines offer them pro
+        // bono here (the console has the AppView read + the requester DID) as
+        // composite `did:machineId` keys, then forward / pass the allow-set so
+        // either core just filters. Machine-granular (not DID-granular) so an
+        // owner's other, billed machines never satisfy the pro-bono request.
+        // Fail closed if nobody does.
+        const { proBono, ...rest } = parsed;
+        let allowedProviderDids: string[] | undefined;
+        if (proBono) {
+          try {
+            const set = await resolveProBonoProviderKeys(session.did);
+            if (set.size === 0) {
+              return json(
+                {
+                  error:
+                    "no provider currently offers you pro-bono compute; turn off pro bono for a normal (billed) request",
+                  // snake_case to match the documented `no_pro_bono_providers`
+                  // code emitted by /v1/probono/chat/completions + openapi.yaml,
+                  // so the same failure has one spelling across both endpoints.
+                  code: "no_pro_bono_providers",
+                },
+                503,
+              );
+            }
+            allowedProviderDids = [...set];
+          } catch (e) {
+            return json({ error: `pro-bono lookup failed: ${(e as Error).message}` }, 502);
+          }
+        }
+
         // Forward to the AppView when configured (it owns the dispatch core +
         // the requester's OAuth session); otherwise run the legacy in-process
         // core below. Both yield the same SSE shape. The forwarded body carries
         // the RAW `messages` (JSON-serializable) — the AppView route rebuilds
         // the envelope on its side; we don't ship binary payloadBytes.
         if (isDispatchForwardConfigured()) {
-          return forwardDispatch({ oauthSession: session.oauthSession, body: { ...parsed } });
+          return forwardDispatch({
+            oauthSession: session.oauthSession,
+            body: { ...rest, ...(allowedProviderDids ? { allowedProviderDids } : {}) },
+          });
         }
 
         // Local in-process core: seal the canonical multimodal envelope when
         // images are present, else the flattened prompt.
-        const { messages, ...textInputs } = parsed;
+        const { messages, ...textInputs } = rest;
         const envelope = messages
           ? { payloadBytes: buildEnvelopeBytes(messages), inputFormat: MESSAGES_V1 }
           : {};
@@ -155,6 +214,7 @@ export const Route = createFileRoute("/api/xrpc/dev.cocore.inference.dispatch")(
           oauthSession: session.oauthSession,
           ...textInputs,
           ...envelope,
+          ...(allowedProviderDids ? { allowedProviderDids: new Set(allowedProviderDids) } : {}),
         });
 
         const stream = new ReadableStream<Uint8Array>({

@@ -153,6 +153,12 @@ struct PreferencesView: View {
                     }
                 }
             }
+            Section("Location") {
+                Text("Sharing this machine's coarse country is now configured on the website — open this machine in the console and turn on “Share country”. It publishes only an advisory country (e.g. “US”) derived from your IP, refreshed each time the machine serves.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
     }

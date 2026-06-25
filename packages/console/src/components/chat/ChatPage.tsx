@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createLink } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button as AriaButton } from "react-aria-components";
-import { ImagePlus, Square, X } from "lucide-react";
+import { ImagePlus, SlidersHorizontal, Square, X } from "lucide-react";
 import type { ReactElement } from "react";
 
 import { getMyBalanceQueryOptions } from "@/components/account/token-balance.functions.ts";
@@ -49,6 +49,7 @@ import { Kbd } from "@/design-system/kbd";
 import { breakpoints } from "@/design-system/theme/media-queries.stylex";
 import { Popover } from "@/design-system/popover";
 import { SearchField } from "@/design-system/search-field";
+import { Switch } from "@/design-system/switch";
 import { getSessionQueryOptions } from "@/integrations/auth/session.functions.ts";
 import { successColor, uiColor } from "@/design-system/theme/color.stylex";
 import { radius } from "@/design-system/theme/radius.stylex";
@@ -100,6 +101,29 @@ const CHAT_SUGGESTIONS = [
   "explain this rust lifetime error",
   "summarize my protocol notes",
   "draft release notes from a diff",
+];
+
+// Coarse region routing. `null` means "Any" — don't pin a region; otherwise
+// the ISO 3166-1 alpha-2 code is forwarded to the dispatch, which routes only
+// to providers advertising that region. A short curated list keeps the picker
+// scannable; the wire still accepts any valid code.
+interface CountryOption {
+  code: string | null;
+  label: string;
+}
+const COUNTRY_CHOICES: CountryOption[] = [
+  { code: null, label: "Any" },
+  { code: "US", label: "United States" },
+  { code: "CA", label: "Canada" },
+  { code: "GB", label: "United Kingdom" },
+  { code: "DE", label: "Germany" },
+  { code: "FR", label: "France" },
+  { code: "NL", label: "Netherlands" },
+  { code: "JP", label: "Japan" },
+  { code: "AU", label: "Australia" },
+  { code: "IN", label: "India" },
+  { code: "BR", label: "Brazil" },
+  { code: "SG", label: "Singapore" },
 ];
 
 // Prototype meta text sits at ~10.5px; the smallest token is 12px,
@@ -839,6 +863,37 @@ const styles = stylex.create({
   composerSend: {
     flexShrink: 0,
   },
+  advBtn: {
+    alignItems: "center",
+    appearance: "none",
+    backgroundColor: { default: uiColor.bgSubtle, ":hover": uiColor.bg },
+    borderColor: { default: uiColor.border1, ":hover": uiColor.border2 },
+    borderRadius: radius.xs,
+    cornerShape: "squircle",
+    borderStyle: "solid",
+    borderWidth: 1,
+    boxSizing: "border-box",
+    color: uiColor.text2,
+    cursor: "pointer",
+    display: "flex",
+    flexShrink: 0,
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.xs,
+    gap: gap.sm,
+    paddingBottom: "4px",
+    paddingLeft: horizontalSpace.md,
+    paddingRight: horizontalSpace.md,
+    paddingTop: "4px",
+    whiteSpace: "nowrap",
+  },
+  advBtnActive: {
+    borderColor: uiColor.text2,
+    color: uiColor.text2,
+  },
+  advCount: {
+    color: uiColor.text1,
+    fontVariantNumeric: "tabular-nums",
+  },
   privacyNote: {
     color: uiColor.text1,
     fontSize: MICRO,
@@ -921,6 +976,39 @@ const styles = stylex.create({
     fontSize: MICRO,
     fontVariantNumeric: "tabular-nums",
   },
+  advPop: {
+    display: "flex",
+    flexDirection: "column",
+    gap: verticalSpace.md,
+    width: "min(360px, calc(100vw - 48px))",
+  },
+  countryGrid: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: gap.sm,
+  },
+  proBonoRow: {
+    alignItems: "flex-start",
+    display: "flex",
+    gap: gap.lg,
+    justifyContent: "space-between",
+  },
+  proBonoText: {
+    display: "flex",
+    flexDirection: "column",
+    gap: gap.xs,
+    minWidth: 0,
+  },
+  proBonoTitle: {
+    color: uiColor.text2,
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.semibold,
+  },
+  proBonoHint: {
+    color: uiColor.text1,
+    fontSize: MICRO,
+    lineHeight: 1.5,
+  },
 });
 
 interface MachineOption {
@@ -990,6 +1078,22 @@ function fmtTok(n: number): string {
   return n >= 1024 ? `${Math.round(n / 1024)}k` : `${n}`;
 }
 
+/** Friendlier copy for the advanced-routing dispatch errors. Falls back to
+ *  the server-supplied reason for everything else (including the country-miss
+ *  codes, whose server message already reads well). */
+function friendlyDispatchReason(code: string, reason: string): string {
+  switch (code) {
+    case "no-pro-bono-providers":
+    case "no_pro_bono_providers":
+      return "No machine is offering you free compute right now.";
+    case "no-providers-for-country":
+    case "no_providers_for_country":
+      return reason || "No machine is serving that region right now.";
+    default:
+      return reason;
+  }
+}
+
 function ModelPicker({
   models,
   modelId,
@@ -1031,7 +1135,7 @@ function ModelPicker({
   // same owner DID don't both light up as "selected".
   const isPinnedTo = (m: MachineOption) =>
     m.did === targetProviderDid &&
-    (m.machineId == null || targetMachineId == null || m.machineId === targetMachineId);
+    (targetMachineId == null || m.machineId == null || m.machineId === targetMachineId);
   const targetLabel = targetProviderDid
     ? (machines.find(isPinnedTo)?.label ?? shortDid(targetProviderDid))
     : "auto";
@@ -1179,6 +1283,78 @@ function ModelPicker({
   );
 }
 
+/** Advanced routing options tucked behind a "advanced" chip in the composer
+ *  toolbar: coarse region routing (ISO 3166-1 alpha-2, "Any" = unpinned) and
+ *  a pro-bono toggle that routes only to providers serving this user for
+ *  free. Both are advisory hints forwarded to the dispatch. */
+function AdvancedOptions({
+  country,
+  proBono,
+  onCountry,
+  onProBono,
+}: {
+  country: string | null;
+  proBono: boolean;
+  onCountry: (code: string | null) => void;
+  onProBono: (on: boolean) => void;
+}): ReactElement {
+  const [open, setOpen] = useState(false);
+  const activeCount = (country ? 1 : 0) + (proBono ? 1 : 0);
+  return (
+    <Popover
+      isOpen={open}
+      onOpenChange={setOpen}
+      placement="top end"
+      trigger={
+        <AriaButton {...stylex.props(styles.advBtn, activeCount > 0 && styles.advBtnActive)}>
+          <SlidersHorizontal size={12} aria-hidden />
+          advanced
+          {activeCount > 0 ? <span {...stylex.props(styles.advCount)}>· {activeCount}</span> : null}
+        </AriaButton>
+      }
+      style={styles.advPop}
+    >
+      <div {...stylex.props(styles.popSectHead)}>
+        <span>route to</span>
+        <span {...stylex.props(styles.popSectHint)}>coarse region — advisory</span>
+      </div>
+      <div {...stylex.props(styles.countryGrid)}>
+        {COUNTRY_CHOICES.map((c) => (
+          <Button
+            key={c.code ?? "any"}
+            size="sm"
+            variant={country === c.code ? "primary" : "outline"}
+            onPress={() => onCountry(c.code)}
+            // Compact 2-letter code is shown; the full country name is the
+            // accessible label (screen readers + hover) so "US" isn't opaque.
+            aria-label={c.label}
+          >
+            {c.code ?? "Any"}
+          </Button>
+        ))}
+      </div>
+
+      <div {...stylex.props(styles.popSectHead)}>
+        <span>pro bono</span>
+        <span {...stylex.props(styles.popSectHint)}>free compute only</span>
+      </div>
+      <div {...stylex.props(styles.proBonoRow)}>
+        <span {...stylex.props(styles.proBonoText)}>
+          <span {...stylex.props(styles.proBonoTitle)}>request pro-bono (free) compute</span>
+          <span {...stylex.props(styles.proBonoHint)}>
+            routes only to machines whose pro-bono policy serves you for free.
+          </span>
+        </span>
+        <Switch
+          aria-label="request pro-bono (free) compute"
+          isSelected={proBono}
+          onChange={onProBono}
+        />
+      </div>
+    </Popover>
+  );
+}
+
 interface ChatSessionsPanelProps {
   visible: ChatSession[];
   activeId: string | null;
@@ -1304,6 +1480,13 @@ export function ChatPage(): ReactElement {
   // no longer holds them — then we show a "had image" indicator.
   const [msgImages, setMsgImages] = useState<Record<string, string[] | "lost">>({});
   const [streamingId, setStreamingId] = useState<string | null>(null);
+
+  // Advanced routing options, kept at page scope: a coarse region (ISO
+  // 3166-1 alpha-2, null = "Any") and a pro-bono toggle. They apply to every
+  // turn in this page session and reset on reload (intentionally not
+  // persisted — they're per-sitting routing hints, not session content).
+  const [country, setCountry] = useState<string | null>(null);
+  const [proBono, setProBono] = useState(false);
 
   // Settings for the not-yet-created session shown by "new chat".
   const [draftModelId, setDraftModelId] = useState<string | null>(null);
@@ -1650,6 +1833,10 @@ export function ChatPage(): ReactElement {
         maxTokensOut,
         targetProviderDid,
         targetMachineId,
+        // null country = "Any" (the dispatch treats null/absent as unpinned);
+        // proBono only forwarded when on.
+        country,
+        ...(proBono ? { proBono: true } : {}),
         signal: abort.signal,
         onMeta: (meta) => {
           const entry = models.find((m) => m.modelId === modelId);
@@ -1688,10 +1875,11 @@ export function ChatPage(): ReactElement {
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
       const isDispatch = e instanceof ChatDispatchError;
+      const rawReason = e instanceof Error ? e.message : String(e);
       patchMessage(sessionId, assistantMsg.id, (m) => ({
         ...m,
         errorCode: isDispatch ? e.code : "unknown",
-        errorReason: e instanceof Error ? e.message : String(e),
+        errorReason: isDispatch ? friendlyDispatchReason(e.code, rawReason) : rawReason,
       }));
     } finally {
       abortRef.current = null;
@@ -1859,6 +2047,13 @@ export function ChatPage(): ReactElement {
                       }`}
                 </span>
               </span>
+              {country ? (
+                <span {...stylex.props(styles.hostChip)}>
+                  <span {...stylex.props(styles.stripLabel)}>region</span>
+                  {country}
+                </span>
+              ) : null}
+              {proBono ? <span {...stylex.props(styles.hostChip)}>pro bono</span> : null}
               <span {...stylex.props(styles.stripItem)}>
                 <span {...stylex.props(styles.stripLabel)}>ctx</span>
                 <span {...stylex.props(styles.emphasis)}>
@@ -2061,6 +2256,12 @@ export function ChatPage(): ReactElement {
                     onMaxTokens={setMaxTokens}
                   />
                 </div>
+                <AdvancedOptions
+                  country={country}
+                  proBono={proBono}
+                  onCountry={setCountry}
+                  onProBono={setProBono}
+                />
                 <span {...stylex.props(styles.rateNote)}>
                   {balance ? `${formatTokensCompact(balance.balance)} tok left · ` : ""}
                   billed per generated token

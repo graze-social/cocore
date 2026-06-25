@@ -147,6 +147,109 @@ enum EnrollmentProbe {
     }
 }
 
+// MARK: - attestation failure diagnostic
+
+/// A structured, copy-pasteable diagnostic for a stalled/failed attesting
+/// step. Built only from signals we actually observed — the device's
+/// enrollment state, the `push-attestation` response, and the last
+/// `attestation-chain` poll — so a failure carries WHY, not just "not ready".
+///
+/// We `NSLog` `report` (so it lands in the log file: greppable, and feedable
+/// to a model verbatim) and show `userMessage` inline so the owner can paste
+/// it back to us. Pure value type, no I/O, so the classification is easy to
+/// reason about (and test) in isolation.
+struct AttestationDiagnostic {
+    var serial: String
+    var enrolled: Bool
+    var elapsedSeconds: Int
+    var polls: Int
+    /// `push-attestation` response: status (bundled|acknowledged|queued|
+    /// queued-no-push|error), whether it was a stub (no real NanoMDM call),
+    /// and any server-side detail.
+    var pushStatus: String?
+    var pushStubbed: Bool?
+    var pushDetail: String?
+    /// Last `attestation-chain` poll: store status (pending|error|captured),
+    /// any detail, and the last non-200 HTTP code seen (nil when every GET was
+    /// a clean 200 that simply carried no chain yet).
+    var chainStatus: String?
+    var chainDetail: String?
+    var chainHTTP: Int?
+
+    /// Stable, greppable code for the classified failure. Ordered most- to
+    /// least-specific so the first matching cause wins.
+    var code: String {
+        if !enrolled { return "secure-mode/not-enrolled" }
+        if pushStatus == "error" { return "secure-mode/push-failed" }
+        if chainStatus == "error" || chainHTTP != nil { return "secure-mode/chain-store-error" }
+        return "secure-mode/chain-not-captured"
+    }
+
+    /// Plain-language cause, safe to show the owner.
+    var summary: String {
+        switch code {
+        case "secure-mode/not-enrolled":
+            return "This Mac doesn't report MDM enrollment, so it can't be asked "
+                + "to hardware-attest. Re-run the enroll step and Allow + Touch ID "
+                + "the management profile."
+        case "secure-mode/push-failed":
+            return "The coordinator couldn't queue the attestation request "
+                + "(\(pushDetail ?? "no detail"))."
+        case "secure-mode/chain-store-error":
+            let detail = chainDetail ?? (chainHTTP.map { "HTTP \($0)" } ?? "unknown")
+            return "The attestation-chain store returned an error (\(detail))."
+        default:
+            return "No hardware attestation landed within \(elapsedSeconds)s. "
+                + "Hardware attestation runs in the background and is rate-limited "
+                + "by Apple, so it can take a while — this Mac may still attest "
+                + "later without any action from you."
+        }
+    }
+
+    /// Internal next-step for whoever debugs this next (logged, not a user nag).
+    var operatorNextStep: String {
+        switch code {
+        case "secure-mode/not-enrolled":
+            return "agent: mdm_enrolled() is false; confirm `profiles status -type enrollment`."
+        case "secure-mode/push-failed":
+            return "check NanoMDM /v1/enqueue + /v1/push and that the device's UDID is a valid NanoMDM target."
+        case "secure-mode/chain-store-error":
+            return "check the console chain store + the step-ca / NanoMDM attestation webhook ingest."
+        default:
+            return "the Attest button does not itself trigger a hardware attestation — "
+                + "capture is driven by the agent's background option-B flow. Check the "
+                + "agent log for \"MDA auto:\" lines (request/bind), and with "
+                + "COCORE_MDM_WEBHOOK_DEBUG set GET attestation-chain?serial="
+                + "zzwebhookdebuglast to see whether NanoMDM is posting results."
+        }
+    }
+
+    /// The full key=value block we log + surface. One place to read every
+    /// signal that fed the classification.
+    var report: String {
+        let stub = pushStubbed.map { $0 ? "true" : "false" } ?? "—"
+        // nil chainHTTP means either a clean 200 last poll OR no poll ever ran
+        // (push-failed path) — distinguish them via polls so the log never
+        // shows a fabricated "200" for a leg that never executed.
+        let http = chainHTTP.map { "\($0)" } ?? (polls == 0 ? "n/a" : "200")
+        return [
+            "co/core Secure Mode attestation failed [\(code)]",
+            "serial=\(serial) enrolled=\(enrolled) elapsed=\(elapsedSeconds)s polls=\(polls)",
+            "push-attestation: status=\(pushStatus ?? "—") stubbed=\(stub) detail=\(pushDetail ?? "—")",
+            "chain-store: status=\(chainStatus ?? "—") http=\(http) detail=\(chainDetail ?? "—")",
+            "cause: \(summary)",
+            "next: \(operatorNextStep)",
+        ].joined(separator: "\n")
+    }
+
+    /// What the wizard shows inline: the plain cause, the Retry/Skip nudge,
+    /// then the full report so the owner can copy it straight to us.
+    var userMessage: String {
+        summary + "\n\nClick Retry, or Skip this step and revisit Secure Mode "
+            + "later. If you report this, copy the detail below:\n\n" + report
+    }
+}
+
 // MARK: - wizard view
 
 struct SecureModeWizardView: View {
@@ -179,6 +282,16 @@ struct SecureModeWizardView: View {
 
     /// Active poll task, cancelled when the user skips/closes a step.
     @State private var pollTask: Task<Void, Never>?
+
+    /// Diagnostic signals captured during the attesting step, so a stall
+    /// surfaces WHY (see `AttestationDiagnostic`) instead of just "not ready".
+    @State private var pushStatus: String?
+    @State private var pushStubbed: Bool?
+    @State private var pushDetail: String?
+    @State private var chainStatus: String?
+    @State private var chainDetail: String?
+    @State private var chainHTTP: Int?
+    @State private var pollAttempts = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -542,6 +655,7 @@ struct SecureModeWizardView: View {
 
     private func startAttestingStep() {
         stepError = nil
+        resetAttestDiagnostics()
         working = true
         progress = "Requesting a hardware attestation…"
         Task {
@@ -554,13 +668,37 @@ struct SecureModeWizardView: View {
                 progress = nil
                 return  // attestingStep now renders the "Sign in again" panel
             }
+            let pushStart = Date()
             do {
                 try await pushAttestation()
                 progress = "Building the attestation chain…"
                 pollForAttestationChain()
             } catch {
                 working = false
-                stepError = friendly(error, "We couldn't start hardware attestation.")
+                // The push leg failing is the same silent-failure pattern we
+                // fix for the poll leg — classify + log it instead of dropping
+                // to a bare string. The push definitively failed (it threw), so
+                // force the error status UNCONDITIONALLY: recordPushResponse may
+                // have already captured a non-"error" body status, and a plain
+                // `?? "error"` would leave that stale value and misclassify the
+                // failure onto a chain code. Keep the server's message as the
+                // detail when it gave one, else the thrown error's text.
+                pushStatus = "error"
+                pushDetail = pushDetail ?? error.localizedDescription
+                let diag = AttestationDiagnostic(
+                    serial: serial,
+                    enrolled: EnrollmentProbe.isEnrolled(),
+                    elapsedSeconds: Int(Date().timeIntervalSince(pushStart)),
+                    polls: 0,
+                    pushStatus: pushStatus,
+                    pushStubbed: pushStubbed,
+                    pushDetail: pushDetail,
+                    chainStatus: nil,
+                    chainDetail: nil,
+                    chainHTTP: nil
+                )
+                NSLog("cocore: %@", diag.report)
+                stepError = diag.userMessage
             }
         }
     }
@@ -579,10 +717,35 @@ struct SecureModeWizardView: View {
         var body: [String: String] = ["serial": serial]
         if let id = enrollmentId { body["enrollmentId"] = id }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        recordPushResponse(data)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw WizardError.http((resp as? HTTPURLResponse)?.statusCode ?? 0)
         }
+    }
+
+    /// Reset the captured diagnostic signals at the start of an attest run so a
+    /// Retry never reports stale state from a previous attempt.
+    private func resetAttestDiagnostics() {
+        pushStatus = nil
+        pushStubbed = nil
+        pushDetail = nil
+        chainStatus = nil
+        chainDetail = nil
+        chainHTTP = nil
+        pollAttempts = 0
+    }
+
+    /// Capture the `push-attestation` response signals (status/stubbed/detail)
+    /// for the failure diagnostic. Best-effort: a non-JSON body just leaves the
+    /// fields nil.
+    private func recordPushResponse(_ data: Data) {
+        guard
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        pushStatus = obj["status"] as? String
+        pushStubbed = obj["stubbed"] as? Bool
+        pushDetail = obj["detail"] as? String
     }
 
     /// Poll GET {apiBase}/api/agent/mdm/attestation-chain?serial=... until a
@@ -601,32 +764,71 @@ struct SecureModeWizardView: View {
                 stepError = "We couldn't build the attestation-chain request."
                 return
             }
+            let start = Date()
             while !Task.isCancelled, Date() < deadline {
+                // Count every attempt, including ones whose request throws
+                // (network error / timeout), so `polls` in the report reflects
+                // the real effort, not just the responses that came back.
+                pollAttempts += 1
                 var req = URLRequest(url: url)
                 req.setValue("Bearer \(auth.apiKey)", forHTTPHeaderField: "Authorization")
                 req.timeoutInterval = 15
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
-                    (resp as? HTTPURLResponse)?.statusCode == 200,
-                    hasChain(data) {
-                    working = false
-                    progress = nil
-                    // Attestation landed — make sure the durable intent is set
-                    // so the posture survives restarts (intro fast-path may have
-                    // skipped startEnrollStep where it's normally written).
-                    MenuBarController.setSecureModeDesired(true)
-                    state.secureModeDesired = true
-                    advance(to: .done)
-                    return
+                if let (data, resp) = try? await URLSession.shared.data(for: req) {
+                    let http = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    recordChainResponse(data, http: http)
+                    if http == 200, hasChain(data) {
+                        working = false
+                        progress = nil
+                        // Attestation landed — make sure the durable intent is set
+                        // so the posture survives restarts (intro fast-path may have
+                        // skipped startEnrollStep where it's normally written).
+                        MenuBarController.setSecureModeDesired(true)
+                        state.secureModeDesired = true
+                        advance(to: .done)
+                        return
+                    }
                 }
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
             if !Task.isCancelled {
                 working = false
-                stepError =
-                    "The attestation chain isn't ready yet. Click Retry, or Skip this step "
-                    + "and revisit Secure Mode later."
+                // Don't fail silently with a bare "not ready" — classify what we
+                // observed into a structured diagnostic, log the full report (so
+                // it's greppable / feedable to a model), and surface the cause.
+                let diag = AttestationDiagnostic(
+                    serial: serial,
+                    enrolled: EnrollmentProbe.isEnrolled(),
+                    elapsedSeconds: Int(Date().timeIntervalSince(start)),
+                    polls: pollAttempts,
+                    pushStatus: pushStatus,
+                    pushStubbed: pushStubbed,
+                    pushDetail: pushDetail,
+                    chainStatus: chainStatus,
+                    chainDetail: chainDetail,
+                    chainHTTP: chainHTTP
+                )
+                NSLog("cocore: %@", diag.report)
+                stepError = diag.userMessage
             }
         }
+    }
+
+    /// Capture the latest `attestation-chain` poll signals for the diagnostic.
+    /// A non-200 records the HTTP code (so the diagnostic classifies it as a
+    /// store error); a 200 leaves `chainHTTP` nil (clean poll, just no chain
+    /// yet) and pulls status/detail from the JSON body when present.
+    private func recordChainResponse(_ data: Data, http: Int) {
+        // Reflect ONLY the last poll's signals so a transient blip never
+        // sticks: a mid-window non-200 (or its JSON `status:"error"` body)
+        // must not survive into a later clean-but-pending poll and misclassify
+        // the timeout as a store error. We therefore overwrite all three
+        // fields every call — including to nil when a 200 body is empty or
+        // unparseable (no status this poll), rather than early-returning and
+        // leaving a stale status behind.
+        chainHTTP = http == 200 ? nil : http
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        chainStatus = obj?["status"] as? String
+        chainDetail = obj?["detail"] as? String
     }
 
     /// A response carries a usable chain when it's a non-empty array, or an

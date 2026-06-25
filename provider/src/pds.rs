@@ -114,6 +114,23 @@ pub struct ProviderRecord {
     /// in, serves exactly as before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desiredTier: Option<String>,
+    /// The owner's pro-bono election: serve matching jobs free, unmetered,
+    /// no exchange cut. Owner-written INTENT, like `desiredModels`/`active`/
+    /// `desiredTier`: the agent reconciles toward it (a matching job gets a
+    /// `proBono: true`, zero-price, zero-token receipt) but NEVER authors it,
+    /// so it must PRESERVE whatever it finds on every re-publish. Absent ≡
+    /// off (every job is metered and billed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proBono: Option<ProBonoPolicy>,
+    /// The owner's opt-in to publishing this machine's coarse country. Owner-
+    /// written INTENT, like `desiredModels`/`active`/`desiredTier`/`proBono`:
+    /// the agent reconciles toward it (when true it geolocates the public IP at
+    /// serve start and stamps `region`/`regionSource`/`regionObservedAt`) but
+    /// NEVER authors it, so it must PRESERVE whatever it finds on every
+    /// re-publish. Absent ≡ not sharing; the agent then omits the region
+    /// fields so opting out clears any previously-shared value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shareLocation: Option<bool>,
     /// True while the agent is still loading its inference engine. Set on
     /// the early "provisioning" publish at serve start so the machine
     /// appears on the console immediately; cleared (set false) on the
@@ -133,7 +150,62 @@ pub struct ProviderRecord {
     /// stale failure. See `build_engines`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engineFault: Option<EngineFault>,
+    /// Coarse, opt-in country of this machine, ISO 3166-1 alpha-2 (e.g.
+    /// "US"). AGENT-authored and ADVISORY: a self-asserted claim from a
+    /// best-effort IP→country lookup at serve start, NOT a proof of location
+    /// (a VPN moves it; verifiers MUST NOT trust it — same posture as
+    /// `tier`). Set fresh on every serve when the owner has opted in via the
+    /// console's `shareLocation` switch on this record; `None` when sharing is
+    /// off, so a re-publish drops any previously-shared value (opt-out clears
+    /// the data). Unlike the console-authored switches it is NOT carried
+    /// through `preserve_console_fields` — the agent re-derives it each serve
+    /// from `shareLocation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// How `region` was derived (e.g. `ip-geo`). Present iff `region` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regionSource: Option<String>,
+    /// When `region` was observed this serve. Present iff `region` is; lets
+    /// consumers judge the freshness of the refresh-on-serve stamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regionObservedAt: Option<chrono::DateTime<chrono::Utc>>,
     pub createdAt: chrono::DateTime<chrono::Utc>,
+}
+
+/// The owner's pro-bono election for a machine, mirroring the lexicon
+/// `dev.cocore.compute.provider#proBonoPolicy`. Decides, per requester,
+/// whether a job is served free + unmetered with no exchange cut.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProBonoPolicy {
+    /// `any` — every requester is served pro bono. `direct` — only the
+    /// requesters in `dids` are. Any other / empty value is treated as
+    /// off (paid), failing closed.
+    pub mode: String,
+    /// Requester DIDs served pro bono under `mode: direct`. Ignored when
+    /// `mode` is `any`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dids: Vec<String>,
+}
+
+impl ProBonoPolicy {
+    /// Does this policy serve `requester_did` pro bono? `any` ⇒ always;
+    /// `direct` ⇒ only when the DID is listed; anything else ⇒ never.
+    /// Fails closed (paid) on an unrecognized mode.
+    pub fn applies_to(&self, requester_did: &str) -> bool {
+        match self.mode.as_str() {
+            "any" => true,
+            "direct" => self.dids.iter().any(|d| d == requester_did),
+            _ => false,
+        }
+    }
+
+    /// Parse a policy from a raw provider-record JSON value (the shape
+    /// `find_my_provider_record` returns). Returns `None` when the field
+    /// is absent or malformed — both equivalent to "no pro bono".
+    pub fn from_record_value(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.get("proBono")?;
+        serde_json::from_value(obj.clone()).ok()
+    }
 }
 
 /// A content-safe description of why the inference engine failed to
@@ -557,6 +629,54 @@ impl PdsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pro_bono_mode_any_serves_everyone() {
+        let p = ProBonoPolicy {
+            mode: "any".into(),
+            dids: vec![],
+        };
+        assert!(p.applies_to("did:plc:anyone"));
+        assert!(p.applies_to("did:plc:someone-else"));
+    }
+
+    #[test]
+    fn pro_bono_mode_direct_serves_only_listed_dids() {
+        let p = ProBonoPolicy {
+            mode: "direct".into(),
+            dids: vec!["did:plc:friend".into()],
+        };
+        assert!(p.applies_to("did:plc:friend"));
+        // A non-listed requester is NOT pro bono — served as a normal paid job.
+        assert!(!p.applies_to("did:plc:stranger"));
+    }
+
+    #[test]
+    fn pro_bono_off_and_unknown_modes_fail_closed() {
+        // Absent policy ≡ default ≡ off.
+        assert!(!ProBonoPolicy::default().applies_to("did:plc:anyone"));
+        // An unrecognized mode (e.g. a future value) fails closed to paid.
+        let weird = ProBonoPolicy {
+            mode: "future-mode".into(),
+            dids: vec!["did:plc:friend".into()],
+        };
+        assert!(!weird.applies_to("did:plc:friend"));
+    }
+
+    #[test]
+    fn pro_bono_from_record_value_parses_and_tolerates_absence() {
+        let rec = serde_json::json!({
+            "machineLabel": "m",
+            "proBono": { "mode": "direct", "dids": ["did:plc:a", "did:plc:b"] }
+        });
+        let p = ProBonoPolicy::from_record_value(&rec).expect("policy present");
+        assert_eq!(p.mode, "direct");
+        assert!(p.applies_to("did:plc:b"));
+
+        // No proBono field → None (off).
+        let bare = serde_json::json!({ "machineLabel": "m" });
+        assert!(ProBonoPolicy::from_record_value(&bare).is_none());
+    }
 
     fn fake_session(api_base: &str) -> Session {
         Session {

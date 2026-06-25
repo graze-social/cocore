@@ -122,6 +122,11 @@
             "items": { "type": "string", "format": "did" },
             "description": "Exchange DIDs this provider will accept settlement from. Empty/absent means any exchange is acceptable."
           },
+          "proBono": {
+            "type": "ref",
+            "ref": "#proBonoPolicy",
+            "description": "The owner's pro-bono election for this machine: it serves matching jobs for free — no tokens metered, no exchange cut taken. Owner-written INTENT (set from the console / tray), like `desiredModels`/`active`: the agent reconciles toward it (it serves a matching job pro bono by writing a receipt with `proBono: true`, `price.amount: 0`, and `tokens: { in: 0, out: 0 }`) but NEVER authors it, so it must PRESERVE whatever it finds on every re-publish. Absent ≡ off: the machine meters and bills every job exactly as before. Pro bono is purely ADDITIVE — a requester that does not match the policy is still served as a normal paid job, so opting in never costs the machine paid work. This is the carve-out for explicitly unlimited usage: a matched requester is never metered or charged, and a requester with no balance is admissible against a machine offering them pro bono. Optional / additive; pre-2026-06 agents ignore it."
+          },
           "contactEndpoint": {
             "type": "string",
             "format": "uri",
@@ -177,7 +182,45 @@
               }
             }
           },
+          "shareLocation": {
+            "type": "boolean",
+            "description": "The owner's opt-in to publishing this machine's coarse country. Owner-written INTENT, set from a management UI (the console's per-machine settings), like `desiredModels`/`desiredTier`/`active`: the agent reconciles toward it but NEVER authors it, so it must PRESERVE whatever it finds on every re-publish. When `true`, the agent resolves this machine's country from a best-effort public-IP geolocation at serve start and stamps `region`/`regionSource`/`regionObservedAt`; when absent/`false` it omits those fields, so turning sharing off drops any previously-shared value on the next re-publish (opt-out clears the data). Absent ≡ not sharing. Optional / additive; pre-2026-06 agents ignore it."
+          },
+          "region": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 2,
+            "description": "Coarse, opt-in country of this machine as an ISO 3166-1 alpha-2 code (e.g. 'US'). AGENT-published and ADVISORY: a self-asserted claim derived from a best-effort public-IP geolocation at serve start, NOT a proof of location — a VPN or proxy moves it, and Apple exposes no signed-location primitive — so a verifier MUST treat it as unverified and MUST NOT gate anything security-relevant on it (same trust posture as `tier`). Present only when the machine's owner has opted into location sharing by setting `shareLocation` (from the console); the agent re-resolves it on every serve (refresh-on-serve) and OMITS it when sharing is off, so opting out drops the value on the next re-publish. Optional / additive; absent ≡ location not shared. A future revision may add finer fields (e.g. integer-rounded lat/lon) additively if needed."
+          },
+          "regionSource": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "How `region` was derived, e.g. 'ip-geo' (public-IP geolocation). Surfaces the provenance — and thus the trust ceiling — of the coarse location to consumers. Present iff `region` is present. Optional / additive."
+          },
+          "regionObservedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When `region` was observed during the current serve (RFC3339, UTC). Because the agent re-stamps on every serve, this doubles as a freshness signal for the coarse location. Present iff `region` is present. Optional / additive."
+          },
           "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    },
+    "proBonoPolicy": {
+      "type": "object",
+      "required": ["mode"],
+      "description": "How this machine holds itself out for pro-bono (free, unmetered, no-cut) work. `mode: any` opts the machine into pro bono for EVERY requester — held out for any pro-bono work. `mode: direct` restricts the carve-out to the requesters listed in `dids` — the owner's direct pro-bono relationships — and serves everyone else as a normal paid job. An absent policy (or an unknown `mode` a reader doesn't understand) means pro bono is off and the machine bills normally; readers MUST fail closed to paid rather than assume free.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "knownValues": ["any", "direct"],
+          "description": "`any`: serve every requester pro bono. `direct`: serve only the requesters in `dids` pro bono; all others are normal paid jobs."
+        },
+        "dids": {
+          "type": "array",
+          "maxLength": 1024,
+          "items": { "type": "string", "format": "did" },
+          "description": "Requester DIDs this machine serves pro bono when `mode` is `direct` — the owner's explicit pro-bono relationships. Ignored when `mode` is `any` (everyone is already free). Empty/absent under `direct` means the machine currently serves no one pro bono (every job is paid), which is the safe default for a half-configured policy."
         }
       }
     }

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use cocore_provider::{
     advisor::AdvisorClient,
     attestation, oauth,
-    pds::{EngineFault, ModelPrice, PdsClient, ProviderRecord, TrustLevel},
+    pds::{EngineFault, ModelPrice, PdsClient, ProBonoPolicy, ProviderRecord, TrustLevel},
     pricing,
     protocol::Register,
     receipt::StrongRef,
@@ -539,6 +539,16 @@ fn preserve_console_fields(record: &mut ProviderRecord, existing: &serde_json::V
         .get("desiredTier")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // The owner's pro-bono election (console / tray "serve pro bono"). Like
+    // the others it's console-written; carry it through or a serve restart
+    // would silently drop the owner's choice to give work away free.
+    record.proBono = ProBonoPolicy::from_record_value(existing);
+    // The owner's location-sharing opt-in (console "Share country" switch).
+    // Console-written like the others — carry it through, or a serve restart
+    // would silently drop the owner's choice. The agent reads this to decide
+    // whether to stamp `region` (see `cmd_serve`); preserving it keeps the
+    // switch sticky across re-publishes.
+    record.shareLocation = existing.get("shareLocation").and_then(|v| v.as_bool());
 }
 
 /// Find this machine's existing provider record (if any) on the
@@ -1032,6 +1042,13 @@ async fn cmd_serve(
             active: None,
             desiredModels: None,
             desiredTier: None,
+            // Owner's pro-bono election — preserved from the existing record
+            // by dedup, like active/desiredModels/desiredTier.
+            proBono: None,
+            // Owner's location-sharing opt-in — preserved from the existing
+            // record by dedup, like proBono. The provisioning publish never
+            // stamps region (no network lookup before the engine is up).
+            shareLocation: None,
             provisioning: Some(true),
             // NOT serving yet: this record is published immediately (so the
             // machine is visible) while the engine is still loading/downloading.
@@ -1040,6 +1057,12 @@ async fn cmd_serve(
             // real record below flips this to true once engines are up.
             serving: Some(false),
             engineFault: None,
+            // Coarse location is resolved (best-effort, network) and stamped
+            // only on the real record below — never worth delaying the
+            // "machine is visible" provisioning publish on an IP lookup.
+            region: None,
+            regionSource: None,
+            regionObservedAt: None,
             createdAt: chrono::Utc::now(),
         };
         match dedup_and_publish_provider(&pds, &attestation_pub_key, &provisioning_record).await {
@@ -1076,26 +1099,41 @@ async fn cmd_serve(
     // of an unmeasured Python child, defeating the tier). We still read
     // `desiredModels` below so a change still triggers a reload restart.
     let confidential = push_rx.is_some();
-    let (desired_at_start, desired_tier_at_start): (Vec<String>, Option<String>) =
-        match find_my_provider_record(&pds, &attestation_pub_key).await {
-            Ok((_, value, _)) => {
-                let models = value
-                    .get("desiredModels")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|m| m.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let tier = value
-                    .get("desiredTier")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                (models, tier)
-            }
-            Err(_) => (Vec::new(), None),
-        };
+    let (desired_at_start, desired_tier_at_start, pro_bono_at_start, share_location_at_start): (
+        Vec<String>,
+        Option<String>,
+        ProBonoPolicy,
+        bool,
+    ) = match find_my_provider_record(&pds, &attestation_pub_key).await {
+        Ok((_, value, _)) => {
+            let models = value
+                .get("desiredModels")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tier = value
+                .get("desiredTier")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // The owner's location-sharing opt-in, read off our own record so
+            // this serve decides whether to geolocate + stamp `region`. Absent
+            // ≡ off (no country published).
+            let share_location = value
+                .get("shareLocation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // The owner's pro-bono election, read off our own record so each
+            // served job can decide per-requester whether it's free. Absent /
+            // malformed ≡ off (every job metered + billed).
+            let pro_bono = ProBonoPolicy::from_record_value(&value).unwrap_or_default();
+            (models, tier, pro_bono, share_location)
+        }
+        Err(_) => (Vec::new(), None, ProBonoPolicy::default(), false),
+    };
     match inference_models_action(confidential, &desired_at_start) {
         InferenceModelsAction::Clear => {
             // Confidential = native-only. Inference MUST stay inside the
@@ -1295,6 +1333,35 @@ async fn cmd_serve(
         Err(_) => (TrustLevel::SelfAttested, None),
     };
 
+    // Coarse, opt-in location (refresh-on-serve). Only when the owner opted in
+    // via the console's `shareLocation` switch (read off our record above) do we
+    // resolve this machine's country from its public IP and stamp it onto the
+    // record. ADVISORY/self-asserted (a VPN moves it) — published to the
+    // provider's OWN PDS, never trusted as proof. A failed lookup leaves it
+    // unset for this serve; sharing-off omits it entirely so the next
+    // re-publish drops any prior value.
+    let (region, region_source, region_observed_at) = if share_location_at_start {
+        let http = reqwest::Client::new();
+        match cocore_provider::geoip::resolve_country(&http).await {
+            Some(cc) => {
+                tracing::info!(country = %cc, "location sharing on — stamping provider record region");
+                (
+                    Some(cc),
+                    Some(cocore_provider::geoip::REGION_SOURCE_IP_GEO.to_string()),
+                    Some(chrono::Utc::now()),
+                )
+            }
+            None => {
+                tracing::warn!(
+                    "location sharing on but country lookup failed — leaving region unset this serve"
+                );
+                (None, None, None)
+            }
+        }
+    } else {
+        (None, None, None)
+    };
+
     let provider_record = ProviderRecord {
         machineLabel: profile.machine_label,
         chip: profile.chip,
@@ -1331,6 +1398,12 @@ async fn cmd_serve(
         desiredModels: None,
         // Owner's confidential opt-in — preserved by dedup like the others.
         desiredTier: None,
+        // Owner's pro-bono election — preserved by dedup like the others.
+        proBono: None,
+        // Owner's location-sharing opt-in — preserved by dedup like proBono.
+        // (The `region` below was already gated on its value, read at serve
+        // start; this carries the switch itself through the re-publish.)
+        shareLocation: None,
         // Engine is loaded by this point — clear the provisioning flag we
         // set on the early publish above, so the console flips the row
         // from "provisioning" to live.
@@ -1342,6 +1415,12 @@ async fn cmd_serve(
         // clears any stale fault from a prior failed serve; `Some(..)`
         // tells the console this machine is up but only serving `stub`.
         engineFault: engine_fault,
+        // Coarse, opt-in location resolved above (refresh-on-serve). Absent
+        // when sharing is off or the lookup failed. Agent-authored, so it is
+        // deliberately NOT in `preserve_console_fields`.
+        region,
+        regionSource: region_source,
+        regionObservedAt: region_observed_at,
         createdAt: chrono::Utc::now(),
     };
     // Dedup-then-upsert: every machine has exactly one provider record
@@ -1435,6 +1514,10 @@ async fn cmd_serve(
         engine_fault: provider_record.engineFault.clone(),
         cd_hash: register_cd_hash,
         tier: register_tier,
+        // Echo the coarse, opt-in country from the provider record so the
+        // advisor can route by country without a PDS read. `None` when the
+        // owner hasn't opted into location sharing.
+        region: provider_record.region.clone(),
         // The measured agent's APNs device token, when the push host registered
         // one (confidential build + logged-in GUI session). Lets the advisor
         // send the code-identity challenge that proves this exact binary is
@@ -1493,6 +1576,7 @@ async fn cmd_serve(
                             &model_schedules,
                             &configured_models,
                             push_rx.as_mut(),
+                            &pro_bono_at_start,
                         )
                         .await;
                     let lived = connected_at.elapsed();
@@ -1552,7 +1636,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut()) => {
+                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation, &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start) => {
                                 if let Err(e) = res {
                                     tracing::warn!(error = %e, "advisor run ended; reconnecting within window in 5s");
                                 }
@@ -2453,9 +2537,14 @@ mod offline_marker_tests {
             active: None,
             desiredModels: None,
             desiredTier: None,
+            proBono: None,
+            shareLocation: None,
             provisioning: Some(false),
             serving: Some(true),
             engineFault: None,
+            region: None,
+            regionSource: None,
+            regionObservedAt: None,
             createdAt: chrono::Utc::now(),
         }
     }
@@ -2524,6 +2613,24 @@ mod offline_marker_tests {
         );
     }
 
+    /// The owner's console-written pro-bono election and location-sharing
+    /// opt-in ride the same preserve path — a re-publish must not drop them.
+    #[test]
+    fn preserve_carries_pro_bono_and_share_location() {
+        let mut rebuilt = agent_built_record();
+        let live = serde_json::json!({
+            "proBono": { "mode": "direct", "dids": ["did:plc:friend"] },
+            "shareLocation": true
+        });
+
+        preserve_console_fields(&mut rebuilt, &live);
+
+        let pro_bono = rebuilt.proBono.expect("pro-bono election preserved");
+        assert_eq!(pro_bono.mode, "direct");
+        assert_eq!(pro_bono.dids, vec!["did:plc:friend".to_string()]);
+        assert_eq!(rebuilt.shareLocation, Some(true));
+    }
+
     /// When the live record has no switches set (a brand-new machine), the
     /// fields stay `None` — we don't fabricate values.
     #[test]
@@ -2537,5 +2644,7 @@ mod offline_marker_tests {
         assert_eq!(offline.payoutsEnabled, None);
         assert_eq!(offline.desiredModels, None);
         assert_eq!(offline.desiredTier, None);
+        assert!(offline.proBono.is_none());
+        assert_eq!(offline.shareLocation, None);
     }
 }

@@ -61,6 +61,18 @@ export interface DispatchInputs {
    *  first DID match, so two machines under the same owner DID are
    *  distinguished. */
   targetMachineId?: string;
+  /** Optional ISO 3166-1 alpha-2 country filter (uppercased). When set,
+   *  pickProvider keeps only candidates whose advertised `region` matches,
+   *  after the model filter. Advisory routing (region is a provider
+   *  self-claim); not applied to an explicit `targetProviderDid`. */
+  country?: string;
+  /** Restrict provider selection to this allow-set, resolved by the console
+   *  (friends / verified / pro-bono) and forwarded here so the AppView core
+   *  only has to filter. Each entry is either a bare DID (owner-granular:
+   *  friends / verified) or a `${did}:${machineId}` composite (machine-granular:
+   *  pro-bono, per provider record). {@link filterByAllowedDids} matches either.
+   *  Ignored on an explicit `targetProviderDid`. Absent ≡ no constraint. */
+  allowedProviderDids?: Set<string>;
 }
 
 /** The slice of a provider's indexed profile the credit line needs.
@@ -130,11 +142,27 @@ export class ProviderPayoutsNotEligibleError extends Error {
   }
 }
 
+export class NoProvidersForCountryError extends Error {
+  readonly model: string;
+  readonly country: string;
+  readonly modelFitCount: number;
+  constructor(model: string, country: string, modelFitCount: number) {
+    super(
+      `no connected provider serving model '${model}' advertises country '${country}' (${modelFitCount} serve the model in other / unknown regions)`,
+    );
+    this.name = "NoProvidersForCountryError";
+    this.model = model;
+    this.country = country;
+    this.modelFitCount = modelFitCount;
+  }
+}
+
 /** Stable codes for the error event. The route translates these to SSE
  *  `error` frames; clients switch on them. */
 export type DispatchErrorCode =
   | "no-providers-connected"
   | "no-providers-for-model"
+  | "no-providers-for-country"
   | "target-provider-not-connected"
   | "provider-payouts-not-eligible"
   | "pds-publish-failed"
@@ -232,6 +260,11 @@ interface AdvisorProviderRow {
   machineId?: string;
   /** Human-readable label for this machine. Optional for legacy agents. */
   machineLabel?: string;
+  /** Coarse, opt-in ISO 3166-1 alpha-2 country the provider advertises
+   *  (echoed from its provider record via the advisor). Advisory self-claim;
+   *  absent when the provider isn't sharing location. Used for `country`
+   *  routing. */
+  region?: string;
 }
 
 interface PickProviderOptions {
@@ -249,6 +282,24 @@ export function filterByPayoutsEligibility<T extends { did: string }>(
     if (options.selfLoopExempt && c.did === options.selfLoopExempt) return true;
     return options.payoutsEligibleDids!.has(c.did);
   });
+}
+
+/** Pure filter for an allow-set (friends / verified / pro-bono). `undefined`
+ *  passes the list through verbatim; otherwise keeps only candidates whose DID
+ *  is in `allowedDids`. The console computes the set and forwards it. */
+export function filterByAllowedDids<T extends { did: string; machineId?: string }>(
+  candidates: T[],
+  allowedDids: Set<string> | undefined,
+): T[] {
+  if (!allowedDids) return candidates;
+  // An entry is either a bare DID — owner-granular (friends / verified) — or a
+  // `${did}:${machineId}` composite — machine-granular (pro-bono, where the
+  // election is per provider record). Match either, so a pro-bono allow-set
+  // never widens to an owner's other, billed machines.
+  return candidates.filter(
+    (c) =>
+      allowedDids.has(c.did) || (c.machineId != null && allowedDids.has(`${c.did}:${c.machineId}`)),
+  );
 }
 
 /** GET the advisor's provider registry. Runs on the module o11y runtime
@@ -282,6 +333,13 @@ async function pickProvider(
   targetDid: string | undefined,
   targetMachineId: string | undefined,
   options: PickProviderOptions,
+  /** Optional ISO 3166-1 alpha-2 country filter (uppercased). Applied after
+   *  the model filter; not applied to an explicit `targetDid`. */
+  country: string | undefined,
+  /** Optional DID allow-set (friends / verified / pro-bono), computed by the
+   *  console and forwarded. Applied before the model filter; not applied to an
+   *  explicit `targetDid`. */
+  allowedDids: Set<string> | undefined,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
    *  failed because they'd flapped out). Excluded from re-selection so
    *  failover lands on a DIFFERENT machine. Never applied to an explicit
@@ -311,18 +369,26 @@ async function pickProvider(
   const own = ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set());
   if (own.length > 0) return own[0]!;
 
-  const pool =
+  const excluded =
     excludeDids && excludeDids.size > 0
       ? attested.filter((p) => !excludeDids.has(p.did))
       : attested;
+  // Constrain to the forwarded allow-set (pro-bono / friends / verified) before
+  // the model filter, so "no provider for model X" still reads naturally within
+  // the constrained pool.
+  const pool = filterByAllowedDids(excluded, allowedDids);
 
   const fits = pool.filter(
     (p) => p.supportedModels.length === 0 || p.supportedModels.includes(model),
   );
   if (fits.length === 0) throw new NoProvidersForModelError(model, attested.length);
-  const eligible = filterByPayoutsEligibility(fits, options);
+  const inCountry = country ? fits.filter((p) => p.region === country) : fits;
+  if (inCountry.length === 0) throw new NoProvidersForCountryError(model, country!, fits.length);
+  const eligible = filterByPayoutsEligibility(inCountry, options);
   if (eligible.length === 0) {
-    throw new ProviderPayoutsNotEligibleError(fits[0]!.did);
+    // Use the post-country-filter list so the surfaced DID is a provider
+    // that's both model-fit and in-country, not one country filtering dropped.
+    throw new ProviderPayoutsNotEligibleError(inCountry[0]!.did);
   }
   eligible.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
   return eligible[0]!;
@@ -377,6 +443,7 @@ interface SseEvent {
 export function classifyDispatchError(e: unknown): DispatchErrorCode {
   if (e instanceof NoProvidersConnectedError) return "no-providers-connected";
   if (e instanceof NoProvidersForModelError) return "no-providers-for-model";
+  if (e instanceof NoProvidersForCountryError) return "no-providers-for-country";
   if (e instanceof TargetProviderNotConnectedError) return "target-provider-not-connected";
   if (e instanceof ProviderPayoutsNotEligibleError) return "provider-payouts-not-eligible";
   return "advisor-transport";
@@ -475,6 +542,10 @@ export async function* runDispatch(
         input.targetProviderDid,
         input.targetMachineId,
         { payoutsEligibleDids: null, selfLoopExempt: null },
+        // No country / allow-set filter on an explicit pin — the user chose
+        // that machine.
+        input.targetProviderDid ? undefined : input.country,
+        input.targetProviderDid ? undefined : input.allowedProviderDids,
         excludeDids,
       );
     } catch (e) {

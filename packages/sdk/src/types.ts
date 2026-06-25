@@ -44,6 +44,12 @@ export interface ProviderRecord {
    *  not opted in (serves exactly as before). Mirrors `desiredModels`. */
   desiredTier?: Tier;
   acceptedExchanges?: string[];
+  /** The owner's pro-bono election: serve matching jobs free, unmetered, with
+   *  no exchange cut. `mode: "any"` serves every requester pro bono; `mode:
+   *  "direct"` serves only the requesters in `dids` (the owner's direct
+   *  pro-bono relationships) and bills everyone else normally. Absent ≡ off.
+   *  Owner-written INTENT, like `desiredModels`/`desiredTier`. */
+  proBono?: ProBonoPolicy;
   contactEndpoint?: string;
   active?: boolean;
   /** True while the agent is still loading its engine after serve start —
@@ -61,6 +67,18 @@ export interface ModelPrice {
   inputPricePerMTok: number;
   outputPricePerMTok: number;
   currency: string;
+}
+
+/** The owner's pro-bono election for a machine. Mirrors the lexicon
+ *  `dev.cocore.compute.provider#proBonoPolicy`. */
+export interface ProBonoPolicy {
+  /** `"any"`: serve every requester pro bono. `"direct"`: serve only the
+   *  requesters in `dids` pro bono; all others are normal paid jobs. An
+   *  unknown value is treated as off (fail closed to paid). */
+  mode: "any" | "direct";
+  /** Requester DIDs served pro bono under `mode: "direct"`. Ignored when
+   *  `mode` is `"any"`. */
+  dids?: string[];
 }
 
 export interface AttestationRecord {
@@ -174,6 +192,12 @@ export interface ReceiptRecord {
   /** Confidentiality tier this job ran under. Recompute from attestation +
    *  sessionKeyCommitment; absent = best-effort. */
   tier?: Tier;
+  /** True when the provider served this job pro bono under its `proBono`
+   *  election — free, unmetered, no exchange cut. A pro-bono receipt MUST
+   *  carry `price.amount: 0` and `tokens: { in: 0, out: 0 }`, and an exchange
+   *  settling it takes no fee and moves no balance. Covered by
+   *  `enclaveSignature`. Absent/false ≡ a normal metered, billable receipt. */
+  proBono?: boolean;
 }
 
 export interface PaymentAuthorizationRecord {

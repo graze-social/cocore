@@ -106,6 +106,13 @@ The mechanics are deliberately few:
 - **A monthly patronage rebate** — most of the treasury flows back to active
   members in proportion to how much they participated. This is the old
   Rochdale co-op dividend (think REI's annual rebate), translated to compute.
+- **A pro bono carve-out** — a provider can hold a machine out for free,
+  unmetered work, either for *anyone* or for an explicit list of direct
+  relationships. A pro bono job counts no tokens and the treasury takes no
+  cut: the receipt records `proBono: true` with a zero price and zero token
+  counts, so a balance-less requester can still be served unlimited. It's
+  purely additive — a requester the policy doesn't cover is still served as a
+  normal paid job, so opting in never costs the machine paid work.
 
 Every parameter lives on a public `dev.cocore.compute.exchangePolicy`
 record, so you — or a competing exchange — can replicate the math without
@@ -129,6 +136,31 @@ curl -fsSL https://console.cocore.dev/agent | sh
 Either way the agent pairs to your identity, attests the machine, loads a
 local model, and starts publishing receipts as it earns. See
 [`docs/install-mac.md`](docs/install-mac.md) for the details.
+
+## Choosing where (and how) a job runs
+
+The completions API and the in-app chat take optional routing controls beyond
+just the model:
+
+- **By country.** Pass a `country` (ISO 3166-1 alpha-2, e.g. `US`) to route
+  only to providers advertising that coarse region. A machine opts into
+  publishing its country from its per-machine settings on the website (the
+  agent then geolocates the machine's IP and refreshes it each time it serves);
+  it's an advisory, self-asserted hint — a VPN moves it — so requests fail
+  closed (`no_providers_for_country`) rather than silently routing elsewhere.
+- **Pro bono.** The pro-bono completion path
+  (`POST /v1/probono/chat/completions`, or the toggle in chat) routes only to
+  providers that have elected to serve you for free. A provider configures this
+  per machine on the website: off, free for *anyone*, or free for an explicit
+  list of people (friends-only). Pro-bono jobs are unmetered and take no
+  exchange cut, so a balance-less requester can still be served.
+- **Verified / friends-only.** `/v1/verified/...` and `/v1/private/...` are the
+  existing trust- and friend-constrained paths.
+
+Full reference: the OpenAPI spec at
+[`packages/console/public/openapi.yaml`](packages/console/public/openapi.yaml)
+(also rendered at `console.cocore.dev/docs`) and the lexicon notes in
+[`lexicons/README.md`](lexicons/README.md).
 
 ## What's in here
 

@@ -194,6 +194,7 @@ export interface ProviderRecord {
   tier?: Tier;
   desiredTier?: Tier;
   acceptedExchanges?: string[];
+  proBono?: Record<string, unknown>;
   contactEndpoint?: string;
   active?: boolean;
   provisioning?: boolean;
@@ -201,6 +202,10 @@ export interface ProviderRecord {
   payoutsEnabled?: boolean;
   binaryVersion?: string;
   engineFault?: { code: string; message: string; models?: string[]; at: string };
+  shareLocation?: boolean;
+  region?: string;
+  regionSource?: string;
+  regionObservedAt?: string;
   createdAt: string;
 }
 
@@ -223,6 +228,7 @@ export interface ReceiptRecord {
   attestation: StrongRef;
   enclaveSignature: string;
   tier?: Tier;
+  proBono?: boolean;
 }
 
 export interface SettlementRecord {

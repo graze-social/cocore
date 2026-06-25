@@ -65,6 +65,11 @@ interface DispatchBody {
   priceCeiling?: unknown;
   targetProviderDid?: unknown;
   targetMachineId?: unknown;
+  /** Optional ISO 3166-1 alpha-2 country to route by (advisory). */
+  country?: unknown;
+  /** Optional DID allow-set the console resolved (pro-bono / friends /
+   *  verified) and forwarded. Constrains provider selection. */
+  allowedProviderDids?: unknown;
 }
 
 type ParsedDispatch = Omit<DispatchInputs, "did">;
@@ -95,6 +100,22 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   }
   if (body.targetMachineId !== undefined && typeof body.targetMachineId !== "string") {
     return "targetMachineId must be a string when provided";
+  let country: string | undefined;
+  if (body.country !== undefined) {
+    if (typeof body.country !== "string" || !/^[A-Za-z]{2}$/.test(body.country.trim())) {
+      return "country must be a 2-letter ISO 3166-1 alpha-2 code";
+    }
+    country = body.country.trim().toUpperCase();
+  }
+  let allowedProviderDids: Set<string> | undefined;
+  if (body.allowedProviderDids !== undefined) {
+    if (
+      !Array.isArray(body.allowedProviderDids) ||
+      !body.allowedProviderDids.every((d): d is string => typeof d === "string")
+    ) {
+      return "allowedProviderDids must be an array of DID strings";
+    }
+    allowedProviderDids = new Set(body.allowedProviderDids);
   }
   // Build the messages-v1 envelope when the client sent images.
   let envelope: Pick<DispatchInputs, "payloadBytes" | "inputFormat"> = {};
@@ -117,6 +138,8 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     ...(typeof body.targetProviderDid === "string" && typeof body.targetMachineId === "string"
       ? { targetMachineId: body.targetMachineId }
       : {}),
+    ...(country ? { country } : {}),
+    ...(allowedProviderDids ? { allowedProviderDids } : {}),
   };
 }
 
