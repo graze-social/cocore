@@ -2050,9 +2050,7 @@ export function ChatPage(): ReactElement {
                   {country}
                 </span>
               ) : null}
-              {proBono ? (
-                <span {...stylex.props(styles.hostChip)}>pro bono</span>
-              ) : null}
+              {proBono ? <span {...stylex.props(styles.hostChip)}>pro bono</span> : null}
               <span {...stylex.props(styles.stripItem)}>
                 <span {...stylex.props(styles.stripLabel)}>ctx</span>
                 <span {...stylex.props(styles.emphasis)}>

@@ -2644,7 +2644,7 @@ mod offline_marker_tests {
         assert_eq!(offline.payoutsEnabled, None);
         assert_eq!(offline.desiredModels, None);
         assert_eq!(offline.desiredTier, None);
-        assert_eq!(offline.proBono.is_none(), true);
+        assert!(offline.proBono.is_none());
         assert_eq!(offline.shareLocation, None);
     }
 }

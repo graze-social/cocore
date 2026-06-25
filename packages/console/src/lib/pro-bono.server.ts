@@ -28,7 +28,10 @@ interface ProBonoPolicyView {
  *  `any` ⇒ everyone; `direct` ⇒ only the listed DIDs; anything else (absent /
  *  unknown mode) ⇒ no (fail closed to paid, matching the provider agent's
  *  `ProBonoPolicy::applies_to`). Pure + exported for testing. */
-export function proBonoApplies(policy: ProBonoPolicyView | undefined, requesterDid: string): boolean {
+export function proBonoApplies(
+  policy: ProBonoPolicyView | undefined,
+  requesterDid: string,
+): boolean {
   if (!policy) return false;
   if (policy.mode === "any") return true;
   if (policy.mode === "direct") {

@@ -699,9 +699,10 @@ export function providerRowsToMachines(
       faultModels: body.engineFault?.models,
       shareLocation: body.shareLocation,
       region: body.region,
-      proBonoMode: body.proBono?.mode === "any" || body.proBono?.mode === "direct"
-        ? body.proBono.mode
-        : undefined,
+      proBonoMode:
+        body.proBono?.mode === "any" || body.proBono?.mode === "direct"
+          ? body.proBono.mode
+          : undefined,
       proBonoDids: body.proBono?.dids,
     };
 
