@@ -28,7 +28,9 @@ const styles = stylex.create({
       default: animationTimingFunction.easeOut,
       ":is([data-exiting])": animationTimingFunction.easeIn,
     },
-    zIndex: 100,
+    // Sit above the sticky navbar (zIndex 1000) so the backdrop dims the top
+    // menu too, and below toasts (9999) so confirmations still surface.
+    zIndex: 1100,
     height: "var(--page-height)",
     left: 0,
     top: 0,

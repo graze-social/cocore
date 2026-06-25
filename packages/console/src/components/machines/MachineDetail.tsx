@@ -49,6 +49,7 @@ import {
   setMyProviderShareLocationMutationOptions,
 } from "@/components/machines/machines.functions.ts";
 import type { MachineWorkItem } from "@/components/machines/machines.server.ts";
+import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
 import { formatTokens } from "@/lib/token-display.ts";
 
 import type { Machine } from "./machines-data.ts";
@@ -425,6 +426,8 @@ export function MachineDetail({ rkey }: { rkey: string }) {
             />
             <LabelText variant="secondary">{m.faultReason ? "fault" : m.state}</LabelText>
           </span>
+          <RegionFlag region={m.region} />
+          <ProBonoBadge mode={m.proBonoMode} />
         </div>
         <div {...stylex.props(styles.metaRow)}>
           <span>{m.gpu}</span>
@@ -753,7 +756,9 @@ export function MachineDetail({ rkey }: { rkey: string }) {
             )
           }
           onSaveProBono={(policy) =>
-            proBonoM.mutate(
+            // mutateAsync so the dialog can await the write and roll its
+            // optimistic state back if it rejects.
+            proBonoM.mutateAsync(
               { rkey: m.id, policy },
               {
                 onSuccess: () =>

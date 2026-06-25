@@ -7,6 +7,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 
 import { Link as RouterLink, useNavigate } from "@tanstack/react-router";
 
+import { Avatar } from "@/design-system/avatar";
 import { Button } from "@/design-system/button";
 import {
   Card,
@@ -16,6 +17,7 @@ import {
   CardHeaderAction,
   CardTitle,
 } from "@/design-system/card";
+import { Checkbox } from "@/design-system/checkbox";
 import { CopyToClipboardButton } from "@/design-system/copy-to-clipboard-button";
 import { TrustTierBadge } from "@/components/TrustTierBadge.tsx";
 import {
@@ -33,7 +35,6 @@ import { Menu, MenuItem } from "@/design-system/menu";
 import { SegmentedControl, SegmentedControlItem } from "@/design-system/segmented-control";
 import { Switch } from "@/design-system/switch";
 import { Tag, TagGroup } from "@/design-system/tag-group";
-import { TextArea } from "@/design-system/text-area";
 import { TextField } from "@/design-system/text-field";
 import {
   Table,
@@ -76,6 +77,11 @@ import {
   CLI_LINES_INSTALL as CLI_LINES,
   CLI_ONE_LINER_INSTALL as CLI_ONE_LINER,
 } from "@/components/machines/cli-snippets.ts";
+import {
+  listMyFriendsQueryOptions,
+  type ListedFriend,
+} from "@/components/friends/friends.functions.ts";
+import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
 import {
   dedupMyProviderRecordsMutationOptions,
   deleteMyProviderRecordMutationOptions,
@@ -1386,17 +1392,6 @@ export function RenameMachineDialogContent({
 /** Pro-bono policy as the proBono mutation expects it (`null` ≡ off). */
 type ProBonoPolicy = { mode: "any" | "direct"; dids?: string[] } | null;
 
-/** Split a free-text DID list (newline / comma / whitespace separated) into
- *  trimmed, de-duped, non-empty entries — what the `direct` allowlist wants. */
-function parseDidList(raw: string): string[] {
-  const out: string[] = [];
-  for (const part of raw.split(/[\s,]+/)) {
-    const t = part.trim();
-    if (t.length > 0 && !out.includes(t)) out.push(t);
-  }
-  return out;
-}
-
 export function AdvancedSettingsDialogContent({
   machine,
   isSharePending,
@@ -1409,26 +1404,51 @@ export function AdvancedSettingsDialogContent({
   isSharePending: boolean;
   isProBonoPending: boolean;
   onShareLocation: (share: boolean) => void;
-  onSaveProBono: (policy: ProBonoPolicy) => void;
+  /** Persists the policy and resolves/rejects with the write so the dialog can
+   *  roll back its optimistic local state on failure. */
+  onSaveProBono: (policy: ProBonoPolicy) => Promise<unknown>;
   onClose: () => void;
 }) {
   // Three-way pro-bono state seeded from the record. Off = no policy; `any`
-  // serves everyone free; `direct` serves only the listed DIDs free.
+  // serves everyone free; `direct` serves only the friends checked below free.
   type ProBonoMode = "off" | "any" | "direct";
   const initialMode: ProBonoMode = machine.proBonoMode ?? "off";
   const [mode, setMode] = useState<ProBonoMode>(initialMode);
-  const [didDraft, setDidDraft] = useState<string>((machine.proBonoDids ?? []).join("\n"));
+  // Friend DIDs served free under `direct`, seeded from the record. Any DID
+  // already on the record that is no longer a friend is preserved silently so
+  // editing the picker never drops it.
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(machine.proBonoDids ?? []));
 
-  const dids = parseDidList(didDraft);
-  const nextPolicy: ProBonoPolicy =
-    mode === "off" ? null : mode === "any" ? { mode: "any" } : { mode: "direct", dids };
+  // The owner's friends are the allowlist source — pick from them instead of
+  // pasting raw DIDs.
+  const friendsQ = useQuery(listMyFriendsQueryOptions);
+  const friends = friendsQ.data ?? [];
 
-  // Has the owner changed the pro-bono policy versus what's on the record?
-  const initialDids = machine.proBonoDids ?? [];
-  const proBonoDirty =
-    mode !== initialMode ||
-    (mode === "direct" &&
-      (dids.length !== initialDids.length || dids.some((d, i) => d !== initialDids[i])));
+  // Every interaction here autosaves — sliding the control or ticking a friend
+  // writes the provider record immediately, no separate submit step. The write
+  // is optimistic: the handlers below update local state first, then roll it
+  // back if `onSaveProBono`'s promise rejects so the dialog never shows a value
+  // the server didn't accept.
+  const persist = (next: ProBonoMode, dids: Set<string>): Promise<unknown> => {
+    if (next === "off") return onSaveProBono(null);
+    if (next === "any") return onSaveProBono({ mode: "any" });
+    return onSaveProBono({ mode: "direct", dids: [...dids] });
+  };
+
+  const handleModeChange = (next: ProBonoMode) => {
+    const prevMode = mode;
+    setMode(next);
+    void persist(next, selected).catch(() => setMode(prevMode));
+  };
+
+  const toggleFriend = (did: string, on: boolean) => {
+    const prev = selected;
+    const next = new Set(selected);
+    if (on) next.add(did);
+    else next.delete(did);
+    setSelected(next);
+    void persist("direct", next).catch(() => setSelected(prev));
+  };
 
   return (
     <>
@@ -1460,31 +1480,37 @@ export function AdvancedSettingsDialogContent({
           </Flex>
 
           <Flex direction="column" gap="md">
-            <LabelText variant="secondary">Pro bono</LabelText>
+            <Flex direction="row" gap="sm" align="center">
+              <LabelText variant="secondary">Pro bono</LabelText>
+              {isProBonoPending ? <SmallBody variant="secondary">Saving…</SmallBody> : null}
+            </Flex>
             <SegmentedControl
               size="sm"
+              isDisabled={isProBonoPending}
               selectedKeys={new Set([mode])}
               onSelectionChange={(keys) => {
                 const k = [...keys][0] as ProBonoMode | undefined;
-                if (k) setMode(k);
+                if (k && k !== mode) handleModeChange(k);
               }}
             >
               <SegmentedControlItem id="off">Off</SegmentedControlItem>
               <SegmentedControlItem id="any">Anyone</SegmentedControlItem>
-              <SegmentedControlItem id="direct">Specific people</SegmentedControlItem>
+              <SegmentedControlItem id="direct">Friends</SegmentedControlItem>
             </SegmentedControl>
             <SmallBody variant="secondary">
               Pro-bono jobs are served free and unmetered, with no exchange cut. “Anyone” serves
-              every requester free; “Specific people” serves only the listed DIDs free — everyone
-              else is still a normal paid job. “Off” bills every job.
+              every requester free; “Friends” serves only the friends you check below — everyone
+              else is still a normal paid job. “Off” bills every job. Changes save as you make them.
             </SmallBody>
             {mode === "direct" ? (
-              <TextArea
-                label="Requester DIDs served free"
-                value={didDraft}
-                onChange={setDidDraft}
-                placeholder={"did:plc:abc…\ndid:web:example.com"}
-                description="One per line (commas and spaces also work). Blanks are dropped on save."
+              <ProBonoFriendPicker
+                friends={friends}
+                isLoading={friendsQ.isLoading}
+                isError={friendsQ.isError}
+                onRetry={() => void friendsQ.refetch()}
+                selected={selected}
+                isDisabled={isProBonoPending}
+                onToggle={toggleFriend}
               />
             ) : null}
           </Flex>
@@ -1495,17 +1521,84 @@ export function AdvancedSettingsDialogContent({
           <Button variant="secondary" size="sm" onPress={onClose}>
             Close
           </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            isDisabled={isProBonoPending || !proBonoDirty}
-            onPress={() => onSaveProBono(nextPolicy)}
-          >
-            {isProBonoPending ? "Saving…" : "Save pro bono"}
-          </Button>
         </Flex>
       </DialogFooter>
     </>
+  );
+}
+
+/** Friend allowlist for `direct` pro-bono: one checkbox row per friend, with a
+ *  hint to the /friends page when the set is empty. */
+function ProBonoFriendPicker({
+  friends,
+  isLoading,
+  isError,
+  onRetry,
+  selected,
+  isDisabled,
+  onToggle,
+}: {
+  friends: ListedFriend[];
+  isLoading: boolean;
+  isError: boolean;
+  onRetry: () => void;
+  selected: Set<string>;
+  isDisabled: boolean;
+  onToggle: (did: string, on: boolean) => void;
+}) {
+  if (isLoading) {
+    return <SmallBody variant="secondary">Loading friends…</SmallBody>;
+  }
+  // A failed load leaves `friends` empty too — distinguish it from a genuinely
+  // empty friend set so we don't send someone with friends to /friends.
+  if (isError) {
+    return (
+      <Flex direction="row" gap="md" align="center">
+        <SmallBody variant="secondary">Couldn't load your friends.</SmallBody>
+        <Button variant="tertiary" size="sm" onPress={onRetry}>
+          Retry
+        </Button>
+      </Flex>
+    );
+  }
+  if (friends.length === 0) {
+    return (
+      <SmallBody variant="secondary">
+        You haven't friended anyone yet. Add friends on the{" "}
+        <RouterLink to="/friends">friends page</RouterLink> to serve them pro bono.
+      </SmallBody>
+    );
+  }
+  return (
+    <Flex direction="column" gap="sm">
+      {friends.map((f) => {
+        const name = f.displayName?.trim() || f.displayHandle || f.subjectHandle || f.subject;
+        const fallback = (
+          f.displayHandle?.trim()?.[0] ??
+          f.subjectHandle?.[0] ??
+          f.subject[0] ??
+          "?"
+        ).toUpperCase();
+        return (
+          <Checkbox
+            key={f.subject}
+            isSelected={selected.has(f.subject)}
+            isDisabled={isDisabled}
+            onChange={(on) => onToggle(f.subject, on)}
+          >
+            <Flex direction="row" gap="md" align="center">
+              <Avatar src={f.avatarUrl ?? undefined} size="sm" alt={name} fallback={fallback} />
+              <Flex direction="column" gap="none">
+                <LabelText>{name}</LabelText>
+                {f.displayHandle ? (
+                  <SmallBody variant="secondary">@{f.displayHandle}</SmallBody>
+                ) : null}
+              </Flex>
+            </Flex>
+          </Checkbox>
+        );
+      })}
+    </Flex>
   );
 }
 
@@ -2271,6 +2364,8 @@ export function MachinesDashboard() {
                                   {m.id}
                                 </Text>
                                 {m.verifiedTier ? <TrustTierBadge tier={m.verifiedTier} /> : null}
+                                <RegionFlag region={m.region} />
+                                <ProBonoBadge mode={m.proBonoMode} />
                               </Flex>
                             </TableCell>
                           );
