@@ -56,7 +56,16 @@ export function InferenceApiReferencePage({ baseUrl }: { baseUrl: string }) {
 { "error": { "type": "service_unavailable_error", "code": "no_friends_available", "message": "..." } }
 
 // 404 — friends-only, but no friend serves this model
-{ "error": { "type": "invalid_request_error", "code": "no_friends_for_model", "message": "..." } }`}
+{ "error": { "type": "invalid_request_error", "code": "no_friends_for_model", "message": "..." } }
+
+// 503 — country set, but no provider in that region serves this model
+{ "error": { "type": "service_unavailable_error", "code": "no_providers_for_country", "message": "..." } }
+
+// 503 — pro-bono route, but no connected provider currently serves you free
+{ "error": { "type": "service_unavailable_error", "code": "no_pro_bono_providers", "message": "..." } }
+
+// 502 — pro-bono route, the provider lookup itself failed (try again)
+{ "error": { "type": "server_error", "code": "pro_bono_lookup_failed", "message": "..." } }`}
                 />
               ) : (
                 <>

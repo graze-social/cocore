@@ -40,13 +40,14 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
     method: "POST",
     path: "/chat/completions",
     description:
-      "OpenAI-compatible chat completion. Routes to an attested provider serving the requested model.",
+      "OpenAI-compatible chat completion. Routes to an attested provider serving the requested model. Set country to an ISO 3166-1 alpha-2 code (e.g. US) to route only to providers advertising that region — an advisory provider self-claim — failing closed with no_providers_for_country when none match. country is accepted on every completion route below.",
     auth: "required",
     params: [
       { name: "model", type: "string", required: true },
       { name: "messages", type: "array", required: true },
       { name: "stream", type: "boolean" },
       { name: "max_tokens", type: "integer" },
+      { name: "country", type: "string" },
     ],
     controls: [
       { kind: "text", param: "model", label: "model", placeholder: "stub" },
@@ -57,6 +58,7 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
         placeholder: "Hello",
       },
       { kind: "text", param: "max_tokens", label: "max_tokens", placeholder: "256" },
+      { kind: "text", param: "country", label: "country", placeholder: "US" },
     ],
     example: { body: CHAT_BODY, canRun: false },
   },
@@ -96,6 +98,7 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
       { name: "messages", type: "array", required: true },
       { name: "stream", type: "boolean" },
       { name: "max_tokens", type: "integer" },
+      { name: "country", type: "string" },
     ],
     controls: [
       { kind: "text", param: "model", label: "model", placeholder: "stub" },
@@ -106,6 +109,7 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
         placeholder: "Hello",
       },
       { kind: "text", param: "max_tokens", label: "max_tokens", placeholder: "256" },
+      { kind: "text", param: "country", label: "country", placeholder: "US" },
     ],
     example: { body: CHAT_BODY, canRun: false },
   },
@@ -123,6 +127,7 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
       { name: "min_trust", type: "string" },
       { name: "stream", type: "boolean" },
       { name: "max_tokens", type: "integer" },
+      { name: "country", type: "string" },
     ],
     controls: [
       { kind: "text", param: "model", label: "model", placeholder: "stub" },
@@ -139,6 +144,35 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
         placeholder: "hardware-attested",
       },
       { kind: "text", param: "max_tokens", label: "max_tokens", placeholder: "256" },
+      { kind: "text", param: "country", label: "country", placeholder: "US" },
+    ],
+    example: { body: CHAT_BODY, canRun: false },
+  },
+  {
+    id: "inference-api-probono-chat-completions",
+    navLabel: "probono/chat/completions",
+    method: "POST",
+    path: "/probono/chat/completions",
+    description:
+      "Same request shape as chat/completions, but routing is limited to providers whose proBono policy elects to serve YOU for free (mode any, or mode direct with your DID listed). A matched job is unmetered, zero-price, and takes no exchange cut, so a balance-less requester can still get a completion. Fails closed with no_pro_bono_providers (503) when no connected provider currently offers you pro bono, or pro_bono_lookup_failed (502) when the provider lookup itself fails. country still narrows by region.",
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "messages", type: "array", required: true },
+      { name: "stream", type: "boolean" },
+      { name: "max_tokens", type: "integer" },
+      { name: "country", type: "string" },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "stub" },
+      {
+        kind: "text",
+        param: "message",
+        label: "user message",
+        placeholder: "Hello",
+      },
+      { kind: "text", param: "max_tokens", label: "max_tokens", placeholder: "256" },
+      { kind: "text", param: "country", label: "country", placeholder: "US" },
     ],
     example: { body: CHAT_BODY, canRun: false },
   },
