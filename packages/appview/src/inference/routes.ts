@@ -100,6 +100,7 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   }
   if (body.targetMachineId !== undefined && typeof body.targetMachineId !== "string") {
     return "targetMachineId must be a string when provided";
+  }
   let country: string | undefined;
   if (body.country !== undefined) {
     if (typeof body.country !== "string" || !/^[A-Za-z]{2}$/.test(body.country.trim())) {
