@@ -3,6 +3,7 @@ import nacl from "tweetnacl";
 
 import {
   NoProvidersConnectedError,
+  NoProvidersForCountryError,
   NoProvidersForModelError,
   ProviderPayoutsNotEligibleError,
   TargetProviderNotConnectedError,
@@ -80,6 +81,9 @@ describe("classifyDispatchError", () => {
     );
     expect(classifyDispatchError(new ProviderPayoutsNotEligibleError("did:plc:y"))).toBe(
       "provider-payouts-not-eligible",
+    );
+    expect(classifyDispatchError(new NoProvidersForCountryError("m", "US", 3))).toBe(
+      "no-providers-for-country",
     );
   });
 

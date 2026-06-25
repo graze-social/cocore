@@ -20,9 +20,11 @@
 //! It is loaded under ENFORCED library validation, so the owner cannot swap in a
 //! different dylib, and its hash is pinned like the metallib's.
 
-use super::{
-    model_prefills_think, DeltaChannel, Engine, GenerateRequest, GenerateResponse, ThinkTagSplitter,
-};
+use super::{DeltaChannel, Engine, GenerateRequest, GenerateResponse};
+// Only used by the macOS generate path below; on other targets the generate
+// method is a stub, so gate the import to match and keep `-D warnings` happy.
+#[cfg(target_os = "macos")]
+use super::{model_prefills_think, ThinkTagSplitter};
 use anyhow::Result;
 use std::path::PathBuf;
 
