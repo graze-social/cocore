@@ -671,7 +671,27 @@ struct SecureModeWizardView: View {
                 pollForAttestationChain()
             } catch {
                 working = false
-                stepError = friendly(error, "We couldn't start hardware attestation.")
+                // The push leg failing is the same silent-failure pattern we
+                // fix for the poll leg — classify + log it instead of dropping
+                // to a bare string. recordPushResponse already ran on an HTTP
+                // error body; force the error status/detail for the throw so
+                // the diagnostic lands on `secure-mode/push-failed`.
+                if pushStatus == nil { pushStatus = "error" }
+                if pushDetail == nil { pushDetail = error.localizedDescription }
+                let diag = AttestationDiagnostic(
+                    serial: serial,
+                    enrolled: EnrollmentProbe.isEnrolled(),
+                    elapsedSeconds: 0,
+                    polls: 0,
+                    pushStatus: pushStatus,
+                    pushStubbed: pushStubbed,
+                    pushDetail: pushDetail,
+                    chainStatus: nil,
+                    chainDetail: nil,
+                    chainHTTP: nil
+                )
+                NSLog("cocore: %@", diag.report)
+                stepError = diag.userMessage
             }
         }
     }
@@ -788,7 +808,10 @@ struct SecureModeWizardView: View {
     /// store error); a 200 leaves `chainHTTP` nil (clean poll, just no chain
     /// yet) and pulls status/detail from the JSON body when present.
     private func recordChainResponse(_ data: Data, http: Int) {
-        if http != 200 { chainHTTP = http }
+        // Keep only the LAST poll's HTTP outcome: a transient non-200 blip
+        // mid-window must not stick and misclassify an otherwise-pending
+        // timeout as a store error — clear it the moment a poll returns 200.
+        chainHTTP = http == 200 ? nil : http
         guard
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return }
