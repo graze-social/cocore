@@ -57,9 +57,13 @@ export interface DispatchInputs {
   /** OAuth session to publish records under. Required — every
    *  authoritative record must hit the user's PDS. */
   oauthSession: OAuthSession;
-  /** Restrict provider selection to this set of DIDs. Used by the
-   *  friends-only chat-completions endpoint, which fetches the
-   *  user's friend records from their PDS and passes the DID set
+  /** Restrict provider selection to this allow-set. Each entry is either a
+   *  bare DID — owner-granular, used by the friends-only + verified endpoints —
+   *  or a `${did}:${machineId}` composite — machine-granular, used by the
+   *  pro-bono path (the election is per provider record, so it must not widen
+   *  to an owner's other billed machines). {@link filterByAllowedDids} matches
+   *  either form. Used by the friends-only chat-completions endpoint, which
+   *  fetches the user's friend records from their PDS and passes the DID set
    *  through to constrain pickProvider.
    *
    *  Empty set is meaningful and DIFFERENT from `undefined`:
@@ -101,6 +105,12 @@ export interface DispatchInputs {
   toolChoice?: "auto" | "none" | "required";
   /** When toolChoice is "required", optionally force a specific function. */
   toolChoiceFunction?: string;
+  /** Optional minimum provider binaryVersion (e.g. `0.9.32`). When set,
+   *  pickProvider keeps only machines reporting a version >= this — used to
+   *  steer feature-bearing requests (image input needs a messages-v1 release)
+   *  to capable providers. Fail-closed: a machine that reports no version is
+   *  excluded. Also forwarded to the advisor /jobs call as a backstop. */
+  minProviderVersion?: string;
 }
 
 /** Distinct error types so the route layer can translate them into
@@ -203,6 +213,7 @@ export type DispatchErrorCode =
   | "no-providers-connected"
   | "no-providers-for-model"
   | "no-providers-for-country"
+  | "no-providers-for-version"
   | "no-friends-available"
   | "no-friends-for-model"
   | "target-provider-not-connected"
@@ -337,6 +348,11 @@ export interface AdvisorProviderRow {
    *  When absent, callers fall back to legacy `supportsToolCalls`; when
    *  present, only these models should be considered tool-capable. */
   toolCallModels?: string[];
+  /** Agent binary version (e.g. `0.9.32`) reported by the machine, from the
+   *  advisor Register frame. Absent for a pre-version agent. Used for
+   *  `minProviderVersion` routing (fail-closed: absent never satisfies a
+   *  floor). */
+  binaryVersion?: string;
 }
 
 export interface PickProviderOptions {
@@ -373,12 +389,19 @@ export function filterByPayoutsEligibility<T extends { did: string }>(
  *  meaningful "filter everything out" signal that the caller
  *  should distinguish — the route layer turns that into
  *  NoFriendsAvailableError. */
-export function filterByAllowedDids<T extends { did: string }>(
+export function filterByAllowedDids<T extends { did: string; machineId?: string }>(
   candidates: T[],
   allowedDids: Set<string> | undefined,
 ): T[] {
   if (!allowedDids) return candidates;
-  return candidates.filter((c) => allowedDids.has(c.did));
+  // An entry is either a bare DID — owner-granular (friends / verified) — or a
+  // `${did}:${machineId}` composite — machine-granular (pro-bono, where the
+  // election is per provider record). Match either, so a pro-bono allow-set
+  // never widens to an owner's other, billed machines.
+  return candidates.filter(
+    (c) =>
+      allowedDids.has(c.did) || (c.machineId != null && allowedDids.has(`${c.did}:${c.machineId}`)),
+  );
 }
 
 /** Pure filter for country routing. `undefined`/empty country passes the
@@ -392,6 +415,54 @@ export function filterByCountry<T extends { region?: string }>(
 ): T[] {
   if (!country) return candidates;
   return candidates.filter((c) => c.region === country);
+}
+
+/** Dotted-numeric version compare (tolerates a leading `v` and drops any
+ *  pre-release/build suffix). Mirrors the advisor's version.ts — kept local
+ *  because the console and advisor can't share a module easily, the same way
+ *  service-auth verification is duplicated across packages. */
+function compareVersions(a: string, b: string): number {
+  const parts = (v: string) =>
+    (v.trim().replace(/^v/i, "").split(/[-+]/, 1)[0] ?? "").split(".").map((n) => {
+      const p = Number.parseInt(n, 10);
+      return Number.isFinite(p) ? p : 0;
+    });
+  const pa = parts(a);
+  const pb = parts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/** True iff `version` is present and >= `min`. Fail-closed: a machine that
+ *  reports no version can't prove it has the feature, so it never passes. */
+export function meetsMinVersion(version: string | undefined, min: string): boolean {
+  if (!version) return false;
+  return compareVersions(version, min) >= 0;
+}
+
+/** Pure filter for version-gated routing. `undefined`/empty `minVersion`
+ *  passes the list through verbatim. Otherwise keeps only machines whose
+ *  reported `binaryVersion` is >= the floor — a machine that reports no
+ *  version is excluded (fail-closed), so a feature request never lands on a
+ *  machine that can't prove it has the feature. */
+export function filterByMinVersion<T extends { binaryVersion?: string }>(
+  candidates: T[],
+  minVersion: string | undefined,
+): T[] {
+  if (!minVersion) return candidates;
+  return candidates.filter((c) => meetsMinVersion(c.binaryVersion, minVersion));
+}
+
+export class NoProvidersForVersionError extends Error {
+  readonly minVersion: string;
+  constructor(minVersion: string, detail: string) {
+    super(`no eligible provider at binaryVersion >= ${minVersion}: ${detail}`);
+    this.name = "NoProvidersForVersionError";
+    this.minVersion = minVersion;
+  }
 }
 
 export class ProviderPayoutsNotEligibleError extends Error {
@@ -418,6 +489,12 @@ async function pickProvider(
    *  explicit `targetDid` (the user pinned that machine) or a self-loop pick
    *  (it's the caller's own machine). */
   country: string | undefined,
+  /** Optional minimum provider binaryVersion (e.g. `0.9.32`). Unlike
+   *  `country`, this is a hard capability requirement, so it's applied to
+   *  EVERY path — including an explicit `targetDid` and a self-loop own-machine
+   *  pick: you can't send an image job to an old machine just because it's
+   *  yours / pinned. Fail-closed: a machine reporting no version never passes. */
+  minProviderVersion: string | undefined,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
    *  failed because they'd flapped out between the snapshot and the
    *  dispatch). Excluded from re-selection so failover lands on a
@@ -437,10 +514,7 @@ async function pickProvider(
     // Fall back to DID-only if no machineId was specified (or for legacy rows
     // that predate the field).
     const hit = targetMachineId
-      ? (attested.find((p) => p.did === targetDid && p.machineId === targetMachineId) ??
-        // Fall back only to legacy rows that predate the machineId field; a row with
-        // a *different* machineId is a different machine and must not be silently selected.
-        attested.find((p) => p.did === targetDid && !p.machineId))
+      ? attested.find((p) => p.did === targetDid && p.machineId === targetMachineId)
       : attested.find((p) => p.did === targetDid);
     if (!hit) throw new TargetProviderNotConnectedError(targetDid);
     // Hard refusal on explicit target: surface why before the user
@@ -448,10 +522,22 @@ async function pickProvider(
     // some other provider — the user asked for this one.
     const targetPasses = filterByPayoutsEligibility([hit], options).length > 0;
     if (!targetPasses) throw new ProviderPayoutsNotEligibleError(targetDid);
+    // Version is a capability gate even on a pin: an old machine literally
+    // can't serve an image request, so refuse rather than send it a job it
+    // will mishandle.
+    if (filterByMinVersion([hit], minProviderVersion).length === 0) {
+      throw new NoProvidersForVersionError(
+        minProviderVersion!,
+        `pinned provider ${targetDid} reports ${hit.binaryVersion ?? "no version"}`,
+      );
+    }
     return hit;
   }
 
-  const own = ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set());
+  const own = filterByMinVersion(
+    ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set()),
+    minProviderVersion,
+  );
   if (own.length > 0) return own[0]!;
 
   // Drop providers a prior attempt already tried-and-failed so failover
@@ -483,7 +569,14 @@ async function pickProvider(
     if (friendInCountry.length === 0) {
       throw new NoProvidersForCountryError(model, country!, friendFits.length);
     }
-    const eligible = filterByPayoutsEligibility(friendInCountry, options);
+    const friendAtVersion = filterByMinVersion(friendInCountry, minProviderVersion);
+    if (friendAtVersion.length === 0) {
+      throw new NoProvidersForVersionError(
+        minProviderVersion!,
+        `${friendInCountry.length} friend provider(s) serve model '${model}' but none at that version`,
+      );
+    }
+    const eligible = filterByPayoutsEligibility(friendAtVersion, options);
     if (eligible.length === 0) {
       // Surface a DID from the post-country-filter list so the diagnostic
       // points at a provider that's actually both model-fit and in-country,
@@ -500,7 +593,14 @@ async function pickProvider(
   if (fits.length === 0) throw new NoProvidersForModelError(model, attested.length);
   const inCountry = filterByCountry(fits, country);
   if (inCountry.length === 0) throw new NoProvidersForCountryError(model, country!, fits.length);
-  const eligible = filterByPayoutsEligibility(inCountry, options);
+  const atVersion = filterByMinVersion(inCountry, minProviderVersion);
+  if (atVersion.length === 0) {
+    throw new NoProvidersForVersionError(
+      minProviderVersion!,
+      `${inCountry.length} provider(s) serve model '${model}' but none at that version`,
+    );
+  }
+  const eligible = filterByPayoutsEligibility(atVersion, options);
   if (eligible.length === 0) {
     // No payouts-eligible provider serves this model. Surface the
     // first model-fit, in-country provider's DID so the caller can
@@ -567,6 +667,7 @@ export function classifyDispatchError(e: unknown): DispatchErrorCode {
   if (e instanceof NoProvidersConnectedError) return "no-providers-connected";
   if (e instanceof NoProvidersForModelError) return "no-providers-for-model";
   if (e instanceof NoProvidersForCountryError) return "no-providers-for-country";
+  if (e instanceof NoProvidersForVersionError) return "no-providers-for-version";
   if (e instanceof NoFriendsAvailableError) return "no-friends-available";
   if (e instanceof NoFriendsForModelError) return "no-friends-for-model";
   if (e instanceof TargetProviderNotConnectedError) return "target-provider-not-connected";
@@ -706,6 +807,9 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         input.targetProviderDid ? undefined : input.allowedProviderDids,
         // No country filter on an explicit pin — the user chose that machine.
         input.targetProviderDid ? undefined : input.country,
+        // Version IS enforced even on a pin — a capability the machine either
+        // has or doesn't, not a routing preference.
+        input.minProviderVersion,
         excludeDids,
       );
     } catch (e) {
@@ -765,6 +869,7 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         ...(input.tools ? { tools: input.tools } : {}),
         ...(input.toolChoice ? { toolChoice: input.toolChoice } : {}),
         ...(input.toolChoiceFunction ? { toolChoiceFunction: input.toolChoiceFunction } : {}),
+        ...(input.minProviderVersion ? { minProviderVersion: input.minProviderVersion } : {}),
         sessionId,
         targetProviderDid: candidate.did,
         // Pin the exact machine we sealed the prompt to, the only one that can unseal.

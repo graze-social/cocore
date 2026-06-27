@@ -201,6 +201,44 @@ fn state_dir() -> Result<PathBuf> {
     Ok(home.join(".cocore"))
 }
 
+/// Max bytes for the assembled ABSOLUTE socket path. The macOS `sun_path`
+/// limit is 104; we hold a margin so a slightly longer sockets dir can
+/// never push us over and trigger `ENAMETOOLONG` in the wrapper's bind().
+const SOCKET_PATH_CEILING: usize = 100;
+
+/// Build a length-safe socket *filename* for `model_id` under `sockets_dir`,
+/// guaranteeing `sockets_dir.join(name)` stays within [`SOCKET_PATH_CEILING`].
+///
+/// The name is `engine-<model><-hash>-<pid>-<nonce>.sock`. Uniqueness comes
+/// entirely from `pid` + `nonce`; the model text is cosmetic (so `ls
+/// ~/.cocore/sockets` still tells you which model each socket serves) and is
+/// truncated to whatever byte budget remains after the fixed parts. An 8-hex
+/// SHA-256 prefix of the FULL model id keeps the name distinguishable and
+/// stable even when the model text is truncated to nothing on a pathological
+/// long home directory.
+fn socket_filename(sockets_dir: &Path, model_id: &str, pid: u32, nonce: u32) -> String {
+    use sha2::{Digest, Sha256};
+    // 8 hex chars from the full id — survives truncation of the model text.
+    let hash = hex::encode(&Sha256::digest(model_id.as_bytes())[..4]);
+    // HF NSIDs contain slashes (would create subdirs); keep only chars that
+    // are safe and readable in a filename.
+    let sanitized: String = model_id
+        .replace('/', "_")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    // Fixed overhead = sockets_dir + path separator + "engine-" + model_seg
+    // + "-" + hash(8) + "-" + pid + "-" + nonce(8) + ".sock". Everything but
+    // model_seg is constant for this call, so compute the budget left for it.
+    let suffix = format!("-{hash}-{pid}-{nonce:08x}.sock");
+    let prefix = "engine-";
+    let dir_len = sockets_dir.as_os_str().len() + 1; // + separator
+    let fixed = dir_len + prefix.len() + suffix.len();
+    let budget = SOCKET_PATH_CEILING.saturating_sub(fixed);
+    let model_seg: String = sanitized.chars().take(budget).collect();
+    format!("{prefix}{model_seg}{suffix}")
+}
+
 /// Readiness is **stall-based**, not a fixed total budget. A cold first
 /// run downloads the model weights from HuggingFace inside the child
 /// (can be tens of GB), then Metal-mmaps them — a 20 GB model at a
@@ -349,16 +387,15 @@ impl SubprocessEngine {
         // path. A per-instance path removes both failure modes: every
         // unlink now targets only the unlinker's own socket.
         //
-        // Sanitize the model id — HF NSIDs contain slashes which would
-        // create subdirectories — and cap its length so the assembled
-        // path stays well under the macOS `sun_path` limit (~104
-        // bytes). The model segment is cosmetic; uniqueness comes from
-        // the pid + nonce, so truncating it can never cause a
-        // collision.
-        let sanitized: String = model_id.replace('/', "_").chars().take(40).collect();
+        // The model segment is cosmetic — uniqueness comes from the pid +
+        // nonce — so `socket_filename` budgets it against the macOS
+        // `sun_path` limit: with a long $HOME, capping only the model
+        // segment (as an earlier revision did) still let the assembled
+        // ABSOLUTE path overflow, and the wrapper's bind() then raised
+        // `ENAMETOOLONG` and the engine never came up.
         let pid = std::process::id();
         let nonce: u32 = rand::random();
-        let socket_path = sockets_dir.join(format!("engine-{sanitized}-{pid}-{nonce:08x}.sock"));
+        let socket_path = sockets_dir.join(socket_filename(&sockets_dir, &model_id, pid, nonce));
         Ok(Self {
             model_id,
             venv_python,
@@ -1777,5 +1814,55 @@ mod tests {
 
         assert_eq!(content, "Let me check");
         assert_eq!(tool_calls.len(), 1);
+    }
+
+    /// A pathological long home dir + a long model id must still produce an
+    /// absolute path within the `sun_path` ceiling — the bug that made the
+    /// wrapper's bind() raise `ENAMETOOLONG`.
+    #[test]
+    fn socket_filename_stays_under_ceiling() {
+        let dir = Path::new("/Users/some.very.long.username.here/.cocore/sockets");
+        let model = "lmstudio-community/gemma-4-12B-it-MLX-8bit-extra-long-suffix-padding";
+        let name = socket_filename(dir, model, 99999, 0xdeadbeef);
+        let full = dir.join(&name);
+        assert!(
+            full.as_os_str().len() <= SOCKET_PATH_CEILING,
+            "path {} is {} bytes, over ceiling {}",
+            full.display(),
+            full.as_os_str().len(),
+            SOCKET_PATH_CEILING
+        );
+        // Still recognizable as an engine socket for the stale-socket sweep.
+        assert!(name.starts_with("engine-") && name.ends_with(".sock"));
+    }
+
+    /// Uniqueness comes from pid + nonce; differing nonces differ.
+    #[test]
+    fn socket_filename_unique_per_nonce() {
+        let dir = Path::new("/Users/u/.cocore/sockets");
+        let model = "mlx-community/Qwen2.5-7B-Instruct-4bit";
+        let a = socket_filename(dir, model, 4242, 1);
+        let b = socket_filename(dir, model, 4242, 2);
+        assert_ne!(a, b);
+    }
+
+    /// Even when the dir is so long the model text budget is zero, the name
+    /// is still a valid, hash-distinguished engine socket.
+    #[test]
+    fn socket_filename_pure_hash_when_no_room() {
+        let long = format!("/{}/sockets", "x".repeat(SOCKET_PATH_CEILING));
+        let dir = Path::new(&long);
+        let name = socket_filename(dir, "mlx-community/some-model-4bit", 7, 9);
+        assert!(name.starts_with("engine-") && name.ends_with(".sock"));
+        // No model text survived, but the hash + pid + nonce keep it unique.
+        assert!(!name.is_empty());
+    }
+
+    /// A normal short path keeps a readable model prefix.
+    #[test]
+    fn socket_filename_keeps_model_prefix_when_short() {
+        let dir = Path::new("/Users/u/.cocore/sockets");
+        let name = socket_filename(dir, "mlx-community/Qwen2.5-7B-Instruct-4bit", 1, 2);
+        assert!(name.contains("mlx-community_Qwen"));
     }
 }

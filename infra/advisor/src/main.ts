@@ -261,6 +261,10 @@ async function main(): Promise<void> {
             supportedModels: p.supportedModels,
             // Coarse, opt-in country (advisory self-claim) for country routing.
             region: p.region,
+            // Agent binary version (null for a pre-version agent). The console
+            // pre-filters by this for version-gated requests (e.g. image input)
+            // before it seals + pins to a machine.
+            binaryVersion: p.binaryVersion,
             encryptionPubKey: p.encryptionPubKey,
             attestationUri: p.attestationUri,
             lastSeen: new Date(p.lastSeen).toISOString(),

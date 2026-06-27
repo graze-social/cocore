@@ -122,6 +122,15 @@ pub struct ProviderRecord {
     /// off (every job is metered and billed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proBono: Option<ProBonoPolicy>,
+    /// The owner's opt-in to publishing this machine's coarse country. Owner-
+    /// written INTENT, like `desiredModels`/`active`/`desiredTier`/`proBono`:
+    /// the agent reconciles toward it (when true it geolocates the public IP at
+    /// serve start and stamps `region`/`regionSource`/`regionObservedAt`) but
+    /// NEVER authors it, so it must PRESERVE whatever it finds on every
+    /// re-publish. Absent ≡ not sharing; the agent then omits the region
+    /// fields so opting out clears any previously-shared value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shareLocation: Option<bool>,
     /// True while the agent is still loading its inference engine. Set on
     /// the early "provisioning" publish at serve start so the machine
     /// appears on the console immediately; cleared (set false) on the
@@ -141,15 +150,25 @@ pub struct ProviderRecord {
     /// stale failure. See `build_engines`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engineFault: Option<EngineFault>,
+    /// Set when `serve` could not build or publish this machine's
+    /// `dev.cocore.compute.attestation` record. Without a published
+    /// attestation the machine cannot produce verifiable receipts (every
+    /// receipt strong-refs one), so it stays effectively self-attested and
+    /// silently completes no billable work. The agent clears this (writes
+    /// `None`) on every successful (re-)attestation, so its presence reflects
+    /// the current state, not a stale failure. See `build_and_publish_attestation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestationFault: Option<AttestationFault>,
     /// Coarse, opt-in country of this machine, ISO 3166-1 alpha-2 (e.g.
     /// "US"). AGENT-authored and ADVISORY: a self-asserted claim from a
     /// best-effort IP→country lookup at serve start, NOT a proof of location
     /// (a VPN moves it; verifiers MUST NOT trust it — same posture as
     /// `tier`). Set fresh on every serve when the owner has opted in via the
-    /// tray's location-sharing toggle (`~/.cocore/share-location`); `None`
-    /// when sharing is off, so a re-publish drops any previously-shared value
-    /// (opt-out clears the data). Unlike the console-authored switches it is
-    /// NOT carried through `preserve_console_fields` — the agent owns it.
+    /// console's `shareLocation` switch on this record; `None` when sharing is
+    /// off, so a re-publish drops any previously-shared value (opt-out clears
+    /// the data). Unlike the console-authored switches it is NOT carried
+    /// through `preserve_console_fields` — the agent re-derives it each serve
+    /// from `shareLocation`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// How `region` was derived (e.g. `ip-geo`). Present iff `region` is.
@@ -219,6 +238,25 @@ pub struct EngineFault {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A content-safe description of why the attestation could not be built or
+/// published. Published on the provider record (mirroring [`EngineFault`]) so
+/// the console can show the operator that receipts are disabled and why,
+/// instead of a machine that looks healthy but completes no billable jobs.
+/// Cleared on every successful (re-)attestation. No prompt/completion bytes
+/// ever reach it (attestation runs before any job).
+#[allow(non_snake_case)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AttestationFault {
+    /// Machine-readable fault class: `attestation-publish-failed` (the record
+    /// could not be written to the PDS) or `attestation-build-failed` (the
+    /// signed record could not be assembled).
+    pub code: String,
+    /// Human-readable summary with remediation guidance.
+    pub message: String,
+    /// When the agent recorded the fault.
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize, Clone)]
 pub struct ModelPrice {
@@ -274,6 +312,7 @@ struct ListRecordsResponse {
 /// HTTP client over the console's `/api/pds/createRecord`
 /// endpoint. One instance per agent lifetime; the API key is
 /// captured at construction and never rotated.
+#[derive(Clone)]
 pub struct PdsClient {
     did: String,
     api_base: String,

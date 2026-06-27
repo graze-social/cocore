@@ -8,6 +8,7 @@ import { useDocsScrollSpyActive } from "@/components/docs/docs-scroll-spy-contex
 import {
   INFERENCE_API_CATALOG,
   INFERENCE_API_ERROR_SECTIONS,
+  INFERENCE_API_TOPIC_SECTIONS,
 } from "@/lib/inference-docs/catalog.ts";
 import { INFERENCE_API_INTRO_ID } from "@/lib/inference-docs/navigation-api.ts";
 import {
@@ -52,7 +53,9 @@ export function InferenceDocsNav() {
               <div {...stylex.props(docsStyles.refNavHeadingRow)}>
                 <span {...stylex.props(docsStyles.refNavHeading)}>{section}</span>
                 <span {...stylex.props(docsStyles.refNavHeadingCount)}>
-                  {INFERENCE_API_CATALOG.length + INFERENCE_API_ERROR_SECTIONS.length}
+                  {INFERENCE_API_CATALOG.length +
+                    INFERENCE_API_TOPIC_SECTIONS.length +
+                    INFERENCE_API_ERROR_SECTIONS.length}
                 </span>
               </div>
               {onApiReference ? (
@@ -79,6 +82,31 @@ export function InferenceDocsNav() {
                 </Link>
               )}
               {INFERENCE_API_CATALOG.map((entry) =>
+                onApiReference ? (
+                  <a
+                    key={entry.id}
+                    href={`#${entry.id}`}
+                    {...stylex.props(
+                      docsStyles.refNavLink,
+                      docsStyles.refNavLinkMono,
+                      active === entry.id && docsStyles.refNavLinkActive,
+                    )}
+                  >
+                    {entry.navLabel}
+                  </a>
+                ) : (
+                  <Link
+                    key={entry.id}
+                    to="/docs/inference/$slug"
+                    params={{ slug: "api-reference" }}
+                    hash={entry.id}
+                    {...stylex.props(docsStyles.refNavLink, docsStyles.refNavLinkMono)}
+                  >
+                    {entry.navLabel}
+                  </Link>
+                ),
+              )}
+              {INFERENCE_API_TOPIC_SECTIONS.map((entry) =>
                 onApiReference ? (
                   <a
                     key={entry.id}

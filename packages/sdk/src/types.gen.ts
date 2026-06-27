@@ -205,6 +205,7 @@ export interface ProviderRecord {
   payoutsEnabled?: boolean;
   binaryVersion?: string;
   engineFault?: { code: string; message: string; models?: string[]; at: string };
+  shareLocation?: boolean;
   region?: string;
   regionSource?: string;
   regionObservedAt?: string;

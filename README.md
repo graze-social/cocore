@@ -137,6 +137,31 @@ Either way the agent pairs to your identity, attests the machine, loads a
 local model, and starts publishing receipts as it earns. See
 [`docs/install-mac.md`](docs/install-mac.md) for the details.
 
+## Choosing where (and how) a job runs
+
+The completions API and the in-app chat take optional routing controls beyond
+just the model:
+
+- **By country.** Pass a `country` (ISO 3166-1 alpha-2, e.g. `US`) to route
+  only to providers advertising that coarse region. A machine opts into
+  publishing its country from its per-machine settings on the website (the
+  agent then geolocates the machine's IP and refreshes it each time it serves);
+  it's an advisory, self-asserted hint — a VPN moves it — so requests fail
+  closed (`no_providers_for_country`) rather than silently routing elsewhere.
+- **Pro bono.** The pro-bono completion path
+  (`POST /v1/probono/chat/completions`, or the toggle in chat) routes only to
+  providers that have elected to serve you for free. A provider configures this
+  per machine on the website: off, free for *anyone*, or free for an explicit
+  list of people (friends-only). Pro-bono jobs are unmetered and take no
+  exchange cut, so a balance-less requester can still be served.
+- **Verified / friends-only.** `/v1/verified/...` and `/v1/private/...` are the
+  existing trust- and friend-constrained paths.
+
+Full reference: the OpenAPI spec at
+[`packages/console/public/openapi.yaml`](packages/console/public/openapi.yaml)
+(also rendered at `console.cocore.dev/docs`) and the lexicon notes in
+[`lexicons/README.md`](lexicons/README.md).
+
 ## What's in here
 
 The lexicon is the source of truth. Everything else exists to make it

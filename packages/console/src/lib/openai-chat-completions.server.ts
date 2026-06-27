@@ -262,7 +262,9 @@ export function parseRequest(raw: OpenAiChatRequest): ParsedRequest | string {
   }
   const stream = typeof raw.stream === "boolean" ? raw.stream : false;
   let country: string | undefined;
-  if (raw.country !== undefined) {
+  // `null` (an explicit "no country") is treated the same as absent, so a
+  // client that sends `country: null` isn't rejected with a misleading 400.
+  if (raw.country !== undefined && raw.country !== null) {
     if (typeof raw.country !== "string" || !/^[A-Za-z]{2}$/.test(raw.country.trim())) {
       return "country must be a 2-letter ISO 3166-1 alpha-2 code";
     }
@@ -580,6 +582,16 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
         status: 503,
         type: "service_unavailable_error",
         code: "no_providers_for_country",
+      };
+    case "no-providers-for-version":
+      // The model exists but no connected provider runs a new enough binary
+      // (e.g. an image request needs a release that parses messages-v1).
+      // 503 (capacity-shaped, retryable) — capable machines may come online
+      // as the fleet updates.
+      return {
+        status: 503,
+        type: "service_unavailable_error",
+        code: "no_providers_for_version",
       };
     case "no-friends-available":
       return {

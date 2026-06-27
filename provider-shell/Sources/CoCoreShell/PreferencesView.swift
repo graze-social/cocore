@@ -55,12 +55,10 @@ struct PreferencesView: View {
     @AppStorage("scheduleLimited") private var scheduleLimited = false
     @AppStorage("idleStart") private var idleStart = 22
     @AppStorage("idleEnd") private var idleEnd = 8
-    @AppStorage("shareLocation") private var shareLocation = false
 
     @State private var networkApplied = false
     @State private var nameApplied = false
     @State private var scheduleApplied = false
-    @State private var locationApplied = false
 
     // One grouped settings form. (Was its own nested TabView with a Status
     // sub-tab; that sub-tab is now the main window's Status tab, and tabs
@@ -156,23 +154,7 @@ struct PreferencesView: View {
                 }
             }
             Section("Location") {
-                Toggle("Share this machine's country", isOn: $shareLocation)
-                    .toggleStyle(.switch)
-                HStack {
-                    Button("Apply & restart agent") {
-                        Task {
-                            await supervisor.applyLocationSharingAndReconnect()
-                            locationApplied = true
-                        }
-                    }
-                    .tint(Color.primary)
-                    if locationApplied {
-                        Text("Applied — agent restarted")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Text("When on, this machine publishes only its coarse country (e.g. “US”) to its public record, refreshed each time it starts serving. It's an advisory signal derived from your IP address — not a precise or verified location. Turn it off and the country is removed on the next restart.")
+                Text("Sharing this machine's coarse country is now configured on the website — open this machine in the console and turn on “Share country”. It publishes only an advisory country (e.g. “US”) derived from your IP, refreshed each time the machine serves.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

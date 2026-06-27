@@ -179,6 +179,55 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
+  /v1/probono/chat/completions:
+    post:
+      tags: [Inference]
+      operationId: createProBonoChatCompletion
+      summary: Create a chat completion (pro-bono / free routing)
+      description: >
+        The pro-bono completion path. Identical wire format to
+        `/v1/chat/completions`, but routing is constrained to providers whose
+        `proBono` policy elects to serve THIS requester for free — either
+        `mode: any` (the provider serves everyone pro bono) or `mode: direct`
+        with the caller's DID in the provider's allowlist. A matched job is
+        served unmetered at zero price and the exchange takes no cut, so a
+        requester with **no token balance** can still get a completion. The
+        resulting receipt carries `proBono: true` with `price.amount: 0` and
+        `tokens: { in: 0, out: 0 }`.
+
+
+        The optional `country` field still narrows by region. Fails closed with
+        `no_pro_bono_providers` (503) when no connected provider currently
+        offers the caller pro bono, rather than silently billing the job — use
+        `/v1/chat/completions` for a normal paid request. Also available at the
+        legacy path `/api/v1/probono/chat/completions`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "200":
+          description: "A completion (or an SSE stream when `stream: true`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatCompletion" }
+            text/event-stream:
+              schema: { type: string }
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "503":
+          description: No connected provider currently offers you pro bono (`no_pro_bono_providers`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /v1/models:
     get:
       tags: [Directory]

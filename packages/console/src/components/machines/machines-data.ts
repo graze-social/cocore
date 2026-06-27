@@ -86,4 +86,19 @@ export interface Machine {
    *  {@link standingKnown} true means the machine isn't connected to the
    *  grid right now. */
   advisorConnected?: boolean;
+  /** Whether the owner opted this machine into publishing its coarse country
+   *  (the provider record's `shareLocation` switch). Drives the "Share
+   *  country" toggle in per-machine settings. Absent ≡ off. */
+  shareLocation?: boolean;
+  /** Coarse, opt-in ISO 3166-1 alpha-2 country the agent published when
+   *  {@link shareLocation} is on (the provider record's `region`). Advisory
+   *  self-claim; absent when not sharing or not yet resolved. */
+  region?: string;
+  /** The owner's pro-bono election from the provider record's `proBono`
+   *  policy: `any` (serve everyone free) or `direct` (serve only the listed
+   *  {@link proBonoDids} free). Absent ≡ pro bono off (every job billed). */
+  proBonoMode?: "any" | "direct";
+  /** Requester DIDs served pro bono under `direct` mode. Empty/absent under
+   *  `direct` means no one is currently served free. */
+  proBonoDids?: string[];
 }

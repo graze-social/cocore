@@ -26,6 +26,7 @@ import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-s
 import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
 import { type AdvisorProviderRow, type DispatchInputs, runDispatch } from "@/lib/inference-dispatch.server.ts";
 import { listMyFriendDids } from "@/lib/friends.server.ts";
+import { resolveProBonoProviderKeys } from "@/lib/pro-bono.server.ts";
 import {
   buildJobInput,
   bufferedResponse,
@@ -37,6 +38,8 @@ import {
 } from "@/lib/openai-chat-completions.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
 import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { resolveBearerKeyViaAppview } from "@/lib/api-keys-appview.server.ts";
+import { verifyServiceAuth } from "@/lib/service-auth.server.ts";
 import { buildModelDirectory } from "@/lib/model-directory.server.ts";
 import {
   parseTrustFloor,
@@ -58,9 +61,59 @@ import {
 // well above the DEFAULT_MAX_TOKENS of 1024 and most real requests.
 const DEFAULT_PRICE_CEILING = { amount: 100_000, currency: "CC" };
 
-/** Authenticate the bearer key and restore the underlying ATProto
- *  session. On success returns the resolved DID + live session; on
- *  failure returns a ready-to-send error Response. */
+// Minimum provider binaryVersion required to serve a multimodal
+// (`messages-v1`) request — i.e. one carrying images. Image support and the
+// Register-frame version reporting that lets the advisor enforce this both
+// land in the same release, so the floor is that release. Configurable via
+// env for when a later release moves it; the default is the first version
+// that reports its version AND parses images. A text request has no floor.
+const MESSAGES_V1_MIN_VERSION = process.env["COCORE_MIN_VERSION_MESSAGES_V1"] ?? "0.9.32";
+
+/** The provider version floor implied by an input format. Images
+ *  (`messages-v1`) require a capable provider; plain text has no floor. */
+function minVersionForInput(inputFormat: string | undefined): string | undefined {
+  return inputFormat === "messages-v1" ? MESSAGES_V1_MIN_VERSION : undefined;
+}
+
+// The method NSID a service-auth token must be minted for (its `lxm`
+// claim) to authenticate inference. The OpenAI-compatible surface forwards
+// to `dev.cocore.inference.dispatch`, so we bind to that NSID — one token
+// works across both the XRPC dispatch and this endpoint.
+const INFERENCE_LXM = "dev.cocore.inference.dispatch";
+
+/** Distinguish an AT Protocol service-auth JWT (three base64url segments)
+ *  from a `cocore-…` API key. A caller can authenticate inference with
+ *  either; a service token (minted by the caller's PDS via getServiceAuth)
+ *  needs no key provisioning at all. */
+function looksLikeServiceToken(bearer: string): boolean {
+  return !bearer.startsWith("cocore-") && bearer.split(".").length === 3;
+}
+
+/** The DID resolved fine, but it has no authorized cocore session — so
+ *  there's no way to publish the job/payment to its PDS. The remedy differs
+ *  by credential: an API-key holder re-mints after re-auth; a service-token
+ *  caller's account owner must complete cocore onboarding once. */
+function sessionAbsentError(viaServiceToken: boolean): Response {
+  if (viaServiceToken) {
+    return jsonError(
+      401,
+      "This DID has no authorized cocore session, so inference cannot run on its behalf. The account owner must connect cocore once at https://cocore.dev, then retry.",
+      "authentication_error",
+      "onboarding_required",
+    );
+  }
+  return jsonError(
+    401,
+    "API key's underlying ATProto session is no longer valid; mint a new key after re-authenticating",
+    "authentication_error",
+  );
+}
+
+/** Authenticate the request and restore the underlying ATProto session.
+ *  Accepts either a cocore API key (resolved against the console store,
+ *  then — for keys minted via the documented AppView endpoint — the AppView
+ *  store) or an AT Protocol service-auth JWT. On success returns the
+ *  resolved DID + live session; on failure returns a ready-to-send error. */
 async function authenticate(
   request: Request,
 ): Promise<{ did: string; oauthSession: OAuthSession } | Response> {
@@ -68,12 +121,29 @@ async function authenticate(
   if (!bearer) {
     return jsonError(401, "Missing Authorization: Bearer header", "authentication_error");
   }
-  const resolved = resolveBearerKey(bearer);
-  if (!resolved) {
-    return jsonError(401, "Invalid API key", "authentication_error");
+
+  // Resolve the caller to a DID via whichever credential they presented.
+  let did: string;
+  let viaServiceToken = false;
+  if (looksLikeServiceToken(bearer)) {
+    viaServiceToken = true;
+    const auth = await verifyServiceAuth(request, INFERENCE_LXM);
+    if (!auth.ok) return jsonError(auth.status, auth.message, "authentication_error", auth.error);
+    did = auth.did;
+  } else {
+    // Local console.db first (console-minted keys + console-paired agents),
+    // then the AppView store (keys minted via the documented createApiKey,
+    // which lands in account.db). The AppView helper self-gates on the
+    // internal channel being configured and on the `cocore-` prefix.
+    const resolved = resolveBearerKey(bearer) ?? (await resolveBearerKeyViaAppview(bearer));
+    if (!resolved) {
+      return jsonError(401, "Invalid API key", "authentication_error", "invalid_api_key");
+    }
+    did = resolved.did;
   }
-  if (!isDid(resolved.did)) {
-    return jsonError(500, "Stored DID is malformed", "server_error");
+
+  if (!isDid(did)) {
+    return jsonError(500, "Resolved DID is malformed", "server_error");
   }
 
   // Single-owner cutover: when forwarding is configured the AppView owns and
@@ -83,15 +153,11 @@ async function authenticate(
   // is replayed by the AppView). Only a DEFINITIVE "session absent" 401s;
   // a transient AppView blip doesn't (the session likely still exists).
   if (isAppviewForwardConfigured()) {
-    const info = await appviewSessionInfo(resolved.did);
+    const info = await appviewSessionInfo(did);
     if (info.checked && !info.present) {
-      return jsonError(
-        401,
-        "API key's underlying ATProto session is no longer valid; mint a new key after re-authenticating",
-        "authentication_error",
-      );
+      return sessionAbsentError(viaServiceToken);
     }
-    return { did: resolved.did, oauthSession: appviewBackedSession(resolved.did as Did) };
+    return { did, oauthSession: appviewBackedSession(did as Did) };
   }
 
   // Restore the OAuth session for this DID. The session store is
@@ -99,16 +165,12 @@ async function authenticate(
   // hasn't explicitly revoked the chain, this resolves.
   const oauthSession = await runTraced(
     "auth.restoreSession",
-    restoreAtprotoSessionEffect(resolved.did as Did),
+    restoreAtprotoSessionEffect(did as Did),
   );
   if (!oauthSession) {
-    return jsonError(
-      401,
-      "API key's underlying ATProto session is no longer valid; mint a new key after re-authenticating",
-      "authentication_error",
-    );
+    return sessionAbsentError(viaServiceToken);
   }
-  return { did: resolved.did, oauthSession };
+  return { did, oauthSession };
 }
 
 /**
@@ -200,6 +262,9 @@ export async function handleChatCompletions(request: Request): Promise<Response>
     prompt: "",
     payloadBytes: payload.payloadBytes,
     inputFormat: payload.inputFormat,
+    // Image requests must only reach providers running a release that
+    // supports the messages-v1 envelope (fail-closed at the advisor).
+    minProviderVersion: minVersionForInput(payload.inputFormat),
     maxTokensOut: parsed.maxTokens,
     priceCeiling: DEFAULT_PRICE_CEILING,
     country: parsed.country,
@@ -271,6 +336,9 @@ export async function handlePrivateChatCompletions(request: Request): Promise<Re
     prompt: "",
     payloadBytes: payload.payloadBytes,
     inputFormat: payload.inputFormat,
+    // Image requests must only reach providers running a release that
+    // supports the messages-v1 envelope (fail-closed at the advisor).
+    minProviderVersion: minVersionForInput(payload.inputFormat),
     maxTokensOut: parsed.maxTokens,
     priceCeiling: DEFAULT_PRICE_CEILING,
     // `allowedProviderDids` here is what tips runDispatch into
@@ -363,6 +431,9 @@ export async function handleVerifiedChatCompletions(request: Request): Promise<R
     prompt: "",
     payloadBytes: payload.payloadBytes,
     inputFormat: payload.inputFormat,
+    // Image requests must only reach providers running a release that
+    // supports the messages-v1 envelope (fail-closed at the advisor).
+    minProviderVersion: minVersionForInput(payload.inputFormat),
     maxTokensOut: parsed.maxTokens,
     priceCeiling: DEFAULT_PRICE_CEILING,
     // Same mechanism as the friends path, but the set is the proof-backed
@@ -373,6 +444,84 @@ export async function handleVerifiedChatCompletions(request: Request): Promise<R
     ...(parsed.tools ? { tools: parsed.tools } : {}),
     ...(parsed.toolChoice ? { toolChoice: parsed.toolChoice } : {}),
     ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
+  };
+
+  if (parsed.stream) {
+    return streamingResponse(id, parsed.model, runDispatch(inputs));
+  }
+  return await bufferedResponse(id, parsed.model, runDispatch(inputs));
+}
+
+/** POST /v1/probono/chat/completions — the pro-bono completion path. Routes
+ *  ONLY to providers whose `proBono` policy elects to serve THIS requester for
+ *  free (`mode: any`, or `mode: direct` with the caller's DID listed). A
+ *  matched job is served unmetered at zero price with no exchange cut, so a
+ *  requester with no token balance can still get a completion. Identical wire
+ *  format to `/v1/chat/completions` (and `country` still narrows by region).
+ *  Fails CLOSED with a 503 when no connected provider currently offers the
+ *  caller pro bono, rather than silently falling back to a billed job. Same
+ *  `allowedProviderDids` mechanism as the friends + verified paths. */
+export async function handleProBonoChatCompletions(request: Request): Promise<Response> {
+  const auth = await authenticate(request);
+  if (auth instanceof Response) return auth;
+
+  let raw: OpenAiChatRequest;
+  try {
+    raw = (await request.json()) as OpenAiChatRequest;
+  } catch {
+    return jsonError(400, "Body must be JSON");
+  }
+  const parsed = parseRequest(raw);
+  if (typeof parsed === "string") return jsonError(400, parsed);
+
+  // Resolve the specific MACHINES that currently serve this DID pro bono BEFORE
+  // submitting the job (composite `did:machineId` keys — pro bono is per-machine,
+  // so we can't widen to an owner's other billed machines). A lookup failure
+  // surfaces as a transport error (so the caller can tell "nobody offers me pro
+  // bono" from "the AppView coughed").
+  let allowedProviderDids: Set<string>;
+  try {
+    allowedProviderDids = await resolveProBonoProviderKeys(auth.did);
+  } catch (e) {
+    return jsonError(
+      502,
+      `failed to resolve pro-bono providers: ${(e as Error).message}`,
+      "server_error",
+      "pro_bono_lookup_failed",
+    );
+  }
+  if (allowedProviderDids.size === 0) {
+    return jsonError(
+      503,
+      "no provider currently offers you pro-bono compute; use /v1/chat/completions for a normal (billed) request",
+      "service_unavailable_error",
+      "no_pro_bono_providers",
+    );
+  }
+
+  const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, "")}`;
+  let payload: Awaited<ReturnType<typeof buildJobInput>>;
+  try {
+    payload = await buildJobInput(parsed.messages);
+  } catch (e) {
+    return jsonError(400, `failed to prepare input: ${(e as Error).message}`);
+  }
+  const inputs: DispatchInputs = {
+    did: auth.did,
+    oauthSession: auth.oauthSession,
+    model: parsed.model,
+    prompt: "",
+    payloadBytes: payload.payloadBytes,
+    inputFormat: payload.inputFormat,
+    // Image requests must only reach providers running a release that
+    // supports the messages-v1 envelope (fail-closed at the advisor).
+    minProviderVersion: minVersionForInput(payload.inputFormat),
+    maxTokensOut: parsed.maxTokens,
+    priceCeiling: DEFAULT_PRICE_CEILING,
+    // Constrain routing to providers that serve this requester free — same
+    // gate as the friends/verified paths, just a different allow-set.
+    allowedProviderDids,
+    country: parsed.country,
   };
 
   if (parsed.stream) {

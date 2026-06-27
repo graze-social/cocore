@@ -151,7 +151,19 @@ export const Route = createFileRoute("/api/agent/status")({
           trustLevel?: string;
           binaryVersion?: string;
           desiredTier?: string;
+          attestationFault?: { code?: string; message?: string; at?: string };
         };
+
+        // Surface an attestation build/publish failure: a machine in this
+        // state is online but cannot produce verifiable receipts, so without
+        // this it just looks idle. Mirrors how engineFault is surfaced.
+        const attestationFault = body.attestationFault
+          ? {
+              code: body.attestationFault.code ?? null,
+              message: body.attestationFault.message ?? null,
+              at: body.attestationFault.at ?? null,
+            }
+          : null;
 
         // The owner's DURABLE intent (written by `agent confidential`), distinct
         // from the advisor's verified standing. The app needs both: intent that
@@ -178,6 +190,7 @@ export const Route = createFileRoute("/api/agent/status")({
             confidentialDesired,
             confidentialBlockedReason,
             agentVersion: body.binaryVersion ?? null,
+            attestationFault,
             needsReauth,
           }),
           { status: 200, headers: { "content-type": "application/json" } },

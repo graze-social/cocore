@@ -11,12 +11,15 @@ import {
   classifyDispatchError,
   filterByAllowedDids,
   filterByCountry,
+  filterByMinVersion,
   filterByPayoutsEligibility,
+  meetsMinVersion,
   NoFriendsAvailableError,
   NoFriendsForModelError,
   NoProvidersConnectedError,
   NoProvidersForCountryError,
   NoProvidersForModelError,
+  NoProvidersForVersionError,
   ProviderPayoutsNotEligibleError,
   TargetProviderNotConnectedError,
 } from "./inference-dispatch.server.ts";
@@ -92,6 +95,22 @@ describe("filterByAllowedDids", () => {
   test("set member with no matching candidate is a no-op (not an error)", () => {
     const out = filterByAllowedDids([A, B], new Set(["did:plc:carol", "did:plc:alice"]));
     assert.deepEqual(out, [A]);
+  });
+
+  test("a `did:machineId` composite matches only that machine (pro-bono granularity)", () => {
+    // Same owner DID, two machines — one pro bono, one not. A composite key
+    // must match ONLY the pro-bono machine, never widen to the billed one.
+    const m1 = { did: "did:plc:alice", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:alice", machineId: "rkeyB" };
+    const out = filterByAllowedDids([m1, m2], new Set(["did:plc:alice:rkeyA"]));
+    assert.deepEqual(out, [m1]);
+  });
+
+  test("a bare DID still matches every machine of that owner (friends/verified)", () => {
+    const m1 = { did: "did:plc:alice", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:alice", machineId: "rkeyB" };
+    const out = filterByAllowedDids([m1, m2], new Set(["did:plc:alice"]));
+    assert.deepEqual(out, [m1, m2]);
   });
 });
 
@@ -175,5 +194,36 @@ describe("filterByCountry — country routing", () => {
 
   test("no provider in the requested country yields an empty list", () => {
     assert.deepEqual(filterByCountry([US, DE], "FR"), []);
+  });
+});
+
+describe("filterByMinVersion — version-gated routing", () => {
+  const NEW = { did: "did:plc:new", binaryVersion: "0.9.32" };
+  const OLD = { did: "did:plc:old", binaryVersion: "0.9.31" };
+  const LEGACY: { did: string; binaryVersion?: string } = { did: "did:plc:legacy" };
+
+  test("undefined floor passes the list through verbatim", () => {
+    assert.deepEqual(filterByMinVersion([NEW, OLD, LEGACY], undefined), [NEW, OLD, LEGACY]);
+  });
+
+  test("keeps only machines at or above the floor", () => {
+    assert.deepEqual(filterByMinVersion([NEW, OLD, LEGACY], "0.9.32"), [NEW]);
+  });
+
+  test("fail-closed: a machine reporting no version never passes a floor", () => {
+    assert.deepEqual(filterByMinVersion([LEGACY], "0.9.32"), []);
+  });
+
+  test("meetsMinVersion is fail-closed on a missing version", () => {
+    assert.equal(meetsMinVersion(undefined, "0.9.32"), false);
+    assert.equal(meetsMinVersion("0.9.32", "0.9.32"), true);
+    assert.equal(meetsMinVersion("0.9.31", "0.9.32"), false);
+  });
+
+  test("classifyDispatchError maps the version error to a stable code", () => {
+    assert.equal(
+      classifyDispatchError(new NoProvidersForVersionError("0.9.32", "none at version")),
+      "no-providers-for-version",
+    );
   });
 });

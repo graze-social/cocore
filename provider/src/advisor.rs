@@ -40,7 +40,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
@@ -67,15 +67,22 @@ impl Drop for ZeroizeOnDrop {
 
 /// Bundles the long-lived state that
 /// [`handle_inference_request`] needs to publish a receipt: the PDS
-/// client (signs its own DPoP), the active attestation strong-ref
-/// (`None` if attestation publish failed at boot — receipts skip
-/// publishing in that mode), and the signer + X25519 keypair
-/// already passed for chunk/complete construction.
+/// client (signs its own DPoP), the active attestation strong-ref, and
+/// the signer + X25519 keypair already passed for chunk/complete
+/// construction.
+///
+/// The attestation is a shared, refreshable cell rather than a plain
+/// reference: a background task in `cmd_serve` re-publishes the attestation
+/// ~1h before it expires (24h lifetime) and swaps the new strong-ref in here,
+/// so jobs always reference the CURRENT attestation. It reads `None` when
+/// attestation publish failed (at boot or on a refresh) — receipts skip
+/// publishing in that mode — and a job reads the freshest value at the moment
+/// it publishes its receipt.
 struct ServeContext<'a> {
     signer: &'a dyn SigningIdentity,
     encryption: &'a ProviderKeypair,
     pds: &'a PdsClient,
-    attestation: Option<&'a StrongRef>,
+    attestation: Arc<RwLock<Option<StrongRef>>>,
     /// Per-model engine registry. `cmd_serve` constructs the
     /// registry from `COCORE_INFERENCE_MODELS` (or the singular
     /// legacy form), with a `stub` entry always included for the
@@ -105,7 +112,11 @@ impl AdvisorClient {
         signer: &dyn SigningIdentity,
         encryption: &ProviderKeypair,
         pds: &PdsClient,
-        attestation: Option<&StrongRef>,
+        // Shared, refreshable attestation cell (see `ServeContext`). Cloned
+        // from `cmd_serve`, which also hands a clone to the refresh task; on
+        // reconnect `run` re-reads the same cell, so it always picks up any
+        // attestation refreshed mid-connection.
+        attestation: Arc<RwLock<Option<StrongRef>>>,
         engines: &EngineRegistry,
         // rkey of this machine's provider record, so we can read the owner's
         // `active` start/stop switch off our own PDS. `None` skips the check
@@ -1246,7 +1257,12 @@ async fn handle_inference_request_inner(
         (tokens_in, tokens_out, price_minor)
     };
 
-    let (receipt_uri, receipt_commit) = match (req.job_cid.as_ref(), ctx.attestation) {
+    // Snapshot the current attestation for this job. The refresh task may swap
+    // a newer one in between jobs; reading here means every receipt references
+    // whatever attestation is live at publish time.
+    let attestation_snapshot = ctx.attestation.read().await.clone();
+    let (receipt_uri, receipt_commit) = match (req.job_cid.as_ref(), attestation_snapshot.as_ref())
+    {
         (Some(job_cid), Some(attestation)) => publish_stub_receipt(
             ctx,
             &req,
@@ -1741,14 +1757,14 @@ mod tests {
         signer: &'a dyn SigningIdentity,
         kp: &'a ProviderKeypair,
         pds: &'a PdsClient,
-        attestation: Option<&'a StrongRef>,
+        attestation: Option<&StrongRef>,
         engines: &'a EngineRegistry,
     ) -> ServeContext<'a> {
         ServeContext {
             signer,
             encryption: kp,
             pds,
-            attestation,
+            attestation: Arc::new(RwLock::new(attestation.cloned())),
             engines,
             pro_bono: off_pro_bono(),
         }

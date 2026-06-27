@@ -31,6 +31,12 @@ export function InferenceDocsOverviewPage({ baseUrl }: { baseUrl: string }) {
         <code {...stylex.props(docsStyles.codeInline)}>/v1/chat/completions</code>. Each request is
         matched to an online, attested provider and settled with a signed receipt.
       </p>
+      <p {...stylex.props(docsStyles.prose)}>
+        Requests can carry text or images: vision-capable models accept inline base64 or remote{" "}
+        <code {...stylex.props(docsStyles.codeInline)}>image_url</code> parts. See{" "}
+        <InferenceApiDocLink fragment="inference-api-image-input">image input</InferenceApiDocLink>{" "}
+        for the request shape and limits.
+      </p>
 
       <h2 {...stylex.props(docsStyles.h2)}>Before your first request</h2>
       <ol {...stylex.props(inferenceDocsSharedStyles.list)}>

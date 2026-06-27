@@ -38,6 +38,8 @@ import {
   setProviderRecordDesiredModels,
   setProviderRecordDesiredTier,
   setProviderRecordMachineLabel,
+  setProviderRecordProBono,
+  setProviderRecordShareLocation,
 } from "@/lib/provider-record-pds.server.ts";
 import { authMiddleware } from "@/middleware/auth.ts";
 
@@ -59,6 +61,21 @@ const setProviderDesiredTierSchema = providerRkeySchema.extend({
 
 const setProviderMachineLabelSchema = providerRkeySchema.extend({
   label: z.string().min(1).max(200),
+});
+
+const setProviderShareLocationSchema = providerRkeySchema.extend({
+  share: z.boolean(),
+});
+
+const setProviderProBonoSchema = providerRkeySchema.extend({
+  // null clears the policy (pro bono off). `direct` carries an optional DID
+  // allowlist; `any` ignores it (everyone is already free).
+  policy: z
+    .object({
+      mode: z.enum(["any", "direct"]),
+      dids: z.array(z.string()).max(1024).optional(),
+    })
+    .nullable(),
 });
 
 export type MyMachinesPayload = {
@@ -431,6 +448,28 @@ const setMyProviderMachineLabelServerFn = createServerFn({ method: "POST" })
     return { ok: true as const };
   });
 
+const setMyProviderShareLocationServerFn = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .inputValidator(setProviderShareLocationSchema)
+  .handler(async ({ context, data }) => {
+    // Owner INTENT only. The agent reads `shareLocation` off its own record at
+    // serve start and re-derives (or clears) the coarse `region` from its IP.
+    await setProviderRecordShareLocation(context.oauthSession, data.rkey, data.share);
+    await nudgeAdvisorControl(context.did);
+    return { ok: true as const };
+  });
+
+const setMyProviderProBonoServerFn = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .inputValidator(setProviderProBonoSchema)
+  .handler(async ({ context, data }) => {
+    // Owner INTENT only. The agent reconciles toward it and serves a matching
+    // requester free; clearing it (null) bills every job again.
+    await setProviderRecordProBono(context.oauthSession, data.rkey, data.policy);
+    await nudgeAdvisorControl(context.did);
+    return { ok: true as const };
+  });
+
 const deleteMyProviderRecordServerFn = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .inputValidator(providerRkeySchema)
@@ -482,6 +521,19 @@ export const setMyProviderDesiredTierMutationOptions = mutationOptions({
 export const setMyProviderMachineLabelMutationOptions = mutationOptions({
   mutationFn: (variables: SetMyProviderMachineLabelInput) =>
     setMyProviderMachineLabelServerFn({ data: variables }),
+});
+
+export type SetMyProviderShareLocationInput = z.infer<typeof setProviderShareLocationSchema>;
+export type SetMyProviderProBonoInput = z.infer<typeof setProviderProBonoSchema>;
+
+export const setMyProviderShareLocationMutationOptions = mutationOptions({
+  mutationFn: (variables: SetMyProviderShareLocationInput) =>
+    setMyProviderShareLocationServerFn({ data: variables }),
+});
+
+export const setMyProviderProBonoMutationOptions = mutationOptions({
+  mutationFn: (variables: SetMyProviderProBonoInput) =>
+    setMyProviderProBonoServerFn({ data: variables }),
 });
 
 export const deleteMyProviderRecordMutationOptions = mutationOptions({

@@ -65,6 +65,7 @@ interface DispatchBody {
   maxTokensOut?: unknown;
   priceCeiling?: unknown;
   targetProviderDid?: unknown;
+  targetMachineId?: unknown;
   /** Optional ISO 3166-1 alpha-2 country to route by (advisory). */
   country?: unknown;
   /** Optional JSON Schema constraining the model's output. */
@@ -73,7 +74,19 @@ interface DispatchBody {
   tools?: unknown;
   /** Optional tool choice strategy. */
   toolChoice?: unknown;
+  /** Optional DID allow-set the console resolved (pro-bono / friends /
+   *  verified) and forwarded. Constrains provider selection. */
+  allowedProviderDids?: unknown;
+  /** Optional explicit minimum provider binaryVersion to route to (e.g.
+   *  `0.9.32` to require a feature). When absent, an image (messages-v1)
+   *  request still derives the messages-v1 floor automatically. */
+  minProviderVersion?: unknown;
 }
+
+// Minimum provider binaryVersion required to serve a multimodal
+// (messages-v1) request. Mirrors the console's constant; configurable via
+// the same env so both surfaces move the floor together.
+const MESSAGES_V1_MIN_VERSION = process.env["COCORE_MIN_VERSION_MESSAGES_V1"] ?? "0.9.32";
 
 type ParsedDispatch = Omit<DispatchInputs, "did">;
 
@@ -101,12 +114,31 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
   if (body.targetProviderDid !== undefined && typeof body.targetProviderDid !== "string") {
     return "targetProviderDid must be a string when provided";
   }
+  if (body.targetMachineId !== undefined && typeof body.targetMachineId !== "string") {
+    return "targetMachineId must be a string when provided";
+  }
+  if (body.targetMachineId !== undefined && body.targetProviderDid === undefined) {
+    return "targetMachineId requires targetProviderDid";
+  }
   let country: string | undefined;
   if (body.country !== undefined) {
     if (typeof body.country !== "string" || !/^[A-Za-z]{2}$/.test(body.country.trim())) {
       return "country must be a 2-letter ISO 3166-1 alpha-2 code";
     }
     country = body.country.trim().toUpperCase();
+  }
+  let allowedProviderDids: Set<string> | undefined;
+  if (body.allowedProviderDids !== undefined) {
+    if (
+      !Array.isArray(body.allowedProviderDids) ||
+      !body.allowedProviderDids.every((d): d is string => typeof d === "string")
+    ) {
+      return "allowedProviderDids must be an array of DID strings";
+    }
+    allowedProviderDids = new Set(body.allowedProviderDids);
+  }
+  if (body.minProviderVersion !== undefined && typeof body.minProviderVersion !== "string") {
+    return "minProviderVersion must be a string when provided";
   }
   // Build the messages-v1 envelope when the client sent images.
   let envelope: Pick<DispatchInputs, "payloadBytes" | "inputFormat"> = {};
@@ -157,6 +189,14 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     }
     toolChoice = body.toolChoice as DispatchInputs["toolChoice"];
   }
+  // An explicit floor wins; otherwise an image request derives the
+  // messages-v1 floor so it only reaches providers that can parse it.
+  const minProviderVersion =
+    typeof body.minProviderVersion === "string"
+      ? body.minProviderVersion
+      : envelope.inputFormat === MESSAGES_V1
+        ? MESSAGES_V1_MIN_VERSION
+        : undefined;
   return {
     model: body.model,
     prompt: body.prompt,
@@ -166,10 +206,15 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
     ...(typeof body.targetProviderDid === "string"
       ? { targetProviderDid: body.targetProviderDid }
       : {}),
+    ...(typeof body.targetProviderDid === "string" && typeof body.targetMachineId === "string"
+      ? { targetMachineId: body.targetMachineId }
+      : {}),
     ...(country ? { country } : {}),
     ...(outputSchema ? { outputSchema } : {}),
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { toolChoice } : {}),
+    ...(allowedProviderDids ? { allowedProviderDids } : {}),
+    ...(minProviderVersion ? { minProviderVersion } : {}),
   };
 }
 

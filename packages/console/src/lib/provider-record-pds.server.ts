@@ -185,6 +185,69 @@ export async function setProviderRecordDesiredModels(
   await putMyProviderRecord(session, rkey, next, cid);
 }
 
+/** Opt a machine into (or out of) publishing its coarse country by writing
+ *  the owner-INTENT `shareLocation` switch onto its provider record. The agent
+ *  reads this off its own record at serve start: when `true` it resolves the
+ *  machine's country from its public IP and stamps `region` (refreshed every
+ *  serve); when off it omits the region fields, so the next re-publish drops
+ *  any previously-shared value. `false` DELETES the key (absent ≡ off), keeping
+ *  the record minimal. Same get→put-with-swap→bridge-mirror path as
+ *  {@link setProviderRecordActive}. */
+export async function setProviderRecordShareLocation(
+  session: OAuthSession,
+  rkey: string,
+  share: boolean,
+): Promise<void> {
+  const { cid, value } = await getMyProviderRecord(session, rkey);
+  const next = { ...value };
+  if (share) {
+    next["shareLocation"] = true;
+  } else {
+    delete next["shareLocation"];
+  }
+  await putMyProviderRecord(session, rkey, next, cid);
+}
+
+/** The owner's pro-bono election for a machine, mirroring the lexicon
+ *  `dev.cocore.compute.provider#proBonoPolicy`. `null` clears the policy. */
+export type ProBonoPolicyInput = { mode: "any" | "direct"; dids?: string[] } | null;
+
+/** Set (or clear) a machine's pro-bono policy by writing `proBono` onto its
+ *  provider record — the owner's INTENT, like `desiredModels`/`desiredTier`.
+ *  The agent reconciles toward it: a matching requester is served free
+ *  (`proBono: true`, zero price, zero tokens; the exchange takes no cut).
+ *  `null` (or `mode` neither `any`/`direct`) DELETES the key, turning pro bono
+ *  off so the machine bills every job again. Under `direct`, `dids` is trimmed,
+ *  deduped, and emptied of blanks — an empty list means "serve no one pro bono
+ *  yet" (the safe default for a half-configured policy). Same
+ *  get→put-with-swap→bridge-mirror path as {@link setProviderRecordActive}. */
+export async function setProviderRecordProBono(
+  session: OAuthSession,
+  rkey: string,
+  policy: ProBonoPolicyInput,
+): Promise<void> {
+  const { cid, value } = await getMyProviderRecord(session, rkey);
+  const next = { ...value };
+  if (policy && (policy.mode === "any" || policy.mode === "direct")) {
+    if (policy.mode === "direct") {
+      const cleaned: string[] = [];
+      const seen = new Set<string>();
+      for (const d of policy.dids ?? []) {
+        const trimmed = d.trim();
+        if (trimmed.length === 0 || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        cleaned.push(trimmed);
+      }
+      next["proBono"] = { mode: "direct", ...(cleaned.length > 0 ? { dids: cleaned } : {}) };
+    } else {
+      next["proBono"] = { mode: "any" };
+    }
+  } else {
+    delete next["proBono"];
+  }
+  await putMyProviderRecord(session, rkey, next, cid);
+}
+
 /** Rename a machine by writing `machineLabel` onto its provider record.
  *  The console writes the field directly; the agent normally sets it from
  *  `COCORE_MACHINE_LABEL`, but the record's `machineLabel` is the value the

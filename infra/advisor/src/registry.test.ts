@@ -297,6 +297,43 @@ describe("ProviderRegistry", () => {
       expect(r.pickFor("nonexistent-model")).toBeNull();
     });
 
+    it("enforces minProviderVersion fail-closed (excludes below-floor + unknown-version)", () => {
+      const r = new ProviderRegistry();
+      // new: reports a version at/above the floor.
+      r.upsert(
+        { ...baseReg, provider_did: "did:plc:new", binary_version: "0.9.32" },
+        noop,
+        noopSend,
+        noopPing,
+        1000,
+      );
+      // old: reports a version below the floor.
+      r.upsert(
+        { ...baseReg, provider_did: "did:plc:old", binary_version: "0.9.31" },
+        noop,
+        noopSend,
+        noopPing,
+        1000,
+      );
+      // legacy: reports no version at all.
+      r.upsert({ ...baseReg, provider_did: "did:plc:legacy" }, noop, noopSend, noopPing, 1000);
+      r.markAttested("did:plc:new", MID, 1100);
+      r.markAttested("did:plc:old", MID, 1100);
+      r.markAttested("did:plc:legacy", MID, 1100);
+
+      // No floor → all three are eligible.
+      expect(r.pickCandidates("llama-3.2").length).toBe(3);
+
+      // Floor 0.9.32 → only the new machine; old + legacy (unknown) excluded.
+      const gated = r.pickCandidates("llama-3.2", true, Number.POSITIVE_INFINITY, 2000, "0.9.32");
+      expect(gated.map((e) => e.did)).toEqual(["did:plc:new"]);
+
+      // A floor nobody meets → empty (never falls open).
+      expect(r.pickCandidates("llama-3.2", true, Number.POSITIVE_INFINITY, 2000, "1.0.0")).toEqual(
+        [],
+      );
+    });
+
     it("treats empty supportedModels as 'matches anything'", () => {
       const r = new ProviderRegistry();
       r.upsert({ ...baseReg, supported_models: [] }, noop, noopSend, noopPing, 1000);

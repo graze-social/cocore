@@ -190,6 +190,16 @@ pub struct Register {
     /// tool-capability gating should require the requested model to be listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_models: Option<Vec<String>>,
+    /// Version string of this agent binary (`env!("CARGO_PKG_VERSION")`,
+    /// e.g. `0.9.32`), echoed live so the advisor can route version-gated
+    /// jobs — a request that needs a feature only present from some release
+    /// (e.g. `messages-v1` image input) is steered to machines at/above a
+    /// minimum version. Mirrors the `binaryVersion` already stamped on the
+    /// PDS provider record. Additive: pre-version advisors ignore it, and an
+    /// advisor enforcing a floor treats a machine that omits it as below the
+    /// floor (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

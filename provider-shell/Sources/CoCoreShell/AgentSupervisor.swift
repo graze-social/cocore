@@ -509,39 +509,11 @@ final class AgentSupervisor {
         }
     }
 
-    /// Write/clear the `~/.cocore/share-location` marker from the current
-    /// location-sharing toggle, then restart the agent so it re-resolves and
-    /// re-stamps (or clears) the provider record's coarse `region` on its next
-    /// serve. Same LaunchAgent-vs-supervised-child mode split as
-    /// `applyScheduleAndReconnect`. Unlike the network/schedule applies there's
-    /// no env var to edit — the agent reads the marker file at serve start —
-    /// so the LaunchAgent path just bounces to pick up the change.
-    func applyLocationSharingAndReconnect() async {
-        let on = UserDefaults.standard.bool(forKey: "shareLocation")
-        Self.setLocationSharingMarker(on)
-        if isLaunchAgentManaged {
-            Self.bounce(label: "dev.cocore.provider")
-        } else {
-            await stop()
-            await start()
-        }
-    }
-
-    /// Write (or remove) the `~/.cocore/share-location` marker — the durable
-    /// record of the owner's coarse-location-sharing intent. Mirrors the
-    /// Secure-Mode marker: a file's existence IS the boolean, and the Rust
-    /// agent reads it at serve start (`location_sharing_enabled`).
-    nonisolated static func setLocationSharingMarker(_ on: Bool) {
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cocore/share-location")
-        if on {
-            try? FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? Data().write(to: path)
-        } else {
-            try? FileManager.default.removeItem(at: path)
-        }
-    }
+    // Coarse-location sharing is no longer a tray toggle: it's configured
+    // per-machine on the console (the `shareLocation` switch on the provider
+    // record). The agent reads that field off its own record at serve start and
+    // re-resolves / clears the coarse `region` accordingly — no local marker
+    // file, so there is nothing to apply from here.
 
     /// Apply the current per-model schedules (`COCORE_MODEL_SCHEDULES`) to the
     /// running agent and reload. Same mode split as the whole-app schedule:

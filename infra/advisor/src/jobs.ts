@@ -34,6 +34,7 @@ import type { AdvisorMessage, InferenceRequest } from "./protocol.ts";
 import type { ProviderEntry, ProviderRegistry } from "./registry.ts";
 import type { SseResponse } from "./sessions.ts";
 import type { SessionManager } from "./sessions.ts";
+import { meetsMinVersion } from "./version.ts";
 
 interface JobBody {
   jobUri: string;
@@ -67,12 +68,28 @@ interface JobBody {
   /** Optional tool-choice directive (e.g. "auto", "none", "required").
    *  Forwarded verbatim to the provider; the advisor never inspects it. */
   toolChoice?: unknown;
+  /** Optional: minimum provider binaryVersion eligible for this job (e.g.
+   *  `0.9.32` for an image request that needs messages-v1 support). Machines
+   *  below it — or that don't report a version — are excluded (fail-closed).
+   *  Backstops the open-pool path; the console also pre-filters before it
+   *  seals + pins to a single machine. */
+  minProviderVersion?: string;
 }
 
 interface ParsedJob {
   ok: true;
   body: Required<
-    Omit<JobBody, "jobCid" | "inputFormat" | "targetProviderDid" | "targetMachineId" | "outputSchema" | "tools" | "toolChoice">
+    Omit<
+      JobBody,
+      | "jobCid"
+      | "inputFormat"
+      | "targetProviderDid"
+      | "targetMachineId"
+      | "outputSchema"
+      | "tools"
+      | "toolChoice"
+      | "minProviderVersion"
+    >
   > & {
     jobCid?: string;
     inputFormat?: string;
@@ -81,6 +98,7 @@ interface ParsedJob {
     outputSchema?: { name: string; strict?: boolean; schema: Record<string, unknown> };
     tools?: unknown;
     toolChoice?: unknown;
+    minProviderVersion?: string;
   };
 }
 
@@ -153,6 +171,9 @@ function parseJobBody(input: unknown, generateId: () => string): ParsedJob | Par
   if (b["toolChoice"] !== undefined && typeof b["toolChoice"] !== "string") {
     return { ok: false, status: 400, error: "toolChoice must be a string when provided" };
   }
+  if (b["minProviderVersion"] !== undefined && typeof b["minProviderVersion"] !== "string") {
+    return { ok: false, status: 400, error: "minProviderVersion must be a string when provided" };
+  }
   return {
     ok: true,
     body: {
@@ -174,6 +195,8 @@ function parseJobBody(input: unknown, generateId: () => string): ParsedJob | Par
           : undefined,
       tools: Array.isArray(b["tools"]) ? b["tools"] : undefined,
       toolChoice: typeof b["toolChoice"] === "string" ? b["toolChoice"] : undefined,
+      minProviderVersion:
+        typeof b["minProviderVersion"] === "string" ? b["minProviderVersion"] : undefined,
     },
   };
 }
@@ -279,21 +302,40 @@ async function selectProvider(
         return false;
       }
       if (m.unhealthyAt !== null) return false;
+      // Version floor (e.g. image input → messages-v1). Fail-closed: a
+      // machine that doesn't report a version is treated as below it.
+      if (job.minProviderVersion && !meetsMinVersion(m.binaryVersion, job.minProviderVersion)) {
+        return false;
+      }
       return true;
     });
     if (eligible.length === 0) {
       return {
         kind: "error",
         status: 503,
-        error: `provider ${job.targetProviderDid} has no attested, healthy machine available`,
+        error: job.minProviderVersion
+          ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
+          : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
       };
     }
     eligible.sort((a, b) => b.lastSeen - a.lastSeen);
     candidates = eligible;
   } else {
-    candidates = ctx.registry.pickCandidates(job.model || undefined, true, ctx.attestationMaxAgeMs);
+    candidates = ctx.registry.pickCandidates(
+      job.model || undefined,
+      true,
+      ctx.attestationMaxAgeMs,
+      Date.now(),
+      job.minProviderVersion ?? null,
+    );
     if (candidates.length === 0) {
-      return { kind: "error", status: 503, error: "no attested providers available" };
+      return {
+        kind: "error",
+        status: 503,
+        error: job.minProviderVersion
+          ? `no attested providers at version >= ${job.minProviderVersion} available`
+          : "no attested providers available",
+      };
     }
   }
 

@@ -5,10 +5,14 @@ import {
   NoProvidersConnectedError,
   NoProvidersForCountryError,
   NoProvidersForModelError,
+  NoProvidersForVersionError,
   ProviderPayoutsNotEligibleError,
   TargetProviderNotConnectedError,
   classifyDispatchError,
+  filterByAllowedDids,
+  filterByMinVersion,
   filterByPayoutsEligibility,
+  meetsMinVersion,
   openFromProvider,
   sealToProvider,
 } from "./dispatch.ts";
@@ -70,6 +74,36 @@ describe("filterByPayoutsEligibility", () => {
   });
 });
 
+describe("filterByAllowedDids", () => {
+  const rows = [{ did: "did:plc:a" }, { did: "did:plc:b" }, { did: "did:plc:c" }];
+
+  it("passes through verbatim when no allow-set", () => {
+    expect(filterByAllowedDids(rows, undefined)).toEqual(rows);
+  });
+
+  it("keeps only DIDs in the allow-set (pro-bono / friends / verified)", () => {
+    const out = filterByAllowedDids(rows, new Set(["did:plc:a", "did:plc:c"]));
+    expect(out.map((r) => r.did)).toEqual(["did:plc:a", "did:plc:c"]);
+  });
+
+  it("an empty allow-set filters everything out", () => {
+    expect(filterByAllowedDids(rows, new Set())).toEqual([]);
+  });
+
+  it("a `did:machineId` composite matches only that machine (pro-bono granularity)", () => {
+    // Same owner, two machines — a composite key must not widen to the other.
+    const m1 = { did: "did:plc:a", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:a", machineId: "rkeyB" };
+    expect(filterByAllowedDids([m1, m2], new Set(["did:plc:a:rkeyA"]))).toEqual([m1]);
+  });
+
+  it("a bare DID still matches every machine of that owner (friends/verified)", () => {
+    const m1 = { did: "did:plc:a", machineId: "rkeyA" };
+    const m2 = { did: "did:plc:a", machineId: "rkeyB" };
+    expect(filterByAllowedDids([m1, m2], new Set(["did:plc:a"]))).toEqual([m1, m2]);
+  });
+});
+
 describe("classifyDispatchError", () => {
   it("maps each known error class to its code", () => {
     expect(classifyDispatchError(new NoProvidersConnectedError())).toBe("no-providers-connected");
@@ -85,9 +119,33 @@ describe("classifyDispatchError", () => {
     expect(classifyDispatchError(new NoProvidersForCountryError("m", "US", 3))).toBe(
       "no-providers-for-country",
     );
+    expect(classifyDispatchError(new NoProvidersForVersionError("0.9.32", "none"))).toBe(
+      "no-providers-for-version",
+    );
   });
 
   it("falls back to advisor-transport for unknown errors", () => {
     expect(classifyDispatchError(new Error("socket hang up"))).toBe("advisor-transport");
+  });
+});
+
+describe("filterByMinVersion — version-gated routing", () => {
+  const NEW = { did: "did:plc:new", binaryVersion: "0.9.32" };
+  const OLD = { did: "did:plc:old", binaryVersion: "0.9.31" };
+  const LEGACY: { did: string; binaryVersion?: string } = { did: "did:plc:legacy" };
+
+  it("passes through when no floor is set", () => {
+    expect(filterByMinVersion([NEW, OLD, LEGACY], undefined)).toEqual([NEW, OLD, LEGACY]);
+  });
+
+  it("keeps only machines at or above the floor (fail-closed on unknown)", () => {
+    expect(filterByMinVersion([NEW, OLD, LEGACY], "0.9.32")).toEqual([NEW]);
+    expect(filterByMinVersion([LEGACY], "0.9.32")).toEqual([]);
+  });
+
+  it("meetsMinVersion is fail-closed on a missing version", () => {
+    expect(meetsMinVersion(undefined, "0.9.32")).toBe(false);
+    expect(meetsMinVersion("0.9.33", "0.9.32")).toBe(true);
+    expect(meetsMinVersion("0.9.31", "0.9.32")).toBe(false);
   });
 });

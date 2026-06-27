@@ -526,6 +526,29 @@ const styles = stylex.create({
       backgroundColor: uiColor.bgSubtle,
     },
   },
+  hostCell: {
+    alignItems: "center",
+    display: "flex",
+    flexWrap: "wrap",
+    gap: gap.sm,
+  },
+  regionChip: {
+    alignItems: "center",
+    backgroundColor: uiColor.bgSubtle,
+    borderColor: uiColor.border1,
+    borderRadius: radius.sm,
+    borderStyle: "solid",
+    borderWidth: 1,
+    color: uiColor.text1,
+    display: "inline-flex",
+    flexShrink: 0,
+    fontSize: fontSize.xs,
+    gap: gap.xs,
+    letterSpacing: "0.03em",
+    lineHeight: lineHeight.sm,
+    paddingBlock: 2,
+    paddingInline: horizontalSpace.sm,
+  },
   snippetRow: {
     alignItems: "flex-start",
     display: "flex",
@@ -691,6 +714,16 @@ const COMPACT_NUMBER_FMT = new Intl.NumberFormat("en-US", {
 function fmtCompact(n: number): string {
   if (!Number.isFinite(n) || n === 0) return "0";
   return COMPACT_NUMBER_FMT.format(n);
+}
+
+/** ISO 3166-1 alpha-2 country code (e.g. "US") → regional-indicator flag
+ *  emoji (e.g. "🇺🇸"). Returns null for anything that isn't two ASCII
+ *  letters so a malformed self-claim renders as plain text, not garbage. */
+function regionFlag(code: string): string | null {
+  const cc = code.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(cc)) return null;
+  const base = 0x1f1e6 - 0x41;
+  return String.fromCodePoint(base + cc.charCodeAt(0), base + cc.charCodeAt(1));
 }
 
 function uniqueOperatorCount(models: ModelDirectoryEntry[]): number {
@@ -1084,6 +1117,9 @@ function ModelsPage() {
                   <tbody>
                     {selected.machines.map((mach, i) => {
                       const isLast = i === selected.machines.length - 1;
+                      // Derive the flag emoji once (it's null for a non-2-letter
+                      // self-claim); reused in the region chip below.
+                      const regionFlagEmoji = mach.region ? regionFlag(mach.region) : null;
                       return (
                         <tr
                           key={`${selected.modelId}-${mach.attestationPubKey ?? mach.did}`}
@@ -1098,12 +1134,25 @@ function ModelsPage() {
                             <TrustTierBadge tier={mach.verifiedTier} />
                           </td>
                           <td {...stylex.props(styles.td, isLast && styles.tdLastRow)}>
-                            <OperatorChip
-                              did={mach.did}
-                              handle={mach.host?.handle ?? null}
-                              displayName={mach.host?.displayName ?? null}
-                              avatarUrl={mach.host?.avatarUrl ?? null}
-                            />
+                            <div {...stylex.props(styles.hostCell)}>
+                              <OperatorChip
+                                did={mach.did}
+                                handle={mach.host?.handle ?? null}
+                                displayName={mach.host?.displayName ?? null}
+                                avatarUrl={mach.host?.avatarUrl ?? null}
+                              />
+                              {mach.region ? (
+                                <span
+                                  {...stylex.props(styles.regionChip)}
+                                  title={`Provider-claimed region · ${mach.region.toUpperCase()}`}
+                                >
+                                  {regionFlagEmoji ? (
+                                    <span aria-hidden="true">{regionFlagEmoji}</span>
+                                  ) : null}
+                                  {mach.region.toUpperCase()}
+                                </span>
+                              ) : null}
+                            </div>
                           </td>
                           <td {...stylex.props(styles.td, isLast && styles.tdLastRow)}>
                             <SmallBody variant="secondary">

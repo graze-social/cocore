@@ -115,7 +115,6 @@ export async function verifyServiceAuth(
     return fail(401, "BadJwtIssuer", "iss must be a did:plc or did:web");
   }
   if (aud !== cocoreConfig().consoleDid) {
-    console.log(aud, cocoreConfig().consoleDid);
     return fail(401, "BadJwtAudience", "aud does not match this service");
   }
   if (lxm !== expectedLxm) {

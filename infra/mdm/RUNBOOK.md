@@ -369,3 +369,23 @@ itself on its normal 23h refresh.
    the push cert.
 2. **Turn OFF the debug seam.** Remove `COCORE_MDM_WEBHOOK_DEBUG` from the
    `Client` service env (it stashes raw webhook bodies; debug-only).
+
+## Secure Mode wizard failure codes (triage)
+
+When the Secure Mode wizard's attesting step stalls it no longer shows a bare
+"attestation chain isn't ready" — it classifies what it observed into a stable
+code and `NSLog`s a full `co/core Secure Mode attestation failed [...]` report
+(serial, enrolled, elapsed/polls, the `push-attestation` response, the last
+`attestation-chain` poll). That report is in the user's log file and in the
+dialog, so it's copy-pasteable straight into an issue / a model. Codes:
+
+| Code                             | What it means                                                                                                                                                                                                                                                                         | Where to look                                                                                                                                                                     |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `secure-mode/not-enrolled`       | The Mac doesn't report MDM enrollment, so nothing can request an attestation.                                                                                                                                                                                                         | Re-run enroll (Allow + Touch ID the profile); `profiles status -type enrollment`.                                                                                                 |
+| `secure-mode/push-failed`        | `push-attestation` returned `status=error` — NanoMDM enqueue/push failed.                                                                                                                                                                                                             | NanoMDM `/v1/enqueue` + `/v1/push`; that the device's UDID is a valid NanoMDM target.                                                                                             |
+| `secure-mode/chain-store-error`  | The `attestation-chain` GET returned non-200 / `status=error`.                                                                                                                                                                                                                        | Console chain store + the step-ca / NanoMDM attestation webhook ingest.                                                                                                           |
+| `secure-mode/chain-not-captured` | Most common. Every poll was a clean 200 `pending`; no chain landed in the window. The Attest button does **not** itself drive a hardware attestation — capture is the agent's background option-B flow (MDM-enrolled, Apple-rate-limited ~1/device/7d, agent re-requests ≤ every 6h). | Agent log for `MDA auto:` lines (request/bind); with `COCORE_MDM_WEBHOOK_DEBUG` set, `GET attestation-chain?serial=zzwebhookdebuglast` to see whether NanoMDM is posting results. |
+
+The classifier is `AttestationDiagnostic` in
+`provider-shell/Sources/CoCoreShell/SecureModeWizard.swift` (pure value type —
+the code/summary mapping lives there).

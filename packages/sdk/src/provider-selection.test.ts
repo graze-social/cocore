@@ -22,9 +22,14 @@ describe("ownMachineCandidates", () => {
     expect(ownMachineCandidates([mineOtherModel], ME, "m", new Set())).toEqual([]);
   });
 
-  it("treats a machine advertising no models as serving everything", () => {
-    const wildcard = { did: ME, supportedModels: [], lastSeen: "2026-01-05T00:00:00Z" };
-    expect(ownMachineCandidates([wildcard], ME, "m", new Set())).toEqual([wildcard]);
+  it("does NOT prefer an own machine that advertises no models (must match explicitly)", () => {
+    // An empty supportedModels means the agent has no health-gated engine to
+    // serve, so self-preference must NOT grab it — that would route the job to
+    // a box that hits its for_model miss and completes without a receipt
+    // (the job then sits pending → expired; graze-social/cocore#103). Falling
+    // through to [] lets the open pool find a provider that actually serves it.
+    const empty = { did: ME, supportedModels: [], lastSeen: "2026-01-05T00:00:00Z" };
+    expect(ownMachineCandidates([empty], ME, "m", new Set())).toEqual([]);
   });
 
   it("excludes own DIDs already burned by a prior failover attempt", () => {

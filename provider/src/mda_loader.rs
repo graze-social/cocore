@@ -576,6 +576,23 @@ fn mark_auto_requested() {
     }
 }
 
+/// Clear the auto-request cooldown marker so the next attestation refresh
+/// re-requests a hardware attestation immediately instead of waiting out the
+/// remaining cooldown. Used by `cocore agent attestation --retry` for an
+/// enrolled Mac that's impatient for its key-bound chain. Returns `Ok(true)`
+/// when a marker existed and was removed, `Ok(false)` when there was nothing to
+/// clear, and `Err` only on an unexpected IO error.
+pub fn clear_auto_request_cooldown() -> std::io::Result<bool> {
+    let Some(path) = auto_request_marker_path() else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Minimal query-component percent-encoding (serials/UUIDs are alphanumeric +
 /// `-`, but encode defensively so a stray char can't break the URL).
 fn urlencode(s: &str) -> String {
