@@ -188,6 +188,158 @@ fn human_bytes(bytes: u64) -> String {
     format!("{value:.decimals$} {}", UNITS[i])
 }
 
+/// HuggingFace token env vars we honor, in priority order. The first
+/// non-empty one wins. `COCORE_HF_TOKEN` lets the operator scope a token
+/// to cocore without touching the global `HF_TOKEN` that other tools on
+/// the box read; the rest are the standard hub variables.
+const HF_TOKEN_VARS: [&str; 4] = [
+    "COCORE_HF_TOKEN",
+    "HF_TOKEN",
+    "HF_HUB_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+];
+
+/// Whether `COCORE_DISABLE_XET` is set to an explicit "off" value. Used
+/// to let an operator opt the Xet fast-path back ON (we disable it by
+/// default — see [`apply_hf_download_env`]).
+fn xet_reenabled_by_operator() -> bool {
+    matches!(
+        std::env::var("COCORE_DISABLE_XET")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Configure a child `Command`'s HuggingFace download environment so the
+/// weight download authenticates and isn't throttled. Applied to every
+/// engine spawn (and the confidential pre-warm) — see issue #117.
+///
+/// Two problems this fixes, both observed when first-serving an uncached
+/// Xet-backed model:
+///
+///  1. **Unauthenticated → 429 throttle collapse.** With no usable token,
+///     HF rate-limits the traffic; the Xet adaptive-concurrency controller
+///     hits a 429 storm, collapses to its concurrency floor (~40 KB/s), and
+///     a multi-GB download can't finish inside the stall window. We resolve
+///     a non-empty token from [`HF_TOKEN_VARS`] and export it under the two
+///     names huggingface_hub reads (`HF_TOKEN` + `HF_HUB_TOKEN`). Crucially
+///     we also **scrub** a set-but-EMPTY token (the launchd default on the
+///     reporting host), which HF treats as unauthenticated — leaving it set
+///     would shadow nothing useful and keep requests anonymous.
+///
+///  2. **Xet progress is invisible to the watchdog.** The Xet/CAS path
+///     writes a 0-byte `.incomplete` until the head term commits, so the
+///     on-disk byte counter the stall watchdog reads stays flat while GBs
+///     cross the network — a healthy download reads as "no progress" and is
+///     killed. Defaulting `HF_HUB_DISABLE_XET=1` forces the plain-LFS HTTPS
+///     path, which both sidesteps the 429-prone Xet protocol AND advances
+///     the on-disk counter incrementally so the watchdog sees real progress.
+///     An operator who wants Xet back sets `COCORE_DISABLE_XET=0`.
+///
+/// Content-safe: never logs the token value.
+pub fn apply_hf_download_env(cmd: &mut Command) {
+    // (1) Token: first non-empty wins; export under both hub names. If none
+    // is non-empty, strip any (possibly empty) token vars from the child so
+    // an empty `HF_TOKEN` can't pin requests to the throttled anonymous tier.
+    let token = HF_TOKEN_VARS
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
+    match token {
+        Some(token) => {
+            cmd.env("HF_TOKEN", &token).env("HF_HUB_TOKEN", &token);
+        }
+        None => {
+            for var in HF_TOKEN_VARS {
+                cmd.env_remove(var);
+            }
+        }
+    }
+
+    // (2) Xet: disabled by default (plain-LFS), opt back in with
+    // COCORE_DISABLE_XET=0.
+    if xet_reenabled_by_operator() {
+        cmd.env_remove("HF_HUB_DISABLE_XET");
+    } else {
+        cmd.env("HF_HUB_DISABLE_XET", "1");
+    }
+}
+
+/// Newest modification time (as seconds since the Unix epoch) of any file
+/// under the HuggingFace Xet cache/log tree, or 0 if absent. The Xet/CAS
+/// reconstruction path leaves the model's on-disk blob at 0 bytes until its
+/// head term commits (see [`apply_hf_download_env`]), so [`hf_cache_size`]
+/// reads flat during an active Xet transfer. This tree — chunk cache and the
+/// per-generation structured logs under `~/.cache/huggingface/xet/` — IS
+/// touched continuously while bytes flow, so an advancing mtime here is a
+/// valid "transfer is alive" signal the stall watchdog can fall back on.
+/// Best-effort; 0 on any read error.
+fn xet_activity_mtime() -> u64 {
+    // Mirror huggingface_hub's cache-root resolution:
+    // HF_HOME > XDG_CACHE_HOME/huggingface > ~/.cache/huggingface.
+    // (`std::env::var` returns a Result, so `.ok().filter(..)` to drop both
+    // the unset and the set-but-empty cases before falling through.)
+    let hf_cache_root =
+        if let Some(hf_home) = std::env::var("HF_HOME").ok().filter(|v| !v.is_empty()) {
+            PathBuf::from(hf_home)
+        } else if let Some(xdg) = std::env::var("XDG_CACHE_HOME")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Path::new(&xdg).join("huggingface")
+        } else {
+            let Ok(home) = std::env::var("HOME") else {
+                return 0;
+            };
+            if home.is_empty() {
+                return 0;
+            }
+            Path::new(&home).join(".cache").join("huggingface")
+        };
+    let dir = hf_cache_root.join("xet");
+    newest_mtime_secs(&dir)
+}
+
+/// Recursively find the newest file mtime (seconds since epoch) under `dir`.
+/// Uses `symlink_metadata` so symlinks are stat'd as links, not followed.
+/// Best-effort; 0 on any read error or empty tree.
+fn newest_mtime_secs(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut newest = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_dir() => newest = newest.max(newest_mtime_secs(&path)),
+            Ok(md) => {
+                if let Ok(mtime) = md.modified() {
+                    if let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        newest = newest.max(since.as_secs());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    newest
+}
+
+/// Stall timeout for the readiness wait, honoring a `COCORE_DOWNLOAD_STALL_TIMEOUT`
+/// override (whole seconds). Defaults to [`READY_STALL_TIMEOUT`]. An operator on a
+/// slow link pulling a large Xet model that genuinely needs more than the default
+/// window can raise this; a malformed/zero value falls back to the default.
+fn ready_stall_timeout() -> Duration {
+    std::env::var("COCORE_DOWNLOAD_STALL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(READY_STALL_TIMEOUT)
+}
+
 /// Embedded Python wrapper. Written to disk once at first spawn so the
 /// agent ships as a single static binary, no separate file to install
 /// alongside it.
@@ -489,6 +641,10 @@ impl SubprocessEngine {
             // mechanic; the failsafe is what bounds its lifetime.
             .stdin(Stdio::null());
 
+        // Authenticate + de-throttle the HF weight download, and force the
+        // plain-LFS path so the stall watchdog can see byte progress (#117).
+        apply_hf_download_env(&mut cmd);
+
         let mut child = cmd.spawn().with_context(|| {
             format!(
                 "spawning {} {} --model {} --uds {}",
@@ -536,6 +692,12 @@ impl SubprocessEngine {
         let started = Instant::now();
         let mut last_progress = started;
         let mut last_bytes = hf_cache_size(&self.model_id);
+        // Xet/CAS transfers leave the on-disk blob at 0 bytes until the head
+        // term commits, so `last_bytes` stays flat while GBs cross the wire.
+        // The Xet cache/log tree IS touched continuously during the transfer,
+        // so an advancing mtime there is our fallback "still alive" signal.
+        let mut last_xet_mtime = xet_activity_mtime();
+        let stall_timeout = ready_stall_timeout();
         let mut last_log = started;
         loop {
             if self.socket_path.exists() && self.probe_ready() {
@@ -558,6 +720,15 @@ impl SubprocessEngine {
                 last_bytes = bytes;
                 last_progress = now;
             }
+            // Xet-aware progress: even when the on-disk byte counter is flat
+            // (the head-term-commit behavior above), a freshly-written file in
+            // the Xet cache/log tree means the transfer is actively moving, so
+            // don't let the stall watchdog kill a healthy Xet download.
+            let xet_mtime = xet_activity_mtime();
+            if xet_mtime > last_xet_mtime {
+                last_xet_mtime = xet_mtime;
+                last_progress = now;
+            }
             // Periodic, content-safe progress line (byte counts only — no
             // prompt/token data). Gives the agent log *some* visibility into
             // an otherwise-silent multi-GB download.
@@ -570,14 +741,14 @@ impl SubprocessEngine {
                 last_log = now;
             }
 
-            if now.duration_since(last_progress) > READY_STALL_TIMEOUT {
+            if now.duration_since(last_progress) > stall_timeout {
                 let _ = child.kill();
                 bail!(
                     "inference subprocess for {} made no progress for {}s ({} downloaded so far) and never became ready. \
                      Common causes: a stalled/failed HF download, vllm-mlx import error, or missing venv.\n\
                      Recent engine output (no request has been served yet — content-safe to share):\n{}\n{}",
                     self.model_id,
-                    READY_STALL_TIMEOUT.as_secs(),
+                    stall_timeout.as_secs(),
                     human_bytes(last_bytes),
                     render_ring("stdout", &stdout_buf),
                     render_ring("stderr", &stderr_buf),
@@ -1127,6 +1298,88 @@ mod tests {
             })
             .unwrap();
         (out, tokens)
+    }
+
+    /// Serializes the env-mutating tests below — `std::env::set_var` is
+    /// process-global, so they'd race each other under cargo's parallel runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Collect a Command's explicit env diffs into (key -> Option<value>).
+    fn cmd_env(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// A non-empty token is exported under both hub names and Xet is disabled
+    /// by default. Env vars are process-global, so this test owns HF_* state.
+    #[test]
+    fn apply_hf_env_passes_token_and_disables_xet() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for var in HF_TOKEN_VARS {
+            std::env::remove_var(var);
+        }
+        std::env::remove_var("COCORE_DISABLE_XET");
+        std::env::set_var("COCORE_HF_TOKEN", "hf_secret123");
+
+        let mut cmd = Command::new("true");
+        apply_hf_download_env(&mut cmd);
+        let env = cmd_env(&cmd);
+
+        assert_eq!(env.get("HF_TOKEN"), Some(&Some("hf_secret123".to_string())));
+        assert_eq!(
+            env.get("HF_HUB_TOKEN"),
+            Some(&Some("hf_secret123".to_string()))
+        );
+        assert_eq!(env.get("HF_HUB_DISABLE_XET"), Some(&Some("1".to_string())));
+
+        std::env::remove_var("COCORE_HF_TOKEN");
+    }
+
+    /// A set-but-EMPTY token (the launchd default that triggered #117) is
+    /// scrubbed from the child env, not propagated as an empty value.
+    #[test]
+    fn apply_hf_env_scrubs_empty_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for var in HF_TOKEN_VARS {
+            std::env::remove_var(var);
+        }
+        std::env::remove_var("COCORE_DISABLE_XET");
+        std::env::set_var("HF_TOKEN", ""); // set-but-empty
+
+        let mut cmd = Command::new("true");
+        apply_hf_download_env(&mut cmd);
+        let env = cmd_env(&cmd);
+
+        // env_remove records the key with a None value.
+        assert_eq!(env.get("HF_TOKEN"), Some(&None));
+        assert_eq!(env.get("HF_HUB_TOKEN"), Some(&None));
+
+        std::env::remove_var("HF_TOKEN");
+    }
+
+    /// COCORE_DISABLE_XET=0 re-enables the Xet fast path (no disable var set).
+    #[test]
+    fn apply_hf_env_xet_opt_out_reenables() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for var in HF_TOKEN_VARS {
+            std::env::remove_var(var);
+        }
+        std::env::set_var("COCORE_DISABLE_XET", "0");
+
+        let mut cmd = Command::new("true");
+        apply_hf_download_env(&mut cmd);
+        let env = cmd_env(&cmd);
+
+        // Removed (operator wants Xet), not set to "1".
+        assert_eq!(env.get("HF_HUB_DISABLE_XET"), Some(&None));
+
+        std::env::remove_var("COCORE_DISABLE_XET");
     }
 
     #[test]

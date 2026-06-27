@@ -1019,15 +1019,17 @@ fn download_hf_snapshot(venv_python: &std::path::Path, model: &str) -> Option<St
     // plain string literal (which rustfmt never reflows).
     let code =
         "import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))";
-    let out = std::process::Command::new(venv_python)
-        .arg("-c")
+    let mut cmd = std::process::Command::new(venv_python);
+    cmd.arg("-c")
         .arg(code)
         .arg(model)
         // Accelerated parallel download (hf_transfer is installed by
         // scripts/bootstrap-python-venv.sh alongside vllm-mlx).
-        .env("HF_HUB_ENABLE_HF_TRANSFER", "1")
-        .output()
-        .ok()?;
+        .env("HF_HUB_ENABLE_HF_TRANSFER", "1");
+    // Same auth + plain-LFS download env the engine subprocess uses, so the
+    // confidential pre-warm doesn't hit the unauthenticated 429 throttle (#117).
+    cocore_provider::engines::subprocess::apply_hf_download_env(&mut cmd);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         tracing::warn!(
             model = %model,
@@ -2668,6 +2670,36 @@ fn build_engines(
             models: all_unserved,
             at: chrono::Utc::now(),
         }
+    } else if !failed.is_empty() && is_weight_download_incomplete(last_err.as_deref()) {
+        // The weights never finished downloading — the readiness watchdog
+        // killed a stalled/throttled download, or the engine logged HF
+        // throttling (unauthenticated 429s). The generic "not MLX format"
+        // message below would be actively wrong (the model id is fine; the
+        // bytes just never landed) and sends the operator down the wrong path
+        // verifying model packaging instead of the download. See issue #117.
+        tracing::warn!(
+            models = ?failed,
+            last_error = %last_err.as_deref().unwrap_or("(none captured)"),
+            "weight download did not complete (stalled/throttled/killed); serving stub only"
+        );
+        EngineFault {
+            code: "model-download-incomplete".to_string(),
+            message: format!(
+                "The weight download for [{}] was throttled or killed before it \
+                 finished, so the engine never came online — the model id and format \
+                 are fine; the bytes never landed. The machine is online but only \
+                 serving the no-op `stub` engine, so it won't be matched to real \
+                 inference jobs. Most common cause: HuggingFace rate-limited an \
+                 unauthenticated download. Fix: set a HuggingFace token before serving \
+                 (export `HF_TOKEN=hf_...`, or `COCORE_HF_TOKEN`), ensure the machine \
+                 can reach huggingface.co, then start serving again. The download \
+                 resumes from where it left off, so retrying after authenticating \
+                 usually succeeds.",
+                failed.join(", "),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
     } else if !failed.is_empty() {
         tracing::warn!(
             models = ?failed,
@@ -2781,6 +2813,23 @@ fn is_multimodal_weight_map_failure(last_err: Option<&str>) -> bool {
     e.contains("language_model.")
         || (e.contains("Missing key") && e.contains("language_model."))
         || (e.contains("KeyError") && e.contains("language_model."))
+}
+
+/// Whether an engine-start error is the "the weight download never finished"
+/// failure — the readiness watchdog SIGKILLing a stalled/throttled download, or
+/// the engine logging HuggingFace throttling (unauthenticated 429s) before being
+/// killed. Detected from the watchdog's own bail text ("made no progress …",
+/// "never became ready") and the throttle signals the child writes to stderr.
+/// Drives a precise "download was throttled/killed" message instead of the
+/// generic "not MLX format" one, which is wrong here — the weights ARE the right
+/// format; the bytes just never landed. Content-safe (watchdog + library
+/// traceback text only). See issue #117.
+fn is_weight_download_incomplete(last_err: Option<&str>) -> bool {
+    let Some(e) = last_err else { return false };
+    e.contains("made no progress for")
+        || e.contains("never became ready")
+        || e.contains("unauthenticated requests to the HF Hub")
+        || e.contains("Too Many Requests")
 }
 
 /// Try to start one model's inference subprocess, retrying transient
@@ -3001,6 +3050,39 @@ mod vision_fault_tests {
         let err = "TypeError: VisionConfig.__init__() missing 6 required positional arguments";
         assert!(is_vision_config_failure(Some(err)));
         assert!(!is_multimodal_weight_map_failure(Some(err)));
+    }
+
+    use super::is_weight_download_incomplete;
+
+    #[test]
+    fn detects_watchdog_no_progress_kill() {
+        // The exact bail text the readiness watchdog emits when it SIGKILLs a
+        // stalled/throttled download (subprocess.rs).
+        let err = "inference subprocess for mlx-community/Qwen3.5-4B-MLX-4bit made no progress for 300s (26 MB downloaded so far) and never became ready.";
+        assert!(is_weight_download_incomplete(Some(err)));
+    }
+
+    #[test]
+    fn detects_hf_throttle_signals() {
+        assert!(is_weight_download_incomplete(Some(
+            "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN"
+        )));
+        assert!(is_weight_download_incomplete(Some(
+            "[stderr] HTTP Error 429: Too Many Requests"
+        )));
+    }
+
+    #[test]
+    fn download_incomplete_ignores_unrelated_and_none() {
+        // A real not-MLX / OOM / import failure must NOT be misclassified as a
+        // download problem, or the operator gets the wrong remediation.
+        assert!(!is_weight_download_incomplete(Some(
+            "OSError: out of memory loading weights"
+        )));
+        assert!(!is_weight_download_incomplete(Some(
+            "TypeError: VisionConfig.__init__() missing 6 required positional arguments"
+        )));
+        assert!(!is_weight_download_incomplete(None));
     }
 }
 
