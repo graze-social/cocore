@@ -355,7 +355,19 @@ impl AdvisorClient {
                 }
                 // A control re-read finished. Honour two owner changes: a
                 // stop (disconnect) and a model-set edit (restart to reload).
-                Some((next_active, desired, desired_tier)) = active_reads.next(), if !active_reads.is_empty() => {
+                Some(maybe_control) = active_reads.next(), if !active_reads.is_empty() => {
+                    // A `None` here means the control read couldn't be resolved
+                    // this cycle (the console proxy fronting the PDS read 502'd,
+                    // or the record momentarily didn't list) — owner intent is
+                    // UNKNOWN, so skip reconciliation entirely. Acting on the old
+                    // read-error defaults (best-effort tier + empty models) is
+                    // what made a transient blip look like the owner opting out
+                    // of confidential / clearing their models and trip a spurious
+                    // restart loop. Wait for the next poll / nudge instead.
+                    let Some((next_active, desired, desired_tier)) = maybe_control else {
+                        tracing::debug!("provider-control read unresolved this cycle; skipping reconciliation");
+                        continue;
+                    };
                     if !next_active {
                         // Owner stopped us — disconnect and let the outer loop
                         // hold us out of the registry until they start us again.
@@ -649,8 +661,13 @@ impl AdvisorClient {
 /// Read the owner's controls (start/stop switch + desired model set) off our
 /// PDS. A free fn (rather than two inline `async` blocks) so both
 /// `active_reads.push` sites produce the SAME future type — `FuturesUnordered`
-/// holds one anonymous type.
-async fn read_provider_control(pds: &PdsClient, rkey: &str) -> (bool, Vec<String>, Option<String>) {
+/// holds one anonymous type. `None` means the read couldn't be resolved (a
+/// transient blip); the caller skips reconciliation rather than acting on
+/// read-error defaults.
+async fn read_provider_control(
+    pds: &PdsClient,
+    rkey: &str,
+) -> Option<(bool, Vec<String>, Option<String>)> {
     pds.get_provider_control(rkey).await
 }
 

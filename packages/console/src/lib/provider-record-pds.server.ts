@@ -1,6 +1,11 @@
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
 import { cocoreConfig } from "@/lib/cocore-config.ts";
+import {
+  type CasRecordStore,
+  isRecordNotFound,
+  transactRecord,
+} from "@/lib/record-transactor.server.ts";
 
 const PROVIDER_COLLECTION = "dev.cocore.compute.provider";
 
@@ -88,22 +93,17 @@ export async function getMyProviderRecord(
   return { cid: body.cid, value: body.value as Record<string, unknown> };
 }
 
-async function putMyProviderRecord(
+/** Raw `com.atproto.repo.putRecord` over the OAuth session: write `record` at
+ *  `rkey`, optionally guarded by `swapRecord` (the CID it was read at — the
+ *  compare-and-swap token). Returns the committed CID. Does NOT stamp
+ *  `createdAt` or mirror — those are the transactor's job, so there's exactly
+ *  one place that owns the read-modify-write semantics. */
+async function rawPutProviderRecord(
   session: OAuthSession,
   rkey: string,
   record: Record<string, unknown>,
-  swapRecord: string,
-): Promise<void> {
-  // Stamp a fresh `createdAt` so this owner edit is unambiguously the newest
-  // version of the record. Provider records treat `createdAt` as a monotonic
-  // "last-published-at" — the agent bumps it on every re-publish — and both
-  // the AppView's index (see store.upsert's version guard) and the agent's
-  // dedup order conflicting writes by it. A read-modify-write that KEEPS the
-  // agent's last timestamp would leave the edit tied with the agent's prior
-  // commit; a lagging/replayed firehose delivery of that same-timestamp
-  // commit could then clobber the edit back to its pre-edit state in the
-  // dashboard. Bumping it makes the edit strictly win.
-  const next = { ...record, createdAt: new Date().toISOString() };
+  swapRecord: string | null,
+): Promise<{ cid: string }> {
   const res = await session.handle(`/xrpc/com.atproto.repo.putRecord`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -111,8 +111,8 @@ async function putMyProviderRecord(
       repo: session.did,
       collection: PROVIDER_COLLECTION,
       rkey,
-      record: next,
-      swapRecord,
+      record,
+      ...(swapRecord ? { swapRecord } : {}),
     }),
   });
   if (!res.ok) {
@@ -121,17 +121,46 @@ async function putMyProviderRecord(
       res.status === 401 || res.status === 403 ? `${err} · try signing out and back in` : err,
     );
   }
-  // The PDS returns the new CID; mirror to the bridge so AppView
-  // indexes the updated body. Best-effort; we still consider the
-  // write successful if the bridge hint fails.
-  try {
-    const body = (await res.json()) as { cid?: string };
-    if (body?.cid) {
-      mirrorPutToBridge({ did: session.did, rkey, cid: body.cid, record: next });
-    }
-  } catch {
-    // ignore — putRecord succeeded, only the bridge hint is missing
-  }
+  const body = (await res.json().catch(() => ({}))) as { cid?: string };
+  return { cid: body?.cid ?? "" };
+}
+
+/** The PDS-backed CAS store the transactor drives for provider records. `read`
+ *  maps a genuine 404 to `null` (so `createIfMissing` can create) while
+ *  rethrowing transport/auth blips (so the transaction aborts rather than
+ *  fabricating a record); `write` performs the swap-guarded put and fires the
+ *  best-effort bridge mirror so the AppView index reflects the new body
+ *  immediately. */
+function providerRecordStore(session: OAuthSession): CasRecordStore {
+  return {
+    async read(rkey) {
+      try {
+        return await getMyProviderRecord(session, rkey);
+      } catch (err) {
+        if (isRecordNotFound(err)) return null;
+        throw err;
+      }
+    },
+    async write(rkey, value, swapRecord) {
+      const { cid } = await rawPutProviderRecord(session, rkey, value, swapRecord);
+      if (cid) mirrorPutToBridge({ did: session.did, rkey, cid, record: value });
+      return { cid };
+    },
+  };
+}
+
+/** Mutate this machine's provider record through the single CAS transactor:
+ *  read the latest record, apply `patch` (which sets only the owner-intent
+ *  field(s) it owns and leaves everything else — including agent-authored and
+ *  unknown fields — untouched), bump the monotonic `createdAt`, and putRecord
+ *  with a swap guard, retrying on `InvalidSwap`. A failed read aborts without
+ *  writing. This is what every `setProviderRecord*` runs on. */
+async function transactProviderRecord(
+  session: OAuthSession,
+  rkey: string,
+  patch: (current: Record<string, unknown>) => Record<string, unknown>,
+): Promise<void> {
+  await transactRecord(providerRecordStore(session), rkey, patch, { stampCreatedAt: true });
 }
 
 export async function setProviderRecordActive(
@@ -139,8 +168,7 @@ export async function setProviderRecordActive(
   rkey: string,
   active: boolean,
 ): Promise<void> {
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  await putMyProviderRecord(session, rkey, { ...value, active }, cid);
+  await transactProviderRecord(session, rkey, (value) => ({ ...value, active }));
 }
 
 /** Opt a machine into (or out of) the confidential tier by writing
@@ -156,14 +184,15 @@ export async function setProviderRecordDesiredTier(
   rkey: string,
   tier: "attested-confidential" | "best-effort",
 ): Promise<void> {
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  const next = { ...value };
-  if (tier === "attested-confidential") {
-    next["desiredTier"] = tier;
-  } else {
-    delete next["desiredTier"];
-  }
-  await putMyProviderRecord(session, rkey, next, cid);
+  await transactProviderRecord(session, rkey, (value) => {
+    const next = { ...value };
+    if (tier === "attested-confidential") {
+      next["desiredTier"] = tier;
+    } else {
+      delete next["desiredTier"];
+    }
+    return next;
+  });
 }
 
 /** Pin the set of models a machine serves by writing `desiredModels` onto
@@ -185,14 +214,15 @@ export async function setProviderRecordDesiredModels(
     seen.add(trimmed);
     cleaned.push(trimmed);
   }
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  const next = { ...value };
-  if (cleaned.length > 0) {
-    next["desiredModels"] = cleaned;
-  } else {
-    delete next["desiredModels"];
-  }
-  await putMyProviderRecord(session, rkey, next, cid);
+  await transactProviderRecord(session, rkey, (value) => {
+    const next = { ...value };
+    if (cleaned.length > 0) {
+      next["desiredModels"] = cleaned;
+    } else {
+      delete next["desiredModels"];
+    }
+    return next;
+  });
 }
 
 /** Opt a machine into (or out of) publishing its coarse country by writing
@@ -208,14 +238,15 @@ export async function setProviderRecordShareLocation(
   rkey: string,
   share: boolean,
 ): Promise<void> {
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  const next = { ...value };
-  if (share) {
-    next["shareLocation"] = true;
-  } else {
-    delete next["shareLocation"];
-  }
-  await putMyProviderRecord(session, rkey, next, cid);
+  await transactProviderRecord(session, rkey, (value) => {
+    const next = { ...value };
+    if (share) {
+      next["shareLocation"] = true;
+    } else {
+      delete next["shareLocation"];
+    }
+    return next;
+  });
 }
 
 /** The owner's pro-bono election for a machine, mirroring the lexicon
@@ -236,26 +267,27 @@ export async function setProviderRecordProBono(
   rkey: string,
   policy: ProBonoPolicyInput,
 ): Promise<void> {
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  const next = { ...value };
-  if (policy && (policy.mode === "any" || policy.mode === "direct")) {
-    if (policy.mode === "direct") {
-      const cleaned: string[] = [];
-      const seen = new Set<string>();
-      for (const d of policy.dids ?? []) {
-        const trimmed = d.trim();
-        if (trimmed.length === 0 || seen.has(trimmed)) continue;
-        seen.add(trimmed);
-        cleaned.push(trimmed);
+  await transactProviderRecord(session, rkey, (value) => {
+    const next = { ...value };
+    if (policy && (policy.mode === "any" || policy.mode === "direct")) {
+      if (policy.mode === "direct") {
+        const cleaned: string[] = [];
+        const seen = new Set<string>();
+        for (const d of policy.dids ?? []) {
+          const trimmed = d.trim();
+          if (trimmed.length === 0 || seen.has(trimmed)) continue;
+          seen.add(trimmed);
+          cleaned.push(trimmed);
+        }
+        next["proBono"] = { mode: "direct", ...(cleaned.length > 0 ? { dids: cleaned } : {}) };
+      } else {
+        next["proBono"] = { mode: "any" };
       }
-      next["proBono"] = { mode: "direct", ...(cleaned.length > 0 ? { dids: cleaned } : {}) };
     } else {
-      next["proBono"] = { mode: "any" };
+      delete next["proBono"];
     }
-  } else {
-    delete next["proBono"];
-  }
-  await putMyProviderRecord(session, rkey, next, cid);
+    return next;
+  });
 }
 
 /** Rename a machine by writing `machineLabel` onto its provider record.
@@ -275,8 +307,7 @@ export async function setProviderRecordMachineLabel(
   if (trimmed.length === 0) {
     throw new Error("Machine name cannot be empty");
   }
-  const { cid, value } = await getMyProviderRecord(session, rkey);
-  await putMyProviderRecord(session, rkey, { ...value, machineLabel: trimmed }, cid);
+  await transactProviderRecord(session, rkey, (value) => ({ ...value, machineLabel: trimmed }));
 }
 
 interface ListRecordsResponse {

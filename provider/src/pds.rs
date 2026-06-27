@@ -181,6 +181,106 @@ pub struct ProviderRecord {
     pub createdAt: chrono::DateTime<chrono::Utc>,
 }
 
+/// Owner-INTENT fields on the provider record. The console (web UI and, via the
+/// proxy, the tray) is the ONLY writer of these; the agent reconciles its
+/// runtime toward them but must NEVER author them. They are the contested
+/// settings, so the merge below treats the latest PDS value as authoritative
+/// and the agent's republish leaves them exactly as-is.
+///
+/// This is the one list that must stay in sync with the lexicon's owner-intent
+/// fields. Adding a new owner setting? Add its key here (and the console writes
+/// it). Forgetting to is the failure we are designing OUT — see
+/// {@link merge_agent_provider_fields}, which preserves unknown keys by default,
+/// so even an owner field missing from this list is carried through rather than
+/// clobbered. The list exists only so the agent can defensively refuse to write
+/// these even if a bug populated them.
+pub const OWNER_INTENT_KEYS: &[&str] = &[
+    "active",
+    "payoutsEnabled",
+    "desiredModels",
+    "desiredTier",
+    "proBono",
+    "shareLocation",
+];
+
+/// Agent-authored OPTIONAL fields — present some serves, absent others (a tier
+/// the machine earned then lost, an engineFault that cleared, region when the
+/// owner turns location sharing off). The agent owns these, so when it does NOT
+/// emit one this serve the merge must DELETE it from the published record, or a
+/// stale value would linger. Always-present agent fields (chip, ram,
+/// supportedModels, keys, …) don't need listing — the overlay overwrites them
+/// every serve regardless.
+///
+/// A new agent optional field forgotten here just goes stale (the old value
+/// lingers until the next field-setting serve) — benign, and never touches
+/// owner data. Contrast the old `preserve_console_fields` allowlist, whose
+/// omission silently DESTROYED an owner setting.
+const AGENT_OPTIONAL_KEYS: &[&str] = &[
+    "gpuCores",
+    "memoryBandwidthGBs",
+    "cpuCores",
+    "pCores",
+    "eCores",
+    "modelIdentifier",
+    "os",
+    "tier",
+    "acceptedExchanges",
+    "contactEndpoint",
+    "binaryVersion",
+    "provisioning",
+    "serving",
+    "engineFault",
+    "attestationFault",
+    "region",
+    "regionSource",
+    "regionObservedAt",
+];
+
+/// Produce the JSON body the agent should publish for its provider record, by
+/// applying its freshly-built `agent_record` onto the LATEST record body read
+/// from the PDS (`base`). This is the field-ownership merge that replaces the
+/// old "rebuild the record and copy an allowlist of the owner's fields onto it"
+/// (`preserve_console_fields`) — inverted so the safe default is PRESERVE:
+///
+///   1. Start from `base` (the latest PDS body) — so every key, including
+///      owner-intent fields AND any field this build has never heard of, is
+///      carried through by default. A new owner setting can never be clobbered.
+///   2. Overlay every key the agent authored this serve (present in the
+///      serialized `agent_record`), except — defensively — any owner-intent key
+///      (the agent must never write those; it builds them as `None` so they're
+///      already absent, but we strip them belt-and-suspenders).
+///   3. Delete any agent-authored OPTIONAL key the agent did NOT emit this
+///      serve, so a tier/fault/region the machine no longer has doesn't linger.
+///
+/// The result is then written under compare-and-swap by the caller, so a
+/// concurrent owner edit either is already in `base` (and preserved) or wins
+/// the swap and forces a re-read.
+pub fn merge_agent_provider_fields(
+    base: &serde_json::Value,
+    agent_record: &ProviderRecord,
+) -> serde_json::Value {
+    let mut out = base.as_object().cloned().unwrap_or_default();
+    let patch = serde_json::to_value(agent_record).unwrap_or(serde_json::Value::Null);
+    let patch_obj = patch.as_object();
+    // (3) Clear agent-authored optional fields the agent isn't emitting now.
+    for key in AGENT_OPTIONAL_KEYS {
+        let emitted_now = patch_obj.map(|o| o.contains_key(*key)).unwrap_or(false);
+        if !emitted_now {
+            out.remove(*key);
+        }
+    }
+    // (2) Overlay the agent's authored fields, never an owner-intent field.
+    if let Some(obj) = patch_obj {
+        for (k, v) in obj {
+            if OWNER_INTENT_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 /// The owner's pro-bono election for a machine, mirroring the lexicon
 /// `dev.cocore.compute.provider#proBonoPolicy`. Decides, per requester,
 /// whether a job is served free + unmetered with no exchange cut.
@@ -516,23 +616,34 @@ impl PdsClient {
 
     /// Read the owner-set controls — the `active` start/stop switch, the
     /// `desiredModels` list, and the `desiredTier` intent — from this DID's
-    /// provider record at `rkey` in one list. Defaults: `active` true
-    /// (serving) when absent, `desired` empty when absent, `desiredTier` None
-    /// when absent. On any read error returns the serving default with an
-    /// empty list and no tier so a transient blip never looks like a stop, a
-    /// model change, or a tier change. The agent polls this to honour remote
-    /// pause + model changes; the serve loop also restarts on a `desiredTier`
-    /// change so the supervisor can re-select the confidential worker binary.
-    pub async fn get_provider_control(&self, rkey: &str) -> (bool, Vec<String>, Option<String>) {
-        let Ok(listed) = self.list_my_records("dev.cocore.compute.provider").await else {
-            return (true, Vec::new(), None);
-        };
-        let Some(rec) = listed
+    /// provider record at `rkey` in one list. Within the record the per-field
+    /// defaults are: `active` true (serving) when absent, `desired` empty when
+    /// absent, `desiredTier` None when absent.
+    ///
+    /// Returns `None` when the controls couldn't be determined — the list read
+    /// failed (the console proxy fronting these reads 502s transiently) OR no
+    /// record currently matches `rkey`. The caller MUST treat `None` as "owner
+    /// intent unknown THIS cycle" and skip reconciliation, NOT as a reset to
+    /// defaults. A previous version returned `(true, [], None)` on a read
+    /// error, which a transient blip made indistinguishable from the owner
+    /// clearing their models AND opting out of the confidential tier
+    /// (`desiredTier` None normalises to best-effort) — so every blip tripped a
+    /// spurious "tier/models changed" restart and the machine churned. Reading
+    /// `None` here is the only blip-safe contract. The agent polls this to
+    /// honour remote pause + model changes; the serve loop also restarts on a
+    /// `desiredTier` change so the supervisor can re-select the confidential
+    /// worker binary.
+    pub async fn get_provider_control(
+        &self,
+        rkey: &str,
+    ) -> Option<(bool, Vec<String>, Option<String>)> {
+        let listed = self
+            .list_my_records("dev.cocore.compute.provider")
+            .await
+            .ok()?;
+        let rec = listed
             .iter()
-            .find(|r| r.uri.rsplit('/').next() == Some(rkey))
-        else {
-            return (true, Vec::new(), None);
-        };
+            .find(|r| r.uri.rsplit('/').next() == Some(rkey))?;
         let active = rec
             .value
             .get("active")
@@ -553,7 +664,7 @@ impl PdsClient {
             .get("desiredTier")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        (active, desired, desired_tier)
+        Some((active, desired, desired_tier))
     }
 
     /// Walk the DID PLC directory to find this DID's PDS host. The

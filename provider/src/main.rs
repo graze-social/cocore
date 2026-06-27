@@ -217,7 +217,7 @@ async fn main() -> Result<()> {
         Cmd::Agent(AgentCmd::Confidential { off }) => cmd_set_confidential(!off).await,
         Cmd::Agent(AgentCmd::Doctor { console, fix }) => doctor::run(&console, fix).await,
         Cmd::Agent(AgentCmd::Update { console, check }) => update::run(&console, check).await,
-        Cmd::Agent(AgentCmd::Models(cmd)) => models_cli::run(cmd),
+        Cmd::Agent(AgentCmd::Models(cmd)) => models_cli::run(cmd).await,
         Cmd::Agent(AgentCmd::Pause) => cmd_set_active(false).await,
         Cmd::Agent(AgentCmd::Resume) => cmd_set_active(true).await,
         Cmd::Agent(AgentCmd::Active) => cmd_print_active().await,
@@ -386,6 +386,82 @@ async fn cmd_set_confidential(on: bool) -> Result<()> {
                     attempt,
                     "desiredTier swap lost a race; re-reading and retrying"
                 );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("loop returns on success, on the final attempt, or on a non-swap error")
+}
+
+/// `cocore agent models set/add/remove` percolation: write the owner's model
+/// pick to `desiredModels` on this machine's provider record — the SAME field
+/// the console's model picker writes. This is what makes a tray model change
+/// percolate to the PDS source of truth (and from there to the AppView, the
+/// confidential native engine, and any serving sibling that reconciles), rather
+/// than only living in the local LaunchAgent plist. An empty list REMOVES the
+/// field (revert to the machine's local default). Field-scoped CAS on the CID
+/// with a bounded retry, exactly like `cmd_set_active`: it patches only
+/// `desiredModels` and leaves every other (agent + owner) field untouched.
+///
+/// A missing record (the machine hasn't served yet, so nothing to patch onto)
+/// is a no-op — the caller's local plist write still applies and first serve
+/// publishes the full record. Returns whether a write actually happened.
+async fn cmd_set_desired_models(models: Vec<String>) -> Result<bool> {
+    let (pds, pubkey) = open_pds()?;
+    const MAX_ATTEMPTS: u32 = 5;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let find = find_my_provider_record(&pds, &pubkey).await;
+        if find.is_err() {
+            // No provider record yet — nothing to patch `desiredModels` onto.
+            // The local plist still carries the set; first serve publishes it.
+            tracing::info!(
+                "no provider record yet; skipped desiredModels PDS write (local config carries the set until first serve)"
+            );
+            return Ok(false);
+        }
+        let (rkey, mut value, cid) = find?;
+        let current: Option<Vec<String>> = value
+            .get("desiredModels")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect()
+            });
+        let next: Option<Vec<String>> = if models.is_empty() {
+            None
+        } else {
+            Some(models.clone())
+        };
+        if current == next {
+            return Ok(false); // already in the desired state — no write.
+        }
+        // Patch ONLY desiredModels; everything else rides through untouched.
+        if let Some(obj) = value.as_object_mut() {
+            if models.is_empty() {
+                obj.remove("desiredModels");
+            } else {
+                obj.insert("desiredModels".to_string(), serde_json::json!(models));
+            }
+        }
+        match pds
+            .put_record("dev.cocore.compute.provider", &rkey, &value, Some(&cid))
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    count = models.len(),
+                    "wrote desiredModels to PDS (owner model pick)"
+                );
+                return Ok(true);
+            }
+            Err(e) if is_swap_conflict(&e) && attempt < MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    "desiredModels swap lost a race; re-reading and retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -651,48 +727,12 @@ fn kickstart_launchagent_if_installed() {
     // either picks it up at next start or needs a manual restart.
 }
 
-/// Overlay the owner/console-authored fields (`active`, `payoutsEnabled`,
-/// `desiredModels`, `desiredTier`) from an existing PDS record onto a record the
-/// agent is about to (re-)publish.
-///
-/// The agent NEVER authors these — the console writes them (the start/stop
-/// switch, Stripe-Connect payouts eligibility, the model picker). They are
-/// all `#[serde(skip_serializing_if = "Option::is_none")]`, and the agent
-/// builds its in-memory record with them as `None`, so any write that doesn't
-/// carry them forward OMITS them from the record. That's silently destructive:
-/// an absent `active` reads back as the default `true`, so a write that drops
-/// it UN-PAUSES a machine the owner just paused. Both the startup dedup
-/// re-publish and the graceful-shutdown offline marker funnel through here so
-/// neither can clobber the switches.
-fn preserve_console_fields(record: &mut ProviderRecord, existing: &serde_json::Value) {
-    record.active = existing.get("active").and_then(|v| v.as_bool());
-    record.payoutsEnabled = existing.get("payoutsEnabled").and_then(|v| v.as_bool());
-    record.desiredModels = existing
-        .get("desiredModels")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        });
-    // The owner's confidential opt-in (console/tray "Upgrade security"). Like
-    // the others it's console-written and the agent must carry it through, or a
-    // serve restart would silently drop the owner's choice to go confidential.
-    record.desiredTier = existing
-        .get("desiredTier")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    // The owner's pro-bono election (console / tray "serve pro bono"). Like
-    // the others it's console-written; carry it through or a serve restart
-    // would silently drop the owner's choice to give work away free.
-    record.proBono = ProBonoPolicy::from_record_value(existing);
-    // The owner's location-sharing opt-in (console "Share country" switch).
-    // Console-written like the others — carry it through, or a serve restart
-    // would silently drop the owner's choice. The agent reads this to decide
-    // whether to stamp `region` (see `cmd_serve`); preserving it keeps the
-    // switch sticky across re-publishes.
-    record.shareLocation = existing.get("shareLocation").and_then(|v| v.as_bool());
-}
+// Owner-intent field preservation is no longer a hand-rolled allowlist
+// (`preserve_console_fields`). Every agent re-publish now goes through
+// `dedup_and_publish_provider`, which merges the agent's authored fields onto
+// the LATEST record via `cocore_provider::pds::merge_agent_provider_fields` —
+// owner-intent fields AND any unknown/future field are preserved by default, so
+// a new owner setting can't be silently clobbered by an agent write.
 
 /// Find this machine's existing provider record (if any) on the
 /// user's PDS by matching `attestationPubKey`, delete any other
@@ -711,50 +751,59 @@ async fn dedup_and_publish_provider(
     attestation_pub_key: &str,
     record: &ProviderRecord,
 ) -> anyhow::Result<(cocore_provider::pds::PublishedRecord, bool, usize)> {
+    // The single agent write path for this machine's provider record: a
+    // compare-and-swap read-modify-write that reads the LATEST record, merges
+    // the agent's authored fields onto it (owner-intent + unknown fields
+    // preserved — see `merge_agent_provider_fields`), and putRecords under a
+    // swap guard, retrying on `InvalidSwap` by re-reading. A read failure
+    // aborts — we never publish a fabricated body on a blind read. It also
+    // dedups: a DID that holds several records with our attestationPubKey
+    // (stale reinstall dupes) keeps the newest and deletes the rest.
+    const MAX_ATTEMPTS: u32 = 6;
     let collection = "dev.cocore.compute.provider";
-    let listed = pds.list_my_records(collection).await?;
-    // Group by attestationPubKey; keep records that match ours.
-    // Each matching tuple carries the existing record's body so we
-    // can preserve fields the agent doesn't manage (notably
-    // `payoutsEnabled`, set by the console's Stripe-Connect reconcile)
-    // when we re-publish on startup.
-    let mut matching: Vec<(String, String, String, serde_json::Value)> = Vec::new();
-    let mut other_pubkey_count = 0usize;
-    for r in &listed {
-        let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();
-        let key = r.value.get("attestationPubKey").and_then(|v| v.as_str());
-        let created_at = r
-            .value
-            .get("createdAt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        match key {
-            Some(k) if k == attestation_pub_key => {
-                matching.push((rkey, r.cid.clone(), created_at, r.value.clone()));
-            }
-            Some(_) => {
-                other_pubkey_count += 1;
-            }
-            None => {
-                // No attestationPubKey — pre-2026-05 record from before
-                // the field was required; leave alone.
+    let mut deleted = 0usize;
+    let mut last_conflict: Option<cocore_provider::error::ProviderError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Read latest. A transport/auth failure propagates and ABORTS — the
+        // republish never invents a record on top of an unreadable PDS.
+        let listed = pds.list_my_records(collection).await?;
+        let mut matching: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+        let mut other_pubkey_count = 0usize;
+        for r in &listed {
+            let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();
+            let key = r.value.get("attestationPubKey").and_then(|v| v.as_str());
+            let created_at = r
+                .value
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match key {
+                Some(k) if k == attestation_pub_key => {
+                    matching.push((rkey, r.cid.clone(), created_at, r.value.clone()));
+                }
+                Some(_) => other_pubkey_count += 1,
+                // No attestationPubKey — pre-2026-05 record; leave alone.
+                None => {}
             }
         }
-    }
-    if other_pubkey_count > 0 {
-        tracing::info!(
-            other_pubkey_count,
-            "saw provider records on this DID with a different attestationPubKey — those describe other machines; leaving alone"
-        );
-    }
-    // Sort newest-first by createdAt; the head wins.
-    matching.sort_by(|a, b| b.2.cmp(&a.2));
-    let mut kept_existing = false;
-    let mut deleted = 0usize;
-    let chosen_rkey = if let Some((rkey, _, _, _)) = matching.first() {
-        kept_existing = true;
-        // Delete losers.
+        if attempt == 1 && other_pubkey_count > 0 {
+            tracing::info!(
+                other_pubkey_count,
+                "saw provider records on this DID with a different attestationPubKey — those describe other machines; leaving alone"
+            );
+        }
+        // Sort newest-first by createdAt; the head is canonical.
+        matching.sort_by(|a, b| b.2.cmp(&a.2));
+
+        let Some((rkey, cid, _, existing_value)) = matching.first().cloned() else {
+            // First publish: no record yet. The agent authors everything; owner
+            // fields are absent (correct for a brand-new machine).
+            let published = pds.publish_provider(record).await?;
+            return Ok((published, false, deleted));
+        };
+
+        // Delete duplicate losers (best-effort; only need to run once).
         for (loser_rkey, loser_cid, _, _) in matching.iter().skip(1) {
             match pds
                 .delete_record(collection, loser_rkey, Some(loser_cid))
@@ -765,46 +814,32 @@ async fn dedup_and_publish_provider(
                     tracing::info!(rkey = %loser_rkey, "deleted duplicate provider record");
                 }
                 Err(e) => {
-                    // Non-fatal: surface and move on. The dedup is
-                    // best-effort; partial cleanup is better than
-                    // none, and the user can re-run on next serve.
-                    tracing::warn!(error = %e, rkey = %loser_rkey, "failed to delete duplicate provider record");
+                    tracing::warn!(error = %e, rkey = %loser_rkey, "failed to delete duplicate provider record")
                 }
             }
         }
-        Some(rkey.clone())
-    } else {
-        None
-    };
 
-    let published = match chosen_rkey {
-        Some(rkey) => {
-            // Refresh the swapRecord (CID) right before the put — the
-            // delete loop above might've changed nothing, but a
-            // future caller could have written between our list and
-            // our put. Re-getRecord is overkill; pass the CID we saw
-            // at list time. If a swap conflict happens, the user
-            // re-running serve will re-list and recover.
-            let (swap, existing_value) = matching
-                .first()
-                .map(|(_, cid, _, val)| (cid.clone(), val.clone()))
-                .unwrap_or_default();
-            // Preserve the owner/console-authored switches from the kept
-            // record (see `preserve_console_fields`): the agent never authors
-            // them, and re-publishing without them resets the DID's
-            // payouts-eligibility and restarts a machine the owner stopped.
-            let mut merged = record.clone();
-            preserve_console_fields(&mut merged, &existing_value);
-            pds.put_provider(
-                &rkey,
-                &merged,
-                if swap.is_empty() { None } else { Some(&swap) },
-            )
-            .await?
+        // Merge the agent's fields onto the LATEST body and CAS-put.
+        let merged = cocore_provider::pds::merge_agent_provider_fields(&existing_value, record);
+        match pds.put_record(collection, &rkey, &merged, Some(&cid)).await {
+            Ok(published) => return Ok((published, true, deleted)),
+            Err(e) if is_swap_conflict(&e) && attempt < MAX_ATTEMPTS => {
+                // Someone (a console edit, a sibling write) committed between our
+                // read and put. Re-read the now-current record and replay.
+                tracing::warn!(
+                    attempt,
+                    "provider record swap conflict; re-reading and retrying"
+                );
+                last_conflict = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
         }
-        None => pds.publish_provider(record).await?,
-    };
-    Ok((published, kept_existing, deleted))
+    }
+    Err(last_conflict
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("provider record publish exhausted retries")))
 }
 
 /// `~/.cocore/serving-paused` — present while the owner has this machine
@@ -832,14 +867,58 @@ fn clear_serving_paused() {
 /// tray reflects it; clears it once we're active again. This is what makes
 /// a console "Stop serving" actually pause the machine: the agent stays out
 /// of the advisor's registry (no jobs) until the owner starts it.
+/// Whether the serve gate should connect now or keep waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum ActiveGate {
+    Serve,
+    Wait,
+}
+
+/// Pure decision for {@link wait_until_active}: given this poll's `active` read
+/// — `None` means the read couldn't be RESOLVED (a transient blip), `Some(b)`
+/// is a confirmed value — and whether we've previously confirmed a pause,
+/// decide whether to serve or keep waiting, latching `confirmed_paused`.
+///
+/// The invariant this encodes: a read blip must NEVER flip the decision. Once
+/// we've confirmed the owner paused us, an unresolved read keeps us paused (it
+/// can't un-pause us). Until we've ever confirmed a pause, an unresolved read
+/// serves optimistically so a PDS outage doesn't strand a healthy machine — the
+/// advisor's own control poll re-checks and disconnects if we were wrong.
+fn active_gate_decision(read: Option<bool>, confirmed_paused: &mut bool) -> ActiveGate {
+    match read {
+        Some(true) => ActiveGate::Serve,
+        Some(false) => {
+            *confirmed_paused = true;
+            ActiveGate::Wait
+        }
+        None => {
+            if *confirmed_paused {
+                ActiveGate::Wait
+            } else {
+                ActiveGate::Serve
+            }
+        }
+    }
+}
+
 async fn wait_until_active(pds: &cocore_provider::pds::PdsClient, rkey: Option<&str>) {
     let Some(rk) = rkey else {
         clear_serving_paused();
         return;
     };
     let mut announced = false;
+    // Whether we've CONFIRMED (via a successful read) that the owner paused us.
+    let mut confirmed_paused = false;
     loop {
-        if pds.get_provider_active(rk).await.unwrap_or(true) {
+        // `get_provider_control` returns `None` ONLY when the read couldn't be
+        // resolved (a transient PDS / console-proxy blip), distinct from a
+        // confirmed `Some(active)`. Acting on that blip as if it were a real
+        // value is the conflation that let a paused machine un-pause itself.
+        let read = pds
+            .get_provider_control(rk)
+            .await
+            .map(|(active, _, _)| active);
+        if active_gate_decision(read, &mut confirmed_paused) == ActiveGate::Serve {
             clear_serving_paused();
             return;
         }
@@ -945,13 +1024,22 @@ async fn prepare_native_confidential_model() {
         tracing::info!("native MLX model already configured via env; skipping download probe");
         return;
     }
-    // Choose the model: the owner's first non-`stub` desiredModels, else the
-    // small default. The native engine serves a single model.
-    let model = read_my_desired_models()
-        .await
-        .into_iter()
-        .find(|m| m != "stub")
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    // Choose the model the native engine serves (it serves exactly one): the
+    // owner's PDS `desiredModels` (website picker) first, then the local
+    // `COCORE_INFERENCE_MODELS` the macOS tray / launchd plist set, then the
+    // small default. The tray sets its model choice through the plist, NOT
+    // `desiredModels`, so reading `desiredModels` alone made every tray-
+    // configured confidential machine ignore the owner's pick and fall back to
+    // the default. The singular `COCORE_INFERENCE_MODEL` is honoured for plist
+    // back-compat, matching `build_engines`.
+    let inference_models_env = std::env::var("COCORE_INFERENCE_MODELS")
+        .or_else(|_| std::env::var("COCORE_INFERENCE_MODEL"))
+        .ok();
+    let model = pick_confidential_native_model(
+        &read_my_desired_models().await,
+        inference_models_env.as_deref(),
+        DEFAULT_MODEL,
+    );
 
     // Resolve the venv interpreter the install script bootstrapped.
     let venv_python = std::env::var("COCORE_PYTHON_VENV")
@@ -1061,18 +1149,46 @@ async fn read_my_desired_models() -> Vec<String> {
     let Ok(signer) = secure_enclave::load_or_create_identity() else {
         return Vec::new();
     };
-    match find_my_provider_record(&pds, &signer.public_key_b64()).await {
-        Ok((_, value, _)) => value
-            .get("desiredModels")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
+    let pubkey = signer.public_key_b64();
+    // The console proxy that fronts these PDS reads 502s transiently. A failed
+    // read here used to fall straight through to the hardcoded default model —
+    // silently overriding the owner's website model pick and serving (and
+    // downloading) the WRONG model until the next restart happened to read
+    // cleanly. Retry a few times with short backoff so a blip doesn't downgrade
+    // the model; a record that genuinely lists no `desiredModels` still yields
+    // an empty list on the first read (Ok path) with no retry.
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        match find_my_provider_record(&pds, &pubkey).await {
+            Ok((_, value, _)) => {
+                return value
+                    .get("desiredModels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            Err(e) if attempt < ATTEMPTS => {
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    "couldn't read desiredModels (transient read / no record yet); retrying before any fallback to the default model"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "couldn't read desiredModels after retries; falling back to the default confidential model"
+                );
+                return Vec::new();
+            }
+        }
     }
+    Vec::new()
 }
 
 /// Non-confidential builds: no push host, serve directly on the main runtime.
@@ -1531,8 +1647,9 @@ async fn cmd_serve(
         // idle machine. `None` clears any stale fault on a clean (re-)attestation.
         attestationFault: boot_attestation.fault.clone(),
         // Coarse, opt-in location resolved above (refresh-on-serve). Absent
-        // when sharing is off or the lookup failed. Agent-authored, so it is
-        // deliberately NOT in `preserve_console_fields`.
+        // when sharing is off or the lookup failed. Agent-authored, so the merge
+        // overwrites it when present and CLEARS it when absent (it's in
+        // `AGENT_OPTIONAL_KEYS`) — turning off sharing drops the stale region.
         region,
         regionSource: region_source,
         regionObservedAt: region_observed_at,
@@ -1858,8 +1975,6 @@ async fn cmd_serve(
                 // those fields, CAS-ing on the CID we just read so we don't
                 // race the pause's own write.
                 let publish = async {
-                    let (rk, value, cid) =
-                        find_my_provider_record(&pds, &attestation_pub_key).await?;
                     let mut offline = provider_record.clone();
                     offline.serving = Some(false);
                     offline.provisioning = Some(false);
@@ -1867,14 +1982,15 @@ async fn cmd_serve(
                     // machine simply stopped serving.
                     offline.engineFault = None;
                     offline.createdAt = chrono::Utc::now();
-                    // Preserve the owner/console-authored switches verbatim —
-                    // crucially `active`, so a machine paused moments ago stays
-                    // paused instead of being un-paused by this write.
-                    preserve_console_fields(&mut offline, &value);
-                    pds.put_provider(&rk, &offline, Some(&cid)).await
+                    // The single CAS write path merges this onto the LATEST
+                    // record — preserving the owner's `active` (so a machine
+                    // paused moments ago stays paused instead of being un-paused
+                    // by this marker) and every other owner/unknown field — and
+                    // retries on a swap conflict.
+                    dedup_and_publish_provider(&pds, &attestation_pub_key, &offline).await
                 };
                 match tokio::time::timeout(std::time::Duration::from_secs(5), publish).await {
-                    Ok(Ok(published)) => tracing::info!(uri = %published.uri, "published provider record with serving=false (active/payouts/desiredModels preserved)"),
+                    Ok(Ok((published, _, _))) => tracing::info!(uri = %published.uri, "published provider record with serving=false (owner switches preserved)"),
                     Ok(Err(e)) => tracing::warn!(error = %e, "failed to publish offline marker (active switch left intact)"),
                     Err(_) => tracing::warn!("offline-marker publish timed out after 5s"),
                 }
@@ -2083,15 +2199,15 @@ async fn republish_attestation_fault(
     fault: Option<AttestationFault>,
 ) {
     let publish = async {
-        let (rk, value, cid) = find_my_provider_record(pds, attestation_pub_key).await?;
         let mut rec = base_record.clone();
         rec.attestationFault = fault.clone();
         // Mid-serve: the machine is up and past provisioning.
         rec.serving = Some(true);
         rec.provisioning = Some(false);
         rec.createdAt = chrono::Utc::now();
-        preserve_console_fields(&mut rec, &value);
-        pds.put_provider(&rk, &rec, Some(&cid)).await
+        // Single CAS write path: merges onto the latest record (owner switches +
+        // unknown fields preserved) and retries on conflict.
+        dedup_and_publish_provider(pds, attestation_pub_key, &rec).await
     };
     match tokio::time::timeout(std::time::Duration::from_secs(10), publish).await {
         Ok(Ok(_)) => {}
@@ -2280,6 +2396,47 @@ fn inference_models_action(confidential: bool, desired: &[String]) -> InferenceM
     } else {
         InferenceModelsAction::Set(desired.join(","))
     }
+}
+
+/// Pick the single model a confidential machine's native (in-process) MLX
+/// engine should serve, from the owner's intent.
+///
+/// Mirrors the best-effort priority in {@link inference_models_action}: the PDS
+/// `desiredModels` (the web-console model picker) wins, then the local
+/// `COCORE_INFERENCE_MODELS` the macOS tray and launchd plist set, then a small
+/// default. The native engine serves exactly ONE model, so we take the first
+/// non-`stub` entry from whichever source is populated.
+///
+/// The two sources matter because the tray and the website set the owner's
+/// choice through DIFFERENT channels: the website writes PDS `desiredModels`,
+/// while the tray's "Add a model" runs `cocore agent models`, which edits the
+/// LaunchAgent plist's `COCORE_INFERENCE_MODELS` and bounces the daemon (it does
+/// NOT write `desiredModels`). The best-effort path already honours both — it
+/// loads `desiredModels` when present and otherwise leaves the plist value in
+/// place. Confidential native selection has to honour both too, or a machine
+/// configured from the tray (the common case) silently ignores the owner's pick
+/// and serves the default.
+// Only called from the apns-gated confidential path, but kept un-gated so its
+// unit tests build (and run) on every platform — like `inference_models_action`.
+#[cfg_attr(not(all(target_os = "macos", feature = "apns")), allow(dead_code))]
+fn pick_confidential_native_model(
+    desired_models: &[String],
+    inference_models_env: Option<&str>,
+    default_model: &str,
+) -> String {
+    let first_servable = |raw: &str| {
+        raw.split(',')
+            .map(str::trim)
+            .find(|m| !m.is_empty() && *m != "stub")
+            .map(str::to_string)
+    };
+    desired_models
+        .iter()
+        .map(|s| s.trim())
+        .find(|m| !m.is_empty() && *m != "stub")
+        .map(str::to_string)
+        .or_else(|| inference_models_env.and_then(first_servable))
+        .unwrap_or_else(|| default_model.to_string())
 }
 
 /// Build the per-model engine registry for this serve invocation.
@@ -2976,6 +3133,60 @@ mod inference_models_action_tests {
             InferenceModelsAction::Leave
         );
     }
+
+    const DEFAULT: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
+
+    #[test]
+    fn confidential_native_prefers_pds_desired_models() {
+        // The website picker (PDS `desiredModels`) wins, even when the tray
+        // plist also set something. First non-`stub` entry, order preserved.
+        assert_eq!(
+            pick_confidential_native_model(
+                &v(&["stub", "mlx-community/gemma-3-4b-it-qat-4bit"]),
+                Some("mlx-community/Qwen2.5-7B-Instruct-4bit"),
+                DEFAULT,
+            ),
+            "mlx-community/gemma-3-4b-it-qat-4bit"
+        );
+    }
+
+    #[test]
+    fn confidential_native_falls_back_to_tray_plist_env() {
+        // The common case: configured from the tray, which sets the plist's
+        // `COCORE_INFERENCE_MODELS` and never writes `desiredModels`. Without
+        // this fallback the machine ignored the owner's pick (the bug).
+        assert_eq!(
+            pick_confidential_native_model(
+                &[],
+                Some("mlx-community/gemma-3-4b-it-qat-4bit,stub"),
+                DEFAULT,
+            ),
+            "mlx-community/gemma-3-4b-it-qat-4bit"
+        );
+        // `stub` is never a servable native pick — skip it in the env list too.
+        assert_eq!(
+            pick_confidential_native_model(
+                &v(&["stub"]),
+                Some("stub , mlx-community/gemma-3-4b-it-qat-4bit"),
+                DEFAULT,
+            ),
+            "mlx-community/gemma-3-4b-it-qat-4bit"
+        );
+    }
+
+    #[test]
+    fn confidential_native_defaults_when_no_owner_choice() {
+        // Neither source has a servable model → the small default.
+        assert_eq!(pick_confidential_native_model(&[], None, DEFAULT), DEFAULT);
+        assert_eq!(
+            pick_confidential_native_model(&v(&["stub"]), Some("stub"), DEFAULT),
+            DEFAULT
+        );
+        assert_eq!(
+            pick_confidential_native_model(&[], Some(""), DEFAULT),
+            DEFAULT
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3114,6 +3325,57 @@ mod vision_fault_tests {
 }
 
 #[cfg(test)]
+mod active_gate_tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_active_serves_and_confirmed_pause_waits() {
+        let mut paused = false;
+        assert_eq!(
+            active_gate_decision(Some(true), &mut paused),
+            ActiveGate::Serve
+        );
+        assert!(!paused);
+        assert_eq!(
+            active_gate_decision(Some(false), &mut paused),
+            ActiveGate::Wait
+        );
+        assert!(paused, "a confirmed pause latches");
+    }
+
+    #[test]
+    fn a_read_blip_after_a_confirmed_pause_stays_paused() {
+        // The regression: owner pauses (Some(false)); then the next read blips
+        // (None). The machine must STAY paused — a blip can't un-pause it.
+        let mut paused = false;
+        assert_eq!(
+            active_gate_decision(Some(false), &mut paused),
+            ActiveGate::Wait
+        );
+        assert_eq!(
+            active_gate_decision(None, &mut paused),
+            ActiveGate::Wait,
+            "an unresolved read must never un-pause a confirmed-paused machine"
+        );
+        // …and once the owner resumes (Some(true)), it serves.
+        assert_eq!(
+            active_gate_decision(Some(true), &mut paused),
+            ActiveGate::Serve
+        );
+    }
+
+    #[test]
+    fn a_read_blip_with_no_prior_pause_serves_optimistically() {
+        // A PDS outage at startup (never confirmed a pause) must not strand a
+        // healthy machine offline — serve, and let the advisor's control poll
+        // catch a pause if there is one.
+        let mut paused = false;
+        assert_eq!(active_gate_decision(None, &mut paused), ActiveGate::Serve);
+        assert!(!paused);
+    }
+}
+
+#[cfg(test)]
 mod offline_marker_tests {
     use super::*;
     use cocore_provider::pds::{ProviderRecord, TrustLevel};
@@ -3159,26 +3421,30 @@ mod offline_marker_tests {
         }
     }
 
+    use cocore_provider::pds::merge_agent_provider_fields;
+
     /// The regression: a machine the owner just PAUSED (`active=false` on the
-    /// live PDS record) must stay paused after the agent writes its
-    /// shutdown offline marker. Before the fix the marker was the
-    /// agent-built record (active=None) written blind, which omitted
-    /// `active` and let it read back as the default `true` — un-pausing the
-    /// machine so the tray reconciler restarted it.
+    /// live PDS record) must stay paused after the agent writes its shutdown
+    /// offline marker. The marker is the agent-built record (`active=None`);
+    /// merging it onto the live record must keep the live `active=false`.
     #[test]
     fn offline_marker_keeps_a_paused_machine_paused() {
         let mut offline = agent_built_record();
         offline.serving = Some(false);
         let live = serde_json::json!({ "active": false, "serving": true });
 
-        preserve_console_fields(&mut offline, &live);
+        let merged = merge_agent_provider_fields(&live, &offline);
 
-        assert_eq!(offline.active, Some(false), "pause must be preserved");
-        // And it must SERIALIZE with active:false present — the whole bug was
-        // the field being omitted, so an absent field reading back as `true`.
-        let json = serde_json::to_value(&offline).unwrap();
-        assert_eq!(json.get("active"), Some(&serde_json::json!(false)));
-        assert_eq!(json.get("serving"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            merged.get("active"),
+            Some(&serde_json::json!(false)),
+            "pause preserved"
+        );
+        assert_eq!(
+            merged.get("serving"),
+            Some(&serde_json::json!(false)),
+            "agent serving=false applied"
+        );
     }
 
     /// The reverse must also hold: quitting a SERVING machine must not
@@ -3189,72 +3455,141 @@ mod offline_marker_tests {
         offline.serving = Some(false);
         let live = serde_json::json!({ "active": true });
 
-        preserve_console_fields(&mut offline, &live);
+        let merged = merge_agent_provider_fields(&live, &offline);
 
-        assert_eq!(offline.active, Some(true));
+        assert_eq!(merged.get("active"), Some(&serde_json::json!(true)));
     }
 
-    /// `payoutsEnabled` and `desiredModels` ride the same path and must be
-    /// carried through too (regression guard for the broader clobber).
+    /// Every owner-intent field on the live record rides through an agent
+    /// re-publish untouched — the agent never authors them, so the merge keeps
+    /// the live values verbatim.
     #[test]
-    fn offline_marker_preserves_payouts_and_desired_models() {
-        let mut offline = agent_built_record();
+    fn merge_preserves_all_owner_intent_fields() {
+        let offline = agent_built_record();
         let live = serde_json::json!({
             "active": false,
             "payoutsEnabled": true,
             "desiredModels": ["mlx-community/Qwen2.5-3B-Instruct-4bit", "stub"],
-            "desiredTier": "attested-confidential"
-        });
-
-        preserve_console_fields(&mut offline, &live);
-
-        assert_eq!(offline.payoutsEnabled, Some(true));
-        assert_eq!(
-            offline.desiredModels,
-            Some(vec![
-                "mlx-community/Qwen2.5-3B-Instruct-4bit".to_string(),
-                "stub".to_string()
-            ])
-        );
-        // The owner's confidential opt-in survives a re-publish.
-        assert_eq!(
-            offline.desiredTier,
-            Some("attested-confidential".to_string())
-        );
-    }
-
-    /// The owner's console-written pro-bono election and location-sharing
-    /// opt-in ride the same preserve path — a re-publish must not drop them.
-    #[test]
-    fn preserve_carries_pro_bono_and_share_location() {
-        let mut rebuilt = agent_built_record();
-        let live = serde_json::json!({
+            "desiredTier": "attested-confidential",
             "proBono": { "mode": "direct", "dids": ["did:plc:friend"] },
             "shareLocation": true
         });
 
-        preserve_console_fields(&mut rebuilt, &live);
+        let merged = merge_agent_provider_fields(&live, &offline);
 
-        let pro_bono = rebuilt.proBono.expect("pro-bono election preserved");
-        assert_eq!(pro_bono.mode, "direct");
-        assert_eq!(pro_bono.dids, vec!["did:plc:friend".to_string()]);
-        assert_eq!(rebuilt.shareLocation, Some(true));
+        assert_eq!(merged.get("active"), Some(&serde_json::json!(false)));
+        assert_eq!(merged.get("payoutsEnabled"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            merged.get("desiredModels"),
+            Some(&serde_json::json!([
+                "mlx-community/Qwen2.5-3B-Instruct-4bit",
+                "stub"
+            ]))
+        );
+        assert_eq!(
+            merged.get("desiredTier"),
+            Some(&serde_json::json!("attested-confidential"))
+        );
+        assert_eq!(
+            merged.get("proBono"),
+            Some(&serde_json::json!({ "mode": "direct", "dids": ["did:plc:friend"] }))
+        );
+        assert_eq!(merged.get("shareLocation"), Some(&serde_json::json!(true)));
     }
 
-    /// When the live record has no switches set (a brand-new machine), the
-    /// fields stay `None` — we don't fabricate values.
+    /// THE property that kills the whole bug class: a field this agent build has
+    /// never heard of (a future owner setting) is preserved by default. The old
+    /// allowlist would have dropped it.
     #[test]
-    fn offline_marker_leaves_absent_switches_absent() {
-        let mut offline = agent_built_record();
-        let live = serde_json::json!({ "serving": true });
+    fn merge_preserves_an_unknown_future_field() {
+        let offline = agent_built_record();
+        let live = serde_json::json!({
+            "active": true,
+            "someFutureOwnerToggle": { "nested": [1, 2, 3] }
+        });
 
-        preserve_console_fields(&mut offline, &live);
+        let merged = merge_agent_provider_fields(&live, &offline);
 
-        assert_eq!(offline.active, None);
-        assert_eq!(offline.payoutsEnabled, None);
-        assert_eq!(offline.desiredModels, None);
-        assert_eq!(offline.desiredTier, None);
-        assert!(offline.proBono.is_none());
-        assert_eq!(offline.shareLocation, None);
+        assert_eq!(
+            merged.get("someFutureOwnerToggle"),
+            Some(&serde_json::json!({ "nested": [1, 2, 3] })),
+            "an unknown field must survive an agent re-publish"
+        );
+    }
+
+    /// The agent OWNS its fields: it overwrites present ones and CLEARS the
+    /// optional ones it no longer emits (a stale tier / engineFault / region).
+    #[test]
+    fn merge_overwrites_agent_fields_and_clears_absent_ones() {
+        let mut rebuilt = agent_built_record();
+        rebuilt.supportedModels =
+            vec!["mlx-community/gemma-3-4b-it-qat-4bit".into(), "stub".into()];
+        // Healthy this serve: no fault, not confidential, not sharing location.
+        rebuilt.engineFault = None;
+        rebuilt.tier = None;
+        rebuilt.region = None;
+        let live = serde_json::json!({
+            "supportedModels": ["old-model"],
+            "engineFault": { "code": "stale", "message": "old", "models": [], "at": "2020-01-01T00:00:00Z" },
+            "tier": "attested-confidential",
+            "region": "US",
+            "active": true
+        });
+
+        let merged = merge_agent_provider_fields(&live, &rebuilt);
+
+        // Always-present agent field overwritten.
+        assert_eq!(
+            merged.get("supportedModels"),
+            Some(&serde_json::json!([
+                "mlx-community/gemma-3-4b-it-qat-4bit",
+                "stub"
+            ]))
+        );
+        // Stale agent-authored optional fields cleared.
+        assert_eq!(merged.get("engineFault"), None, "cleared fault");
+        assert_eq!(merged.get("tier"), None, "cleared achieved tier");
+        assert_eq!(merged.get("region"), None, "cleared region");
+        // Owner field still preserved.
+        assert_eq!(merged.get("active"), Some(&serde_json::json!(true)));
+    }
+
+    /// Defence in depth: even if a bug populated an owner-intent field on the
+    /// agent record, the merge must NOT write it — the live value wins.
+    #[test]
+    fn merge_never_lets_the_agent_write_an_owner_field() {
+        let mut rebuilt = agent_built_record();
+        rebuilt.active = Some(true); // agent erroneously authoring an owner field
+        rebuilt.desiredModels = Some(vec!["agent-should-not-set-this".into()]);
+        let live = serde_json::json!({ "active": false, "desiredModels": ["owner-choice"] });
+
+        let merged = merge_agent_provider_fields(&live, &rebuilt);
+
+        assert_eq!(
+            merged.get("active"),
+            Some(&serde_json::json!(false)),
+            "owner value wins"
+        );
+        assert_eq!(
+            merged.get("desiredModels"),
+            Some(&serde_json::json!(["owner-choice"])),
+            "agent can never overwrite the owner's model pick"
+        );
+    }
+
+    /// First publish (empty base): the agent authors everything; owner-intent
+    /// fields are simply absent, which is correct for a brand-new machine.
+    #[test]
+    fn merge_onto_empty_base_yields_agent_fields_only() {
+        let rebuilt = agent_built_record();
+        let merged = merge_agent_provider_fields(&serde_json::json!({}), &rebuilt);
+
+        assert_eq!(merged.get("chip"), Some(&serde_json::json!("Apple M1")));
+        assert_eq!(
+            merged.get("supportedModels"),
+            Some(&serde_json::json!(["stub"]))
+        );
+        assert_eq!(merged.get("active"), None);
+        assert_eq!(merged.get("desiredModels"), None);
     }
 }

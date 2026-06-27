@@ -70,14 +70,14 @@ const ENV_KEY: &str = "EnvironmentVariables:COCORE_INFERENCE_MODELS";
 #[cfg(target_os = "macos")]
 const LEGACY_ENV_KEY: &str = "EnvironmentVariables:COCORE_INFERENCE_MODEL";
 
-pub fn run(cmd: ModelsCmd) -> Result<()> {
+pub async fn run(cmd: ModelsCmd) -> Result<()> {
     match cmd {
         ModelsCmd::List => list(),
         ModelsCmd::Set { models } => {
             let next = normalize(&models);
             let prev = read_current().unwrap_or_default();
             let added: Vec<String> = next.iter().filter(|m| !prev.contains(m)).cloned().collect();
-            commit(&next, "set", &added)
+            commit(&next, "set", &added).await
         }
         ModelsCmd::Add { model } => {
             // Resolve the model id: either the explicit positional or
@@ -111,7 +111,7 @@ pub fn run(cmd: ModelsCmd) -> Result<()> {
                 return Ok(());
             }
             current.push(m.clone());
-            commit(&current, "add", std::slice::from_ref(&m))
+            commit(&current, "add", std::slice::from_ref(&m)).await
         }
         ModelsCmd::Remove { model } => {
             let m = model.trim();
@@ -122,7 +122,7 @@ pub fn run(cmd: ModelsCmd) -> Result<()> {
                 println!("'{m}' was not in the list; no change.");
                 return Ok(());
             }
-            commit(&current, "remove", &[])
+            commit(&current, "remove", &[]).await
         }
     }
 }
@@ -185,11 +185,33 @@ fn normalize(raw: &str) -> Vec<String> {
     out
 }
 
-fn commit(models: &[String], verb: &str, await_models: &[String]) -> Result<()> {
+async fn commit(models: &[String], verb: &str, await_models: &[String]) -> Result<()> {
     let joined = models.join(",");
+
+    // Percolate the owner's model pick to the PDS source of truth FIRST, on
+    // every platform: write `desiredModels` (the same field the website's model
+    // picker sets) so the choice propagates to the AppView, the confidential
+    // native engine, and any serving sibling that reconciles — not just the
+    // local plist. On macOS this complements the plist+bounce below; on a
+    // never-served machine it's a no-op (the plist carries the set until first
+    // serve). A failure here is non-fatal on macOS (the local plist write still
+    // drives this machine, and the next serve republish reconciles), but we
+    // surface it so the user knows cross-device sync is delayed.
+    let pds_wrote = match crate::cmd_set_desired_models(models.to_vec()).await {
+        Ok(wrote) => wrote,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't write desiredModels to PDS");
+            eprintln!(
+                "warning: couldn't sync your model choice to your account ({e}). \
+                 Applied locally; it will sync on the next serve."
+            );
+            false
+        }
+    };
 
     #[cfg(target_os = "macos")]
     {
+        let _ = pds_wrote;
         let plist = plist_path()?;
         write_env_var(&plist, ENV_KEY, &joined)
             .with_context(|| format!("updating {ENV_KEY} in {}", plist.display()))?;
@@ -246,12 +268,24 @@ fn commit(models: &[String], verb: &str, await_models: &[String]) -> Result<()> 
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (models, verb, await_models, joined);
-        anyhow::bail!(
-            "`cocore agent models` mutations require macOS today (the plist + LaunchAgent live there). \
-             On Linux, edit your service-manager env file to set COCORE_INFERENCE_MODELS and restart \
-             the unit."
-        )
+        let _ = (verb, await_models, joined);
+        // On Linux there's no LaunchAgent to edit/bounce, but the PDS write
+        // above IS the action: a serving agent reconciles `desiredModels` on its
+        // ~30s poll (and restarts to reload). So this is no longer a hard error.
+        if pds_wrote {
+            println!(
+                "Wrote your model selection ({} model(s)) to your account. A running agent will \
+                 reconcile within ~30s and reload; restart the service to apply immediately.",
+                models.len()
+            );
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Couldn't sync the model selection — this machine has no provider record yet \
+                 (has it served at least once?). On Linux, also set COCORE_INFERENCE_MODELS in \
+                 your service-manager env file and restart the unit."
+            )
+        }
     }
 }
 
