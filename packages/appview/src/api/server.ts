@@ -111,6 +111,30 @@ function buildInternalAccountRouter(
         return ok({ key: out.key, secret: out.secret });
       }).pipe(Effect.withSpan("appview.internal.mintKey")),
     ),
+    // Resolve a presented bearer key to its owning DID against THIS store.
+    // The console's inference path calls this so a key minted via the
+    // (documented) AppView `createApiKey` — which lands in account.db, a
+    // different store than the console's console.db — still authenticates at
+    // `cocore.dev/v1/chat/completions`. Returns 404 when the key is unknown,
+    // revoked, or expired (resolveBearerKey collapses all three to null), so
+    // the caller never distinguishes those cases.
+    HttpRouter.post(
+      "/internal/account/resolve-key",
+      Effect.gen(function* () {
+        if (!(yield* authorized)) return err(403, { error: "Forbidden" });
+        const parsed = yield* Effect.either(jsonBody);
+        if (parsed._tag === "Left") {
+          return err(400, { error: "InvalidRequest", message: "body must be JSON" });
+        }
+        const body = parsed.right as { key?: unknown };
+        if (typeof body.key !== "string" || body.key.length === 0) {
+          return err(400, { error: "InvalidRequest", message: "key required" });
+        }
+        const resolved = accountStore.resolveBearerKey(body.key);
+        if (!resolved) return err(404, { error: "NotFound", message: "key not resolvable" });
+        return ok({ id: resolved.id, did: resolved.did, name: resolved.name });
+      }).pipe(Effect.withSpan("appview.internal.resolveKey")),
+    ),
     // AppView half of the console's "reset connection" repair flow:
     // revoke all of a DID's API keys + drop its OAuth session so the user
     // can re-pair from a clean slate. (merged from main #33)

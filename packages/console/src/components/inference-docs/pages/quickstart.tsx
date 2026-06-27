@@ -103,7 +103,18 @@ export function InferenceQuickstartPage({ baseUrl }: { baseUrl: string }) {
       <HighlightedBlock code="Authorization: Bearer cocore-..." lang="bash" />
       <CreateApiKeyOrLoginButton redirectTo="/docs/inference/quickstart" />
       <p {...stylex.props(docsStyles.prose)}>
-        Invalid or missing keys return{" "}
+        Building on top of AT Protocol? Skip key provisioning entirely: mint a service-auth token
+        from the caller&apos;s PDS (
+        <code {...stylex.props(docsStyles.codeInline)}>com.atproto.server.getServiceAuth</code> with{" "}
+        <code {...stylex.props(docsStyles.codeInline)}>aud=did:web:console.cocore.dev</code> and{" "}
+        <code {...stylex.props(docsStyles.codeInline)}>lxm=dev.cocore.inference.dispatch</code>) and
+        pass it as the Bearer token. Inference then runs on behalf of the token&apos;s issuer DID.
+        The DID must have connected co/core once so a session exists to publish the job to its PDS;
+        otherwise the request returns{" "}
+        <code {...stylex.props(docsStyles.codeInline)}>401 onboarding_required</code>.
+      </p>
+      <p {...stylex.props(docsStyles.prose)}>
+        Invalid or missing credentials return{" "}
         <code {...stylex.props(docsStyles.codeInline)}>401 authentication_error</code>. See{" "}
         <InferenceApiDocLink fragment="inference-api-http-errors">HTTP errors</InferenceApiDocLink>{" "}
         for the full envelope.
