@@ -29,6 +29,10 @@ pub fn detect() -> Option<bool> {
     {
         return Some(false);
     }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        return Some(aarch64_linux::has_hypervisor());
+    }
     #[allow(unreachable_code)]
     None
 }
@@ -40,6 +44,10 @@ pub fn vendor() -> Option<String> {
     #[cfg(target_arch = "x86_64")]
     {
         return x86_64::vendor_string();
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        return aarch64_linux::vendor_from_sysfs();
     }
     #[allow(unreachable_code)]
     None
@@ -76,6 +84,40 @@ mod x86_64 {
             .map(|b| b as char)
             .collect();
         Some(s)
+    }
+}
+
+/// Linux aarch64: no CPUID hypervisor leaf. Fall back to `/sys/hypervisor/type`
+/// (populated by Xen/KVM/Hyper-V) and `/proc/cpuinfo` "Hypervisor vendor".
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod aarch64_linux {
+    use std::fs;
+
+    pub fn has_hypervisor() -> bool {
+        if let Ok(t) = fs::read_to_string("/sys/hypervisor/type") {
+            let t = t.trim();
+            if !t.is_empty() {
+                return true;
+            }
+        }
+        if let Ok(info) = fs::read_to_string("/proc/cpuinfo") {
+            for line in info.lines() {
+                if line.starts_with("Hypervisor vendor") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn vendor_from_sysfs() -> Option<String> {
+        if let Ok(t) = fs::read_to_string("/sys/hypervisor/type") {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+        None
     }
 }
 
