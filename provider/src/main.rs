@@ -208,6 +208,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
 
+    // Install a process-default rustls CryptoProvider before any TLS
+    // handshake (the advisor WebSocket, the OpenAI engine, PDS/console
+    // HTTPS). With both aws-lc-rs and ring compiled in (from
+    // tokio-tungstenite and reqwest), rustls 0.23 can't auto-select and
+    // panics. We pick aws-lc-rs (the rustls default). Idempotent: a
+    // second call returns Err which we ignore.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     match cli.cmd {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
         Cmd::Agent(AgentCmd::Serve { advisor }) => cmd_serve_entry(advisor).await,
