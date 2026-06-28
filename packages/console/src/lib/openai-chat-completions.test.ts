@@ -762,11 +762,20 @@ describe("streamingResponse with tool calls", () => {
     const data = await readSseData(res);
     assert.equal(data.at(-1), "[DONE]");
 
-    // Find the chunk that carries tool_calls (skip [DONE] terminator).
-    const toolCallChunk = data
+    const chunks = data
       .filter((d) => d !== "[DONE]")
-      .map((d) => JSON.parse(d) as { choices: Array<{ delta: { tool_calls?: unknown[] } }> })
-      .find((c) => c.choices[0]?.delta.tool_calls);
+      .map(
+        (d) =>
+          JSON.parse(d) as {
+            choices: Array<{
+              delta: { tool_calls?: unknown[] };
+              finish_reason: string | null;
+            }>;
+          },
+      );
+
+    // Find the chunk that carries tool_calls (skip [DONE] terminator).
+    const toolCallChunk = chunks.find((c) => c.choices[0]?.delta.tool_calls);
 
     assert.ok(toolCallChunk, "at least one SSE chunk should carry delta.tool_calls");
     const tc = toolCallChunk!.choices[0]!.delta.tool_calls as Array<{
@@ -776,6 +785,9 @@ describe("streamingResponse with tool calls", () => {
     assert.equal(tc[0]!.id, "call_abc");
     assert.equal(tc[0]!.function.name, "get_weather");
     assert.equal(tc[0]!.function.arguments, '{"city":"Tokyo"}');
+
+    const finalChunk = chunks.at(-1)!;
+    assert.equal(finalChunk.choices[0]!.finish_reason, "tool_calls");
   });
 
   test("emits content and tool_calls in separate SSE chunks", async () => {

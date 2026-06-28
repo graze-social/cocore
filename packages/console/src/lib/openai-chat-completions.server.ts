@@ -681,6 +681,7 @@ export function streamingResponse(
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (s: string) => controller.enqueue(encoder.encode(`data: ${s}\n\n`));
+      let emittedToolCalls = false;
       // OpenAI clients expect a leading role-only delta.
       send(chunkPayload(id, model, { role: "assistant" }, null));
 
@@ -692,6 +693,7 @@ export function streamingResponse(
             if (ev.channel === "tool_call") {
               try {
                 const toolCalls = JSON.parse(ev.text);
+                emittedToolCalls = true;
                 send(chunkPayload(id, model, { tool_calls: toolCalls }, null));
               } catch {
                 // Malformed tool_call JSON — skip rather than crash the stream.
@@ -704,10 +706,19 @@ export function streamingResponse(
               send(chunkPayload(id, model, delta, null));
             }
           } else if (ev.kind === "complete") {
-            // The final `stop` chunk carries the x_cocore credit so a
-            // streaming client gets the same "who ran it" metadata the
-            // buffered path returns.
-            send(chunkPayload(id, model, {}, "stop", cocoreMeta(ev.providerCredit, ev.receiptUri)));
+            // The final chunk carries the x_cocore credit so a streaming
+            // client gets the same "who ran it" metadata the buffered path
+            // returns. If the stream emitted tool_call deltas, use the OpenAI
+            // finish_reason that tells agents to execute the accumulated calls.
+            send(
+              chunkPayload(
+                id,
+                model,
+                {},
+                emittedToolCalls ? "tool_calls" : "stop",
+                cocoreMeta(ev.providerCredit, ev.receiptUri),
+              ),
+            );
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             return;
           } else if (ev.kind === "error") {
@@ -762,7 +773,7 @@ export async function bufferedResponse(
 ): Promise<Response> {
   let content = "";
   let reasoning = "";
-  let toolCallChunks: string[] = [];
+  const toolCallChunks: string[] = [];
   let tokensIn = 0;
   let tokensOut = 0;
   let providerCredit: ProviderCredit | undefined;

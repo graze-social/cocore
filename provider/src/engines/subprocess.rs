@@ -1213,7 +1213,8 @@ impl SubprocessEngine {
         splitter: &mut ThinkTagSplitter,
         on_data: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
         tokens: &mut (u64, u64),
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut emitted_delta = false;
         while *cursor < buf.len() {
             let rest = &buf[*cursor..];
             let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
@@ -1248,6 +1249,7 @@ impl SubprocessEngine {
                 .and_then(|c| c.as_str())
             {
                 if !reasoning.is_empty() {
+                    emitted_delta = true;
                     on_data(DeltaChannel::Reasoning, reasoning)?;
                 }
             }
@@ -1259,6 +1261,7 @@ impl SubprocessEngine {
                 if !tool_calls.is_null() {
                     let json = serde_json::to_string(tool_calls).unwrap_or_default();
                     if !json.is_empty() {
+                        emitted_delta = true;
                         on_data(DeltaChannel::ToolCall, &json)?;
                     }
                 }
@@ -1271,6 +1274,7 @@ impl SubprocessEngine {
                 .and_then(|c| c.as_str())
             {
                 if !content.is_empty() {
+                    emitted_delta = true;
                     splitter.push(content, on_data)?;
                 }
             }
@@ -1287,7 +1291,7 @@ impl SubprocessEngine {
             buf.drain(..*cursor);
             *cursor = 0;
         }
-        Ok(())
+        Ok(emitted_delta)
     }
 
     fn http_post_stream_uds(
@@ -1338,7 +1342,7 @@ impl SubprocessEngine {
 
         let started = Instant::now();
         let mut last_progress = Instant::now();
-        let mut body_started = false;
+        let mut meaningful_stream_started = false;
 
         loop {
             let n = match stream.read(&mut read_buf) {
@@ -1357,7 +1361,7 @@ impl SubprocessEngine {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    if body_started {
+                    if meaningful_stream_started {
                         if last_progress.elapsed() > HTTP_STREAM_IDLE_TIMEOUT {
                             bail!(
                                 "engine stream stalled (no bytes for {}s)",
@@ -1379,7 +1383,7 @@ impl SubprocessEngine {
                 }
                 Err(e) => return Err(e.into()),
             };
-            last_progress = Instant::now();
+            let read_at = Instant::now();
             buf.extend_from_slice(&read_buf[..n]);
 
             if header_end.is_none() {
@@ -1399,21 +1403,25 @@ impl SubprocessEngine {
                     continue;
                 }
             }
-            // Latch once real body bytes are in hand: only then does a quiet
-            // slice mean a mid-stream idle rather than first-token prefill. We
-            // fall through to process here (rather than `continue`-ing) so a
-            // response whose head and body land in the same read isn't dropped.
-            if body_cursor < buf.len() {
-                body_started = true;
-            }
-
-            Self::process_sse_buffer(
+            // Do not treat every SSE body byte as meaningful stream progress:
+            // vLLM/vllm-mlx often emits an initial role/empty chunk, then goes
+            // quiet while it finishes a buffered tool call. Stay on the longer
+            // first-token budget until we see content, reasoning, or tool_calls.
+            // Once meaningful output has started, any subsequent body byte is
+            // progress for the mid-stream idle timer.
+            let emitted_delta = Self::process_sse_buffer(
                 &mut buf,
                 &mut body_cursor,
                 &mut splitter,
                 on_delta,
                 &mut tokens,
             )?;
+            if emitted_delta {
+                meaningful_stream_started = true;
+                last_progress = read_at;
+            } else if meaningful_stream_started {
+                last_progress = read_at;
+            }
         }
         // Flush any partial <think> marker held at end of stream.
         splitter.finish(on_delta)?;
@@ -2080,6 +2088,60 @@ mod tests {
         let second: serde_json::Value =
             serde_json::from_str(tool_call_deltas[1]).expect("second delta is JSON");
         assert_eq!(second[0]["function"]["arguments"], "{\"city\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn process_sse_buffer_reports_only_meaningful_deltas_as_progress() {
+        let mut buf = Vec::new();
+        let mut cursor = 0;
+        let mut splitter = ThinkTagSplitter::new();
+        let mut deltas: Vec<(DeltaChannel, String)> = Vec::new();
+        let mut tokens = (0u64, 0u64);
+
+        // vllm-mlx commonly emits a leading role-only SSE chunk before doing
+        // the expensive/buffered tool-call work. That chunk should not switch
+        // the UDS reader from the first-token budget to the mid-stream idle
+        // budget, because no user-visible content/tool_call has arrived yet.
+        let role_only =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+        buf.extend_from_slice(role_only.as_bytes());
+        let emitted = {
+            let mut on_data = |ch: DeltaChannel, s: &str| {
+                deltas.push((ch, s.to_string()));
+                Ok(())
+            };
+            SubprocessEngine::process_sse_buffer(
+                &mut buf,
+                &mut cursor,
+                &mut splitter,
+                &mut on_data,
+                &mut tokens,
+            )
+        }
+        .unwrap();
+        assert!(
+            !emitted,
+            "role-only chunks are not meaningful stream progress"
+        );
+        assert!(deltas.is_empty());
+
+        let tool_call = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n";
+        buf.extend_from_slice(tool_call.as_bytes());
+        let emitted = {
+            let mut on_data = |ch: DeltaChannel, s: &str| {
+                deltas.push((ch, s.to_string()));
+                Ok(())
+            };
+            SubprocessEngine::process_sse_buffer(
+                &mut buf,
+                &mut cursor,
+                &mut splitter,
+                &mut on_data,
+                &mut tokens,
+            )
+        }
+        .unwrap();
+        assert!(emitted, "tool_call chunks are meaningful stream progress");
     }
 
     #[test]
