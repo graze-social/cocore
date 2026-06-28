@@ -412,10 +412,21 @@ const READY_HARD_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 /// ceiling vllm-mlx's `--timeout` uses by default.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Idle timeout between streamed body reads. Reset implicitly on each
-/// successful read; if the engine stalls mid-stream for longer than
-/// this we treat it as a disconnect.
+/// Idle timeout between streamed body reads, applied only AFTER the
+/// engine has started emitting the response body. The wait for the
+/// *first* token is governed by `HTTP_TIMEOUT` instead (see
+/// `http_post_stream_uds`): a large tool-schema prompt can spend well
+/// over a minute in prefill on slow hardware before the first SSE byte,
+/// and that must not be mistaken for a mid-stream stall.
 const HTTP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Granularity at which the streaming read loop wakes to re-evaluate its
+/// time budgets. The socket read timeout is set to this short slice so a
+/// `WouldBlock`/`TimedOut` wakeup lets us decide whether we're still
+/// within the first-token (`HTTP_TIMEOUT`) or idle
+/// (`HTTP_STREAM_IDLE_TIMEOUT`) budget rather than bailing on the first
+/// quiet slice.
+const HTTP_STREAM_READ_POLL: Duration = Duration::from_secs(5);
 
 /// vLLM/vllm-mlx tool-calling launch configuration.
 ///
@@ -1196,13 +1207,17 @@ impl SubprocessEngine {
 
     /// Drain complete `data:` lines from an SSE body buffer. Returns
     /// when the buffer ends mid-line so the caller can read more bytes.
+    ///
+    /// The boolean return value reports whether this call emitted at least
+    /// one meaningful, user-visible delta (content, reasoning, or tool_calls).
     fn process_sse_buffer(
         buf: &mut Vec<u8>,
         cursor: &mut usize,
         splitter: &mut ThinkTagSplitter,
         on_data: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
         tokens: &mut (u64, u64),
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut emitted_delta = false;
         while *cursor < buf.len() {
             let rest = &buf[*cursor..];
             let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
@@ -1237,6 +1252,7 @@ impl SubprocessEngine {
                 .and_then(|c| c.as_str())
             {
                 if !reasoning.is_empty() {
+                    emitted_delta = true;
                     on_data(DeltaChannel::Reasoning, reasoning)?;
                 }
             }
@@ -1248,6 +1264,7 @@ impl SubprocessEngine {
                 if !tool_calls.is_null() {
                     let json = serde_json::to_string(tool_calls).unwrap_or_default();
                     if !json.is_empty() {
+                        emitted_delta = true;
                         on_data(DeltaChannel::ToolCall, &json)?;
                     }
                 }
@@ -1260,6 +1277,7 @@ impl SubprocessEngine {
                 .and_then(|c| c.as_str())
             {
                 if !content.is_empty() {
+                    emitted_delta = true;
                     splitter.push(content, on_data)?;
                 }
             }
@@ -1276,7 +1294,7 @@ impl SubprocessEngine {
             buf.drain(..*cursor);
             *cursor = 0;
         }
-        Ok(())
+        Ok(emitted_delta)
     }
 
     fn http_post_stream_uds(
@@ -1293,7 +1311,9 @@ impl SubprocessEngine {
             )
         })?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_read_timeout(Some(HTTP_STREAM_IDLE_TIMEOUT))?;
+        // Poll in short slices; the loop below converts a quiet slice into a
+        // first-token vs. mid-stream-stall decision against the budgets above.
+        stream.set_read_timeout(Some(HTTP_STREAM_READ_POLL))?;
 
         let req_head = format!(
             "POST {path} HTTP/1.1\r\n\
@@ -1323,18 +1343,50 @@ impl SubprocessEngine {
             ThinkTagSplitter::new()
         };
 
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        let mut meaningful_stream_started = false;
+
         loop {
             let n = match stream.read(&mut read_buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    bail!(
-                        "engine stream stalled (no bytes for {}s)",
-                        HTTP_STREAM_IDLE_TIMEOUT.as_secs()
-                    );
+                // A read interrupted by a signal is not an error — re-arm.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // The socket read timeout (`SO_RCVTIMEO`) expired with no
+                // bytes this slice. Rust maps that to `WouldBlock` on Unix
+                // (EAGAIN, "Resource temporarily unavailable", os error 35)
+                // and `TimedOut` on Windows — both mean the same thing here.
+                // Decide whether we're still within budget or genuinely stuck.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if meaningful_stream_started {
+                        if last_progress.elapsed() > HTTP_STREAM_IDLE_TIMEOUT {
+                            bail!(
+                                "engine stream stalled (no bytes for {}s)",
+                                HTTP_STREAM_IDLE_TIMEOUT.as_secs()
+                            );
+                        }
+                    } else if started.elapsed() > HTTP_TIMEOUT {
+                        // Still waiting for the first token. Tool-enabled
+                        // requests carry the full tool schemas, so prefill of
+                        // a big prompt on slow hardware can legitimately run
+                        // for minutes before the first SSE byte; allow the
+                        // same ceiling the non-streaming path uses.
+                        bail!(
+                            "engine produced no output within {}s",
+                            HTTP_TIMEOUT.as_secs()
+                        );
+                    }
+                    continue;
                 }
                 Err(e) => return Err(e.into()),
             };
+            let read_at = Instant::now();
             buf.extend_from_slice(&read_buf[..n]);
 
             if header_end.is_none() {
@@ -1347,17 +1399,32 @@ impl SubprocessEngine {
                     }
                     header_end = Some(end);
                     body_cursor = end;
+                } else {
+                    // Headers still incomplete — keep reading. (uvicorn flushes
+                    // the response head before the model's first token, so a
+                    // long prefill gap lands AFTER this point, not here.)
+                    continue;
                 }
-                continue;
             }
-
-            Self::process_sse_buffer(
+            // Do not treat every SSE body byte as meaningful stream progress:
+            // vLLM/vllm-mlx often emits an initial role/empty chunk, then goes
+            // quiet while it finishes a buffered tool call. Stay on the longer
+            // first-token budget until we see content, reasoning, or tool_calls.
+            // Once meaningful output has started, any subsequent body byte is
+            // progress for the mid-stream idle timer.
+            let emitted_delta = Self::process_sse_buffer(
                 &mut buf,
                 &mut body_cursor,
                 &mut splitter,
                 on_delta,
                 &mut tokens,
             )?;
+            if emitted_delta {
+                meaningful_stream_started = true;
+            }
+            if meaningful_stream_started {
+                last_progress = read_at;
+            }
         }
         // Flush any partial <think> marker held at end of stream.
         splitter.finish(on_delta)?;
@@ -2027,6 +2094,60 @@ mod tests {
     }
 
     #[test]
+    fn process_sse_buffer_reports_only_meaningful_deltas_as_progress() {
+        let mut buf = Vec::new();
+        let mut cursor = 0;
+        let mut splitter = ThinkTagSplitter::new();
+        let mut deltas: Vec<(DeltaChannel, String)> = Vec::new();
+        let mut tokens = (0u64, 0u64);
+
+        // vllm-mlx commonly emits a leading role-only SSE chunk before doing
+        // the expensive/buffered tool-call work. That chunk should not switch
+        // the UDS reader from the first-token budget to the mid-stream idle
+        // budget, because no user-visible content/tool_call has arrived yet.
+        let role_only =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+        buf.extend_from_slice(role_only.as_bytes());
+        let emitted = {
+            let mut on_data = |ch: DeltaChannel, s: &str| {
+                deltas.push((ch, s.to_string()));
+                Ok(())
+            };
+            SubprocessEngine::process_sse_buffer(
+                &mut buf,
+                &mut cursor,
+                &mut splitter,
+                &mut on_data,
+                &mut tokens,
+            )
+        }
+        .unwrap();
+        assert!(
+            !emitted,
+            "role-only chunks are not meaningful stream progress"
+        );
+        assert!(deltas.is_empty());
+
+        let tool_call = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n";
+        buf.extend_from_slice(tool_call.as_bytes());
+        let emitted = {
+            let mut on_data = |ch: DeltaChannel, s: &str| {
+                deltas.push((ch, s.to_string()));
+                Ok(())
+            };
+            SubprocessEngine::process_sse_buffer(
+                &mut buf,
+                &mut cursor,
+                &mut splitter,
+                &mut on_data,
+                &mut tokens,
+            )
+        }
+        .unwrap();
+        assert!(emitted, "tool_call chunks are meaningful stream progress");
+    }
+
+    #[test]
     fn process_sse_buffer_separates_tool_calls_from_content() {
         let mut buf = Vec::new();
         let mut cursor = 0;
@@ -2067,6 +2188,76 @@ mod tests {
 
         assert_eq!(content, "Let me check");
         assert_eq!(tool_calls.len(), 1);
+    }
+
+    /// Regression for #133. A slow first token — the engine flushes the HTTP
+    /// response head, then goes quiet through a full read-poll slice while it
+    /// prefills a big tool-schema prompt — must NOT abort the request. On
+    /// macOS the socket read timeout surfaces as `WouldBlock` (EAGAIN, os
+    /// error 35, "Resource temporarily unavailable"); an earlier revision only
+    /// caught `TimedOut` and returned that EAGAIN as a fatal error, so every
+    /// tool-enabled request through the advisor failed. The body delivered
+    /// after the gap must still arrive in full.
+    #[test]
+    fn stream_survives_prefill_gap_before_first_token() {
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let engine = SubprocessEngine::new(
+            "test-model",
+            PathBuf::from("/nonexistent/python"),
+            VllmToolConfig::default(),
+        )
+        .expect("construct engine");
+
+        let _ = std::fs::remove_file(&engine.socket_path);
+        let listener = UnixListener::bind(&engine.socket_path).expect("bind uds");
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            // Drain the request head so the client's write completes.
+            let mut req = [0u8; 1024];
+            let _ = conn.read(&mut req);
+            // Flush the HTTP response head immediately (as uvicorn's
+            // StreamingResponse does), then stay silent past one read-poll
+            // slice to emulate prefill of a large prompt before the first token.
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            conn.flush().unwrap();
+            thread::sleep(HTTP_STREAM_READ_POLL + Duration::from_millis(500));
+            // Now deliver the tool call + usage + DONE and close (EOF).
+            conn.write_all(
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                    "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            conn.flush().unwrap();
+        });
+
+        let mut deltas: Vec<(DeltaChannel, String)> = Vec::new();
+        let tokens = engine
+            .http_post_stream_uds("/v1/chat/completions", b"{}", false, &mut |ch, s| {
+                deltas.push((ch, s.to_string()));
+                Ok(())
+            })
+            .expect("stream must survive the prefill gap, not bail on WouldBlock");
+
+        server.join().unwrap();
+
+        assert_eq!(tokens, (10, 5), "usage from after the gap is captured");
+        let tool_calls: Vec<&str> = deltas
+            .iter()
+            .filter(|(ch, _)| *ch == DeltaChannel::ToolCall)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "tool call delivered after the gap");
+        let parsed: serde_json::Value =
+            serde_json::from_str(tool_calls[0]).expect("tool call json");
+        assert_eq!(parsed[0]["function"]["name"], "get_weather");
     }
 
     /// A pathological long home dir + a long model id must still produce an
