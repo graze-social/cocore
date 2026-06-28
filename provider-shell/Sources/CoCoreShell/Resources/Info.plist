@@ -9,7 +9,7 @@
 	<key>CFBundleName</key>
 	<string>co/core</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.9.33</string>
+	<string>0.9.34</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -22,7 +22,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>933</string>
+	<string>934</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
