@@ -2620,6 +2620,57 @@ fn build_engines(
         return (registry, native_fault, vec![]);
     }
 
+    // OpenAI-compatible HTTP engine path (Linux / remote inference). When
+    // COCORE_OPENAI_BASE_URL is set, all models in COCORE_INFERENCE_MODELS
+    // are served via the OpenAI HTTP engine against that endpoint instead
+    // of the vllm-mlx subprocess. This is the primary Linux inference path.
+    if let Ok(base_url) = std::env::var("COCORE_OPENAI_BASE_URL") {
+        let api_key = std::env::var("COCORE_OPENAI_API_KEY").ok();
+        let configured: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut failed: Vec<String> = vec![];
+        for model in &configured {
+            match cocore_provider::engines::openai::OpenAiEngine::new(
+                model.clone(),
+                &base_url,
+                api_key.clone(),
+            ) {
+                Ok(engine) => {
+                    tracing::info!(model = %model, base_url = %base_url, "registered OpenAI-compatible HTTP engine");
+                    registry.register(model.clone(), std::sync::Arc::new(engine));
+                }
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "failed to create OpenAI HTTP engine");
+                    failed.push(model.clone());
+                }
+            }
+        }
+        let fault = if failed.is_empty() {
+            None
+        } else {
+            Some(EngineFault {
+                code: "openai-engine-failed".to_string(),
+                message: format!(
+                    "The OpenAI-compatible HTTP engine for [{}] against {} could not be \
+                     created. The machine is online but only serving the no-op `stub` \
+                     engine for those models.",
+                    failed.join(", "),
+                    base_url,
+                ),
+                models: failed,
+                at: chrono::Utc::now(),
+            })
+        };
+        // Tool calling: we can't probe the OpenAI endpoint's tool-call
+        // capability at build time without a model load, so we report
+        // all configured models as tool-capable and let runtime errors
+        // surface if the endpoint doesn't support them.
+        return (registry, fault, configured);
+    }
+
     // Resolve the venv interpreter once. The install script writes it
     // to `~/.cocore/python/bin/python` via `uv venv`.
     let Some(home) = dirs::home_dir() else {
