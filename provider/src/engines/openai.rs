@@ -76,6 +76,60 @@ impl OpenAiEngine {
         }
     }
 
+    /// Forced-tool-call canary: POST a request that forces one function call
+    /// and verify the endpoint returns a structured `tool_calls` array naming
+    /// our canary function. Mirrors the macOS subprocess engine's
+    /// `verify_tool_call_support` — cocore advertises tool support only for
+    /// what the backend proves at runtime, keeping no model/parser matrix.
+    /// Non-streaming; bodies are `Zeroizing`. Returns `Ok(false)` (not an
+    /// error) when the endpoint answers without a tool call.
+    pub fn probe_tool_calls(&self) -> Result<bool> {
+        let body = serde_json::json!({
+            "model": self.model_id,
+            "messages": [
+                { "role": "system", "content": "tool-calling canary" },
+                { "role": "user", "content": "Call report_status with status set to ok." },
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "report_status",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "status": { "type": "string" } },
+                        "required": ["status"],
+                        "additionalProperties": false,
+                    },
+                },
+            }],
+            "tool_choice": { "type": "function", "function": { "name": "report_status" } },
+            "max_tokens": 96,
+            "temperature": 0,
+            "stream": false,
+        });
+        let bytes = Zeroizing::new(serde_json::to_vec(&body)?);
+        let resp = self
+            .with_auth(self.client.post(&self.chat_url))
+            .timeout(REQUEST_TIMEOUT)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes.to_vec())
+            .send()
+            .with_context(|| format!("POST {}", self.chat_url))?;
+        if !resp.status().is_success() {
+            return Ok(false);
+        }
+        let v: serde_json::Value = resp.json().context("parsing tool-call canary response")?;
+        let ok = v
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(|tc| tc.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|c| {
+                    c.pointer("/function/name").and_then(|n| n.as_str()) == Some("report_status")
+                })
+            });
+        Ok(ok)
+    }
+
     fn body(&self, request: &GenerateRequest, stream: bool) -> serde_json::Value {
         let messages: Vec<serde_json::Value> = request
             .messages

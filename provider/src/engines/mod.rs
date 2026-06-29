@@ -34,6 +34,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub mod llama_server;
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
 pub mod openai;
