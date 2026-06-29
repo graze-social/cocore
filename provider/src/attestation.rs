@@ -155,7 +155,27 @@ fn detect_secure_boot() -> bool {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux Secure Boot detection via EFI runtime variables. The kernel exposes
+/// the `SecureBoot-*` variable at this path when booted in UEFI mode and
+/// Secure Boot is active. The last byte of the 5-byte value (4-byte attribute
+/// header + 1-byte data) is 0x01 when enabled. Returns false if the file
+/// doesn't exist (legacy BIOS boot, no efivarfs) — honest floor.
+#[cfg(target_os = "linux")]
+fn detect_secure_boot() -> bool {
+    use std::io::Read;
+    let path = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 5];
+    if f.read_exact(&mut buf).is_ok() {
+        buf[4] == 1
+    } else {
+        false
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn detect_secure_boot() -> bool {
     false
 }
@@ -179,9 +199,12 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
         serial_number: "stub-serial".into(),
         os_version,
         binary_path,
-        // SIP is verified ON before we ever get here: `security::apply_all`
-        // runs `csrutil status` at startup and refuses to serve if it's off.
-        sip_enabled: true,
+        // macOS: SIP is verified ON before we get here (security::apply_all
+        // runs csrutil status and refuses to serve if off).
+        // Linux: no SIP equivalent — report false so the confidential tier
+        // formula honestly blocks until a Linux-native analogue (e.g. kernel
+        // lockdown) is integrated as a first-class attestation field.
+        sip_enabled: cfg!(target_os = "macos"),
         // Apple Silicon Secure Boot policy, measured live (Full Security only).
         // Reduced/Permissive and any read failure report false (the honest
         // floor) so we never over-claim the confidential posture.
@@ -222,7 +245,42 @@ fn sysctl_string(name: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux equivalents for the sysctl keys used by `build_stub_inputs`.
+/// Reads from /proc and /sys instead. Unrecognized keys return None.
+#[cfg(target_os = "linux")]
+fn sysctl_string(name: &str) -> Option<String> {
+    use std::fs;
+    match name {
+        "machdep.cpu.brand_string" => {
+            let info = fs::read_to_string("/proc/cpuinfo").ok()?;
+            for line in info.lines() {
+                if let Some(rest) = line.strip_prefix("model name") {
+                    let val = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+            None
+        }
+        "hw.model" => fs::read_to_string("/sys/class/dmi/id/product_name")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        "kern.osproductversion" => {
+            let content = fs::read_to_string("/etc/os-release").ok()?;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                    return Some(rest.trim_matches('"').to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sysctl_string(_name: &str) -> Option<String> {
     None
 }
