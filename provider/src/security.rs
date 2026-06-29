@@ -70,7 +70,7 @@ fn yama_ptrace_scope_ge2() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .map_or(false, |v| v >= 2)
+        .is_some_and(|v| v >= 2)
 }
 
 /// Apply every available hardening control. Returns the first error
