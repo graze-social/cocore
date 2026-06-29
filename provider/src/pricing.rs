@@ -446,14 +446,36 @@ pub fn budget_report(models: &[String], total_ram_gb: u32) -> BudgetReport {
     }
 }
 
-/// Look up the rate for a model id; falls back to the stub rate so
-/// receipts always carry _some_ price.
+/// Look up the rate for a model id; falls back to the uniform off-catalog
+/// rate ([`UNIFORM_RATE`]) so receipts always carry _some_ price.
+///
+/// The fallback is the uniform rate, NOT `RATES[0]`: an off-catalog model
+/// (e.g. any GGUF id a Linux provider serves) must bill at the same uniform
+/// exchange rate that [`price_components_for`] advertises for it, and the two
+/// must agree by construction. Falling back to `RATES[0]` made that agreement
+/// accidental — it held only because the `stub` entry happens to carry the
+/// uniform rate, so editing `stub`'s rate would silently reprice every
+/// off-catalog model and desync the advertised price from the receipt price.
 pub fn rate_for(model_id: &str) -> &'static ModelRate {
     RATES
         .iter()
         .find(|r| r.model_id == model_id)
-        .unwrap_or(&RATES[0])
+        .unwrap_or(&UNIFORM_RATE)
 }
+
+/// The fallback `ModelRate` for any off-catalog model id, backed by the same
+/// `UNIFORM_*` constants [`price_components_for`] uses — so the receipt rate
+/// and the advertised `priceList` rate for an off-catalog model are identical
+/// by construction, independent of the catalog.
+static UNIFORM_RATE: ModelRate = ModelRate {
+    model_id: "",
+    input_per_mtok: UNIFORM_INPUT_PER_MTOK,
+    output_per_mtok: UNIFORM_OUTPUT_PER_MTOK,
+    currency: UNIFORM_CURRENCY,
+    min_ram_gb: 0,
+    description: "uniform off-catalog fallback rate",
+    recommended: false,
+};
 
 /// The uniform exchange rate every cocore model is priced at today:
 /// 1,000,000 CC per MTok in each direction (1:1 between model tokens and
@@ -587,9 +609,16 @@ mod tests {
     }
 
     #[test]
-    fn rate_for_unknown_falls_back_to_first() {
+    fn rate_for_unknown_falls_back_to_uniform_rate() {
+        // Off-catalog ids (e.g. any GGUF id) bill at the uniform rate, and
+        // must match what price_components_for advertises for the same id —
+        // by construction, not by coincidence with the stub catalog entry.
         let r = rate_for("not-a-real-model");
-        assert_eq!(r.model_id, RATES[0].model_id);
+        assert_eq!(r.input_per_mtok, UNIFORM_INPUT_PER_MTOK);
+        assert_eq!(r.output_per_mtok, UNIFORM_OUTPUT_PER_MTOK);
+        assert_eq!(r.currency, UNIFORM_CURRENCY);
+        let (i, o, c) = price_components_for("not-a-real-model");
+        assert_eq!((r.input_per_mtok, r.output_per_mtok, r.currency), (i, o, c));
     }
 
     #[test]
