@@ -17,6 +17,10 @@ use tokio::sync::RwLock;
 
 mod doctor;
 mod models_cli;
+/// Linux systemd user-service control (parity with the macOS launchctl/plist
+/// surface). Linux-only; the macOS arms use launchctl directly.
+#[cfg(target_os = "linux")]
+mod service;
 mod update;
 
 #[derive(Parser)]
@@ -726,13 +730,27 @@ fn kickstart_launchagent_if_installed() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn kickstart_launchagent_if_installed() {
-    // No LaunchAgent on Linux / Windows; the agent is run as a
-    // foreground process or via systemd / nssm and the operator is
-    // expected to manage that lifecycle themselves. Pairing under
-    // those setups still writes session.json correctly; the daemon
-    // either picks it up at next start or needs a manual restart.
+    // Linux parity for the macOS kickstart: restart the systemd user unit so
+    // the freshly paired session.json is picked up immediately, instead of
+    // waiting for a manual restart. No-op hint when the unit isn't installed
+    // (the operator runs the agent some other way).
+    if service::restart_if_installed() {
+        println!("Restarted cocore-provider.service — your machine should appear on /machines within ~10s.");
+    } else {
+        println!(
+            "Note: no {} found. If the daemon is running another way, restart it to pick up the pairing.",
+            service::UNIT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kickstart_launchagent_if_installed() {
+    // No managed service integration on other platforms; the operator runs
+    // the agent themselves. Pairing still writes session.json correctly; the
+    // daemon picks it up at next start or needs a manual restart.
 }
 
 // Owner-intent field preservation is no longer a hand-rolled allowlist

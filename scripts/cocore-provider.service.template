@@ -1,0 +1,50 @@
+# systemd user unit for the cocore agent on Linux — the parity counterpart to
+# scripts/dev.cocore.provider.plist.template (the macOS LaunchAgent).
+#
+# The installer substitutes @@BIN@@ (absolute path to the `cocore` binary) and
+# writes the expanded unit to ~/.config/systemd/user/cocore-provider.service.
+# Enable + start with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cocore-provider.service
+#   loginctl enable-linger "$USER"   # so it runs without an active login session
+#
+# Behavior parity with the LaunchAgent:
+#   * WantedBy=default.target + enable  ↔  RunAtLoad: starts at user login.
+#   * Restart=on-failure                ↔  KeepAlive{SuccessfulExit:false}:
+#     restarted when it exits non-zero (the serve loop's exit(3)=reload and
+#     exit(7)=engine-death both trip this, mirroring launchd respawn).
+#   * RestartSec=10                     ↔  ThrottleInterval=10.
+#   * Logs go to journald: `journalctl --user -u cocore-provider -f`
+#     (the agent ALSO keeps its own rolling log at ~/.cocore/logs/agent.log).
+#
+# Static config lives in the EnvironmentFile below; the DYNAMIC model set is
+# NOT here — it flows through the PDS `desiredModels` field (the source of
+# truth) and the serve loop reconciles it into COCORE_INFERENCE_MODELS at
+# startup. `cocore agent models …` writes desiredModels + restarts this unit.
+
+[Unit]
+Description=cocore decentralized-compute provider agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@@BIN@@ agent serve
+WorkingDirectory=%h
+
+# Static config (COCORE_LLAMA_SERVER_BIN, COCORE_ADVISOR, COCORE_CONSOLE,
+# COCORE_LOG). Optional (leading '-') so a missing file doesn't block startup.
+EnvironmentFile=-%h/.cocore/provider.env
+
+# llama.cpp reads GGUF chat templates that can carry non-ASCII bytes; a UTF-8
+# locale keeps tokenization happy (the macOS plist sets the same for the same
+# reason). C.UTF-8 is universally present on Linux, unlike en_US.UTF-8.
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

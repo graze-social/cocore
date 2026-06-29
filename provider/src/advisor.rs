@@ -1569,9 +1569,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///   wrapper still wipes the bytes on drop, so the worst case is
 ///   "if the system swaps, the wiped-after-drop bytes might briefly
 ///   exist on disk before being overwritten."
-/// - Non-Unix platforms — the agent only ships on macOS today, but
-///   the `cfg(unix)` gate keeps the code portable if that ever
-///   changes.
+/// - Non-Unix platforms — the `cfg(unix)` gate compiles this out there.
+///   On both macOS and Linux (both Unix) the `mlock(2)` call is active.
 ///
 /// We intentionally do NOT `munlock` on drop. `mlock` is a page-
 /// granularity hint; once Zeroizing has scrubbed the buffer, the
