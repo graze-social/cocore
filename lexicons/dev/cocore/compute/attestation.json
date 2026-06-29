@@ -106,6 +106,11 @@
             "description": "True iff dynamic-linker injection vectors (DYLD_*) were scrubbed from the environment at startup. Required for `attested-confidential`. Optional / additive; absent treated as false."
           },
           "sipEnabled": { "type": "boolean" },
+          "kernelLockdown": {
+            "type": "string",
+            "maxLength": 32,
+            "description": "Linux kernel lockdown LSM mode, read from /sys/kernel/security/lockdown: one of 'none', 'integrity', or 'confidentiality'. The Linux analogue of `sipEnabled` for the confidential-tier OS-integrity gate: 'confidentiality' (the strictest) denies ptrace of other tasks, kprobes, /dev/mem, BPF reads of kernel memory, and unsigned-module loads — the kernel-integrity protections SIP provides on macOS. A confidential-tier verifier evaluating a Linux attestation MUST require kernelLockdown == 'confidentiality' in place of `sipEnabled` (which is absent on Linux). Absent on macOS (where `sipEnabled` governs) and on Linux kernels built without the lockdown LSM. Optional / additive; absent treated as no lockdown."
+          },
           "secureBootEnabled": { "type": "boolean" },
           "secureEnclaveAvailable": { "type": "boolean" },
           "authenticatedRootEnabled": { "type": "boolean" },
@@ -130,6 +135,29 @@
                 "type": "bytes",
                 "maxLength": 64,
                 "description": "The App Attest key identifier (the SHA-256 of the attested public key) DCAppAttestService.generateKey returned. Verifiers cross-check this equals the credentialId in authData."
+              }
+            }
+          },
+          "tpmQuote": {
+            "type": "object",
+            "description": "Optional TPM 2.0 quote evidence — the Linux path to trustLevel 'hardware-attested', mirroring `mdaCertChain`/`appAttest` on macOS. A verifier MUST, offline: (1) verify the Attestation Key (AK) certificate chain in `akCertChain` to an embedded TPM manufacturer root CA (Infineon, STMicroelectronics, Nuvoton, Intel, AMD, etc.), enforcing BasicConstraints; (2) verify the `signature` over `quoted` with the AK public key from the chain leaf; (3) parse the TPMS_ATTEST in `quoted`, requiring magic TPM_GENERATED_VALUE (0xff544347) and type TPM_ST_ATTEST_QUOTE; (4) BIND the quote to this record's `publicKey` by requiring its extraData (qualifyingData) == sha256(publicKey) — without this binding a valid quote from one TPM could be stapled onto an unrelated signing key, so an unbound quote MUST NOT earn 'hardware-attested'; (5) optionally check the attested PCR digest against expected measured-boot / IMA values. A bound, vendor-rooted, signature-valid quote earns 'hardware-attested' exactly as a bound mdaCertChain does: it proves a genuine, manufacturer-certified TPM holds an Attestation Key bound to the signing key. It does NOT by itself prove the signing key is TPM-resident nor that the running binary is honest (those are carried by the signing identity, kernelLockdown, and the cdHash/binaryHash known-good gate — the same self-measurement ceiling as the MDA path).",
+            "required": ["quoted", "signature", "akCertChain"],
+            "properties": {
+              "quoted": {
+                "type": "bytes",
+                "maxLength": 2048,
+                "description": "The TPM2B_ATTEST structure (TPMS_ATTEST) the TPM signed: magic TPM_GENERATED_VALUE, type TPM_ST_ATTEST_QUOTE, qualifiedSigner, extraData (== sha256(publicKey), the signing-key binding), clock/firmware info, and TPMS_QUOTE_INFO (PCR selection + composite PCR digest)."
+              },
+              "signature": {
+                "type": "bytes",
+                "maxLength": 1024,
+                "description": "The TPMT_SIGNATURE over `quoted`, produced by the AK (ECDSA P-256 or RSA-PSS/PKCS1v1.5). Verified with the AK public key taken from the leaf of `akCertChain`."
+              },
+              "akCertChain": {
+                "type": "array",
+                "items": { "type": "bytes", "maxLength": 8192 },
+                "maxLength": 8,
+                "description": "The Attestation Key certificate chain (DER), leaf (AK certificate) first, up to but not including the embedded TPM manufacturer root CA. Establishes that the AK lives in a genuine, vendor-certified TPM — the Linux equivalent of Apple's Enterprise Attestation Root anchoring an MDA chain."
               }
             }
           },
