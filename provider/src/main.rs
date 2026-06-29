@@ -2159,7 +2159,7 @@ async fn build_and_publish_attestation(
     // verify Apple-rooted AND bind to our signing key.
     let (trust_level, tier) = match &built {
         Ok(rec) => (
-            if !rec.mdaCertChain.is_empty() || rec.appAttest.is_some() {
+            if !rec.mdaCertChain.is_empty() || rec.appAttest.is_some() || rec.tpmQuote.is_some() {
                 TrustLevel::HardwareAttested
             } else {
                 TrustLevel::SelfAttested

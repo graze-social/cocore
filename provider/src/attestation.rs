@@ -26,6 +26,20 @@ pub struct AppAttestEvidence {
     pub keyId: String,
 }
 
+/// TPM 2.0 quote evidence as it rides in the record — the Linux path to
+/// `hardware-attested`, mirroring [`AppAttestEvidence`]/`mdaCertChain` on
+/// macOS. Field names match the lexicon's `tpmQuote` object; `quoted` and
+/// `signature` are base64, `akCertChain` is base64 DER leaf-first. Acquired
+/// from the TPM (see the future `tpm_loader`); embedded by [`build`] ONLY if
+/// it verifies vendor-rooted AND binds to the signing key.
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Serialize)]
+pub struct TpmQuoteEvidence {
+    pub quoted: String,
+    pub signature: String,
+    pub akCertChain: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttestationInputs {
     pub provider_did: String,
@@ -71,6 +85,11 @@ pub struct AttestationInputs {
     /// gate. `None` on macOS (where `sip_enabled` governs) and on kernels
     /// without the lockdown LSM.
     pub kernel_lockdown: Option<String>,
+    /// Optional TPM 2.0 quote evidence (Linux path to hardware-attested),
+    /// acquired from the TPM. Embedded only if it verifies vendor-rooted AND
+    /// binds to this signer — mirroring the MDA-chain / App-Attest discipline.
+    /// `None` until the TPM acquisition path (tss-esapi) lands.
+    pub tpm_quote: Option<TpmQuoteEvidence>,
 }
 
 // Field names match the lexicon's camelCase wire shape so serde produces
@@ -94,6 +113,10 @@ pub struct AttestationRecord {
     pub mdaCertChain: Vec<String>, // base64
     #[serde(skip_serializing_if = "Option::is_none")]
     pub appAttest: Option<AppAttestEvidence>,
+    /// TPM 2.0 quote evidence (Linux hardware-attested path). Embedded only
+    /// when verified + bound; absent (skipped) otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpmQuote: Option<TpmQuoteEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cdHash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +285,9 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
         // Linux kernel lockdown mode (the SIP analogue); `None` on macOS and on
         // kernels without the lockdown LSM.
         kernel_lockdown: detect_kernel_lockdown(),
+        // No TPM acquisition path yet (tss-esapi, needs hardware); the data
+        // path + fail-closed embed discipline are in place for when it lands.
+        tpm_quote: None,
     }
 }
 
@@ -398,6 +424,30 @@ pub fn build(
         }
     };
 
+    // TPM 2.0 quote — the Linux path to hardware-attested. Same discipline as
+    // the MDA chain / App Attest: embed it ONLY if it verifies (AK cert chain
+    // to a TPM-manufacturer root, quote signature valid) AND binds to this
+    // signing key (quote qualifyingData == sha256(publicKey)).
+    //
+    // FAIL-CLOSED: the vendor-root quote verifier (mirroring `mda::verify_chain`)
+    // and the TPM acquisition (tss-esapi) are a feature-gated increment that
+    // needs a real TPM to validate against. Until it lands, any quote present is
+    // DROPPED — so a TPM quote can never yet earn `hardware-attested`. This is
+    // the codebase's unsafe-by-default rule: an unverified measurement must
+    // never silently elevate trust.
+    let tpm_quote: Option<TpmQuoteEvidence> = match &inputs.tpm_quote {
+        None => None,
+        Some(_ev) => {
+            tracing::warn!(
+                "TPM quote present but the vendor-root quote verifier is not yet \
+                 implemented; dropping it (fail-closed) and staying self-attested. \
+                 The verified path will mirror mda::verify_chain: AK-cert→vendor-root \
+                 chain walk + quote signature + qualifyingData == sha256(publicKey)."
+            );
+            None
+        }
+    };
+
     // Producer's HONEST self-asserted tier. `attested-confidential` is the
     // CONFIDENTIALITY axis — "the prompt is handled only inside this measured,
     // signed binary, and the operator can't read it." It is ORTHOGONAL to
@@ -494,6 +544,16 @@ pub fn build(
         if let Some(kl) = &inputs.kernel_lockdown {
             map.insert("kernelLockdown".into(), Value::String(kl.clone()));
         }
+        if let Some(q) = &tpm_quote {
+            map.insert(
+                "tpmQuote".into(),
+                json!({
+                    "quoted": q.quoted,
+                    "signature": q.signature,
+                    "akCertChain": q.akCertChain,
+                }),
+            );
+        }
     }
     let canonical = to_canonical_bytes(&unsigned)?;
     let sig = signer
@@ -515,6 +575,7 @@ pub fn build(
         rdmaDisabled: inputs.rdma_disabled,
         mdaCertChain: mda_chain_b64,
         appAttest: app_attest,
+        tpmQuote: tpm_quote,
         cdHash: inputs.cd_hash,
         teamId: inputs.team_id,
         hardenedRuntime: inputs.hardened_runtime,
@@ -598,6 +659,7 @@ mod tests {
             core_dumps_disabled: true,
             env_scrubbed: true,
             kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
         assert!(!rec.selfSignature.is_empty());
@@ -723,6 +785,7 @@ mod tests {
             core_dumps_disabled: true,
             env_scrubbed: true,
             kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
         assert!(
@@ -775,6 +838,7 @@ mod tests {
             core_dumps_disabled: true,
             env_scrubbed: true,
             kernel_lockdown: None,
+            tpm_quote: None,
         };
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         inputs.app_attest = Some(AppAttestEvidence {
@@ -848,6 +912,27 @@ mod tests {
             core_dumps_disabled: true,
             env_scrubbed: true,
             kernel_lockdown: lockdown.map(|s| s.to_string()),
+            tpm_quote: None,
         }
+    }
+
+    /// Fail-closed: a TPM quote present on the inputs MUST be dropped (not
+    /// embedded) until the vendor-root quote verifier lands, so it can never
+    /// yet earn hardware-attested. Mirrors the unverifiable-MDA/App-Attest drop.
+    #[test]
+    fn tpm_quote_is_dropped_until_verifier_lands() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let mut inputs = confidential_inputs_with_lockdown(false, Some("confidentiality"));
+        inputs.tpm_quote = Some(TpmQuoteEvidence {
+            quoted: "AAAA".into(),
+            signature: "BBBB".into(),
+            akCertChain: vec!["CCCC".into()],
+        });
+        let rec = build(inputs, &*signer).unwrap();
+        assert!(
+            rec.tpmQuote.is_none(),
+            "an unverified TPM quote must be dropped (fail-closed), not embedded"
+        );
     }
 }
