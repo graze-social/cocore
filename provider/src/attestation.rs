@@ -438,11 +438,17 @@ pub fn build(
     let tpm_quote: Option<TpmQuoteEvidence> = match &inputs.tpm_quote {
         None => None,
         Some(_ev) => {
+            // The quote-signature + key-binding core is implemented and tested
+            // against real TPM output (`crate::tpm::verify_quote`). Embedding
+            // still needs the AK-cert→vendor-root chain walk to source a TRUSTED
+            // AK pubkey — `crate::tpm::verify_ak_chain` over `tpm::vendor_roots()`,
+            // which is empty until the maintainers curate the TPM-manufacturer
+            // root set. With no trusted roots the chain can't anchor, so we drop
+            // (fail-closed) and stay self-attested — an unverified measurement
+            // must never elevate trust.
             tracing::warn!(
-                "TPM quote present but the vendor-root quote verifier is not yet \
-                 implemented; dropping it (fail-closed) and staying self-attested. \
-                 The verified path will mirror mda::verify_chain: AK-cert→vendor-root \
-                 chain walk + quote signature + qualifyingData == sha256(publicKey)."
+                "TPM quote present but no trusted TPM-vendor roots are configured; \
+                 dropping it (fail-closed) and staying self-attested"
             );
             None
         }
