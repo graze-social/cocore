@@ -1396,14 +1396,18 @@ export function AdvancedSettingsDialogContent({
   machine,
   isSharePending,
   isProBonoPending,
+  isToolCallsPending,
   onShareLocation,
+  onToolCalls,
   onSaveProBono,
   onClose,
 }: {
   machine: Machine;
   isSharePending: boolean;
   isProBonoPending: boolean;
+  isToolCallsPending: boolean;
   onShareLocation: (share: boolean) => void;
+  onToolCalls: (enabled: boolean) => void;
   /** Persists the policy and resolves/rejects with the write so the dialog can
    *  roll back its optimistic local state on failure. */
   onSaveProBono: (policy: ProBonoPolicy) => Promise<unknown>;
@@ -1454,7 +1458,7 @@ export function AdvancedSettingsDialogContent({
     <>
       <DialogHeader>Advanced settings — {machine.alias}</DialogHeader>
       <DialogDescription>
-        Optional per-machine controls. Both are written to this machine's provider record; the agent
+        Optional per-machine controls. Each is written to this machine's provider record; the agent
         picks them up the next time it serves.
       </DialogDescription>
       <DialogBody>
@@ -1477,6 +1481,22 @@ export function AdvancedSettingsDialogContent({
                 Currently sharing: <InlineCode>{machine.region}</InlineCode>
               </LabelText>
             ) : null}
+          </Flex>
+
+          <Flex direction="column" gap="md">
+            <Switch
+              isSelected={machine.toolCalls === true}
+              isDisabled={isToolCallsPending}
+              onChange={onToolCalls}
+            >
+              Tool calling
+            </Switch>
+            <SmallBody variant="secondary">
+              Lets this machine serve tool/function calls. It's enabled only for the curated top
+              models a tool-call parser is known for; each is verified with a startup check before
+              it's advertised, and any other model keeps serving exactly as it does now. Picked up
+              the next time the machine serves.
+            </SmallBody>
           </Flex>
 
           <Flex direction="column" gap="md">

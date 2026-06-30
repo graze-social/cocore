@@ -249,6 +249,29 @@ export async function setProviderRecordShareLocation(
   });
 }
 
+/** Set (or clear) a machine's tool-calling opt-in by writing `toolCalls` onto
+ *  its provider record — the owner's INTENT, like `shareLocation`/`desiredTier`.
+ *  The agent reconciles toward it: when on it enables vLLM automatic tool choice
+ *  for the curated top models it knows a parser pairing for, and verifies each
+ *  with a forced-tool startup canary before advertising it. `false` DELETES the
+ *  key (absent ≡ off), so the machine serves exactly as before. Same
+ *  get→put-with-swap→bridge-mirror path as {@link setProviderRecordShareLocation}. */
+export async function setProviderRecordToolCalls(
+  session: OAuthSession,
+  rkey: string,
+  enabled: boolean,
+): Promise<void> {
+  await transactProviderRecord(session, rkey, (value) => {
+    const next = { ...value };
+    if (enabled) {
+      next["toolCalls"] = true;
+    } else {
+      delete next["toolCalls"];
+    }
+    return next;
+  });
+}
+
 /** The owner's pro-bono election for a machine, mirroring the lexicon
  *  `dev.cocore.compute.provider#proBonoPolicy`. `null` clears the policy. */
 export type ProBonoPolicyInput = { mode: "any" | "direct"; dids?: string[] } | null;

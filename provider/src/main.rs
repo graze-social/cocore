@@ -917,7 +917,7 @@ async fn wait_until_active(pds: &cocore_provider::pds::PdsClient, rkey: Option<&
         let read = pds
             .get_provider_control(rk)
             .await
-            .map(|(active, _, _)| active);
+            .map(|(active, _, _, _)| active);
         if active_gate_decision(read, &mut confirmed_paused) == ActiveGate::Serve {
             clear_serving_paused();
             return;
@@ -1313,6 +1313,7 @@ async fn cmd_serve(
             // record by dedup, like proBono. The provisioning publish never
             // stamps region (no network lookup before the engine is up).
             shareLocation: None,
+            toolCalls: None,
             provisioning: Some(true),
             // NOT serving yet: this record is published immediately (so the
             // machine is visible) while the engine is still loading/downloading.
@@ -1364,41 +1365,63 @@ async fn cmd_serve(
     // of an unmeasured Python child, defeating the tier). We still read
     // `desiredModels` below so a change still triggers a reload restart.
     let confidential = push_rx.is_some();
-    let (desired_at_start, desired_tier_at_start, pro_bono_at_start, share_location_at_start): (
-        Vec<String>,
-        Option<String>,
-        ProBonoPolicy,
-        bool,
-    ) = match find_my_provider_record(&pds, &attestation_pub_key).await {
-        Ok((_, value, _)) => {
-            let models = value
-                .get("desiredModels")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|m| m.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let tier = value
-                .get("desiredTier")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            // The owner's location-sharing opt-in, read off our own record so
-            // this serve decides whether to geolocate + stamp `region`. Absent
-            // ≡ off (no country published).
-            let share_location = value
-                .get("shareLocation")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            // The owner's pro-bono election, read off our own record so each
-            // served job can decide per-requester whether it's free. Absent /
-            // malformed ≡ off (every job metered + billed).
-            let pro_bono = ProBonoPolicy::from_record_value(&value).unwrap_or_default();
-            (models, tier, pro_bono, share_location)
-        }
-        Err(_) => (Vec::new(), None, ProBonoPolicy::default(), false),
-    };
+    let (
+        desired_at_start,
+        desired_tier_at_start,
+        pro_bono_at_start,
+        share_location_at_start,
+        tool_calls_at_start,
+    ): (Vec<String>, Option<String>, ProBonoPolicy, bool, bool) =
+        match find_my_provider_record(&pds, &attestation_pub_key).await {
+            Ok((_, value, _)) => {
+                let models = value
+                    .get("desiredModels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tier = value
+                    .get("desiredTier")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                // The owner's location-sharing opt-in, read off our own record so
+                // this serve decides whether to geolocate + stamp `region`. Absent
+                // ≡ off (no country published).
+                let share_location = value
+                    .get("shareLocation")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // The owner's pro-bono election, read off our own record so each
+                // served job can decide per-requester whether it's free. Absent /
+                // malformed ≡ off (every job metered + billed).
+                let pro_bono = ProBonoPolicy::from_record_value(&value).unwrap_or_default();
+                // The owner's tool-calling opt-in. Absent ≡ off (no engine
+                // advertises tool calls). Gates the curated tool-call path below.
+                let tool_calls = value
+                    .get("toolCalls")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                (models, tier, pro_bono, share_location, tool_calls)
+            }
+            Err(_) => (Vec::new(), None, ProBonoPolicy::default(), false, false),
+        };
+
+    // Reconcile the owner's tool-calling intent into the env knob `build_engines`
+    // reads. An EXPLICIT operator setting always wins (a launchd plist / shell
+    // that pinned `COCORE_ENABLE_TOOL_CALLS` keeps full control, including the
+    // global-parser passthrough); we only fill it in from the console intent when
+    // the operator left it unset. `for_model` then enables automatic tool choice
+    // for just the curated top models, and the startup canary decides what's
+    // actually advertised — so flipping this on can only ADD capability.
+    if std::env::var_os("COCORE_ENABLE_TOOL_CALLS").is_none() && tool_calls_at_start {
+        tracing::info!(
+            "owner enabled tool calling for this machine (console toolCalls=true); curated top models will attempt tool calls and verify with a startup canary"
+        );
+        std::env::set_var("COCORE_ENABLE_TOOL_CALLS", "1");
+    }
     match inference_models_action(confidential, &desired_at_start) {
         InferenceModelsAction::Clear => {
             // Confidential = native-only. Inference MUST stay inside the
@@ -1631,6 +1654,7 @@ async fn cmd_serve(
         // (The `region` below was already gated on its value, read at serve
         // start; this carries the switch itself through the re-publish.)
         shareLocation: None,
+        toolCalls: None,
         // Engine is loaded by this point — clear the provisioning flag we
         // set on the early publish above, so the console flips the row
         // from "provisioning" to live.
@@ -1861,6 +1885,7 @@ async fn cmd_serve(
                             &configured_models,
                             push_rx.as_mut(),
                             &pro_bono_at_start,
+                            tool_calls_at_start,
                         )
                         .await;
                     let lived = connected_at.elapsed();
@@ -1921,7 +1946,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start) => {
+                            res = client.run(register.clone(), &*signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start, tool_calls_at_start) => {
                                 if let Err(e) = res {
                                     tracing::warn!(error = %e, "advisor run ended; reconnecting within window in 5s");
                                 }
@@ -2705,7 +2730,12 @@ fn build_engines(
     let mut tool_call_models: Vec<String> = vec![];
 
     for model in &configured {
-        match start_engine_with_recovery(model, &venv_python, tool_config.clone()) {
+        // Resolve tool calling PER MODEL: when the operator left the parser to
+        // cocore, only a curated "top model" with a vetted parser pairing gets
+        // automatic tool choice; everything else loads exactly as before. The
+        // forced-tool startup canary inside the engine still decides whether the
+        // model is actually added to `tool_call_models` (advertised).
+        match start_engine_with_recovery(model, &venv_python, tool_config.for_model(model)) {
             Ok(engine) => {
                 tracing::info!(model = %model, "inference subprocess engine ready");
                 if engine.verified_tool_calls() {
@@ -3410,6 +3440,7 @@ mod offline_marker_tests {
             desiredTier: None,
             proBono: None,
             shareLocation: None,
+            toolCalls: None,
             provisioning: Some(false),
             serving: Some(true),
             engineFault: None,

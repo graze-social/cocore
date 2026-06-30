@@ -149,6 +149,12 @@ impl AdvisorClient {
         // record at serve start. Threaded into `ServeContext` so each job
         // can decide, per requester, whether to serve free + unmetered.
         pro_bono: &ProBonoPolicy,
+        // The owner's `toolCalls` opt-in this serve loaded against. If the
+        // owner flips it on the console we detect the change in the control
+        // re-read below and restart to rebuild engines — the same reload path
+        // as a `desiredModels` edit (engines are built once per serve, and the
+        // per-model tool-call parser is chosen at build time).
+        tool_calls_at_start: bool,
     ) -> Result<()> {
         tracing::info!(url = %self.url, "connecting to advisor");
         let (ws, _resp) =
@@ -364,7 +370,7 @@ impl AdvisorClient {
                     // what made a transient blip look like the owner opting out
                     // of confidential / clearing their models and trip a spurious
                     // restart loop. Wait for the next poll / nudge instead.
-                    let Some((next_active, desired, desired_tier)) = maybe_control else {
+                    let Some((next_active, desired, desired_tier, tool_calls)) = maybe_control else {
                         tracing::debug!("provider-control read unresolved this cycle; skipping reconciliation");
                         continue;
                     };
@@ -406,6 +412,20 @@ impl AdvisorClient {
                         // Reap engine subprocesses before the destructor-
                         // skipping exit so the old model's child doesn't
                         // orphan while the fresh serve loads the new set.
+                        ctx.engines.terminate_all();
+                        std::process::exit(3);
+                    }
+                    if tool_calls != tool_calls_at_start {
+                        // Owner flipped the tool-calling switch on the console.
+                        // The per-model tool-call parser is chosen at engine
+                        // build time, so reload the same way a model-set edit
+                        // does: reap children and exit non-zero for the
+                        // supervisor to respawn into a fresh serve that reads
+                        // the new intent.
+                        tracing::info!(
+                            from = tool_calls_at_start, to = tool_calls,
+                            "owner changed this machine's tool-calling setting from the console; restarting to rebuild engines"
+                        );
                         ctx.engines.terminate_all();
                         std::process::exit(3);
                     }
@@ -667,7 +687,7 @@ impl AdvisorClient {
 async fn read_provider_control(
     pds: &PdsClient,
     rkey: &str,
-) -> Option<(bool, Vec<String>, Option<String>)> {
+) -> Option<(bool, Vec<String>, Option<String>, bool)> {
     pds.get_provider_control(rkey).await
 }
 

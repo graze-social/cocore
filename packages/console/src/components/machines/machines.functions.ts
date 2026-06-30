@@ -40,6 +40,7 @@ import {
   setProviderRecordMachineLabel,
   setProviderRecordProBono,
   setProviderRecordShareLocation,
+  setProviderRecordToolCalls,
 } from "@/lib/provider-record-pds.server.ts";
 import { authMiddleware } from "@/middleware/auth.ts";
 
@@ -65,6 +66,10 @@ const setProviderMachineLabelSchema = providerRkeySchema.extend({
 
 const setProviderShareLocationSchema = providerRkeySchema.extend({
   share: z.boolean(),
+});
+
+const setProviderToolCallsSchema = providerRkeySchema.extend({
+  enabled: z.boolean(),
 });
 
 const setProviderProBonoSchema = providerRkeySchema.extend({
@@ -459,6 +464,19 @@ const setMyProviderShareLocationServerFn = createServerFn({ method: "POST" })
     return { ok: true as const };
   });
 
+const setMyProviderToolCallsServerFn = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .inputValidator(setProviderToolCallsSchema)
+  .handler(async ({ context, data }) => {
+    // Owner INTENT only. The agent reads `toolCalls` off its own record at
+    // serve start and, when on, enables vLLM automatic tool choice for the
+    // curated top models, verifying each with a forced-tool startup canary
+    // before advertising it. Turning it on can only ADD capability.
+    await setProviderRecordToolCalls(context.oauthSession, data.rkey, data.enabled);
+    await nudgeAdvisorControl(context.did);
+    return { ok: true as const };
+  });
+
 const setMyProviderProBonoServerFn = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .inputValidator(setProviderProBonoSchema)
@@ -525,10 +543,16 @@ export const setMyProviderMachineLabelMutationOptions = mutationOptions({
 
 export type SetMyProviderShareLocationInput = z.infer<typeof setProviderShareLocationSchema>;
 export type SetMyProviderProBonoInput = z.infer<typeof setProviderProBonoSchema>;
+export type SetMyProviderToolCallsInput = z.infer<typeof setProviderToolCallsSchema>;
 
 export const setMyProviderShareLocationMutationOptions = mutationOptions({
   mutationFn: (variables: SetMyProviderShareLocationInput) =>
     setMyProviderShareLocationServerFn({ data: variables }),
+});
+
+export const setMyProviderToolCallsMutationOptions = mutationOptions({
+  mutationFn: (variables: SetMyProviderToolCallsInput) =>
+    setMyProviderToolCallsServerFn({ data: variables }),
 });
 
 export const setMyProviderProBonoMutationOptions = mutationOptions({

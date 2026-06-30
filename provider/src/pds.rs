@@ -131,6 +131,15 @@ pub struct ProviderRecord {
     /// fields so opting out clears any previously-shared value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shareLocation: Option<bool>,
+    /// The owner's opt-in to serving tool/function calls. Owner-written INTENT,
+    /// like `desiredModels`/`active`/`desiredTier`/`proBono`/`shareLocation`:
+    /// the agent reconciles toward it (when true it enables vLLM automatic tool
+    /// choice for the curated top models and verifies each with a forced-tool
+    /// startup canary before advertising it) but NEVER authors it, so it must
+    /// PRESERVE whatever it finds on every re-publish. Absent ≡ off (no engine
+    /// advertises tool calls; the machine serves exactly as before).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolCalls: Option<bool>,
     /// True while the agent is still loading its inference engine. Set on
     /// the early "provisioning" publish at serve start so the machine
     /// appears on the console immediately; cleared (set false) on the
@@ -201,6 +210,7 @@ pub const OWNER_INTENT_KEYS: &[&str] = &[
     "desiredTier",
     "proBono",
     "shareLocation",
+    "toolCalls",
 ];
 
 /// Agent-authored OPTIONAL fields — present some serves, absent others (a tier
@@ -636,7 +646,7 @@ impl PdsClient {
     pub async fn get_provider_control(
         &self,
         rkey: &str,
-    ) -> Option<(bool, Vec<String>, Option<String>)> {
+    ) -> Option<(bool, Vec<String>, Option<String>, bool)> {
         let listed = self
             .list_my_records("dev.cocore.compute.provider")
             .await
@@ -664,7 +674,14 @@ impl PdsClient {
             .get("desiredTier")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        Some((active, desired, desired_tier))
+        // The owner's tool-calling opt-in; absent ≡ off. The serve loop restarts
+        // on a change so the fresh build rebuilds engines with the new setting.
+        let tool_calls = rec
+            .value
+            .get("toolCalls")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some((active, desired, desired_tier, tool_calls))
     }
 
     /// Walk the DID PLC directory to find this DID's PDS host. The

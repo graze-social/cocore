@@ -101,4 +101,10 @@ export interface Machine {
   /** Requester DIDs served pro bono under `direct` mode. Empty/absent under
    *  `direct` means no one is currently served free. */
   proBonoDids?: string[];
+  /** Whether the owner opted this machine into serving tool/function calls
+   *  (the provider record's `toolCalls` switch). When on, the agent enables
+   *  vLLM automatic tool choice for the curated top models it knows a parser
+   *  pairing for and verifies each with a startup canary before advertising it.
+   *  Drives the "Tool calling" toggle in per-machine settings. Absent ≡ off. */
+  toolCalls?: boolean;
 }

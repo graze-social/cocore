@@ -47,6 +47,7 @@ import {
   setMyProviderMachineLabelMutationOptions,
   setMyProviderProBonoMutationOptions,
   setMyProviderShareLocationMutationOptions,
+  setMyProviderToolCallsMutationOptions,
 } from "@/components/machines/machines.functions.ts";
 import type { MachineWorkItem } from "@/components/machines/machines.server.ts";
 import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
@@ -373,6 +374,10 @@ export function MachineDetail({ rkey }: { rkey: string }) {
   });
   const proBonoM = useMutation({
     ...setMyProviderProBonoMutationOptions,
+    onSuccess: invalidate,
+  });
+  const toolCallsM = useMutation({
+    ...setMyProviderToolCallsMutationOptions,
     onSuccess: invalidate,
   });
 
@@ -740,6 +745,7 @@ export function MachineDetail({ rkey }: { rkey: string }) {
           machine={m}
           isSharePending={shareLocationM.isPending}
           isProBonoPending={proBonoM.isPending}
+          isToolCallsPending={toolCallsM.isPending}
           onShareLocation={(share) =>
             shareLocationM.mutate(
               { rkey: m.id, share },
@@ -752,6 +758,21 @@ export function MachineDetail({ rkey }: { rkey: string }) {
                   ),
                 onError: (e) =>
                   showToast(e instanceof Error ? e.message : "Could not update country sharing"),
+              },
+            )
+          }
+          onToolCalls={(enabled) =>
+            toolCallsM.mutate(
+              { rkey: m.id, enabled },
+              {
+                onSuccess: () =>
+                  showToast(
+                    enabled
+                      ? `${m.alias}: tool calling on for top models on the next serve`
+                      : `${m.alias}: tool calling off`,
+                  ),
+                onError: (e) =>
+                  showToast(e instanceof Error ? e.message : "Could not update tool calling"),
               },
             )
           }

@@ -469,6 +469,47 @@ impl VllmToolConfig {
         }
     }
 
+    /// Resolve the effective tool-calling config for a SPECIFIC model.
+    ///
+    /// `from_env` reads the operator's coarse intent (is tool calling on, and
+    /// is there a single global parser override). This narrows it to one model,
+    /// which is where the "restrict to top models for now" boundary lives:
+    ///
+    /// * Tool calling off ⇒ unchanged (disabled for every model).
+    /// * An explicit operator parser (`COCORE_VLLM_TOOL_CALL_PARSER`) ⇒ applied
+    ///   to every model verbatim, exactly as before this method existed — the
+    ///   power-user / single-model-host escape hatch.
+    /// * Otherwise ⇒ the CURATED path: enable automatic tool choice only for a
+    ///   model cocore has a vetted parser pairing for (`pricing::tool_call_parser`),
+    ///   using that model's own parser. A model with no pairing serves WITHOUT
+    ///   tool calls — never a wrong-parser guess. Either way the forced-tool
+    ///   startup canary still has the final say on what gets advertised.
+    ///
+    /// Generic wrapper passthrough (`extra_args`) rides through in all cases —
+    /// it isn't tool-call-specific.
+    pub fn for_model(&self, model_id: &str) -> VllmToolConfig {
+        if !self.enabled {
+            return self.clone();
+        }
+        if self.tool_call_parser.is_some() {
+            return self.clone();
+        }
+        match crate::pricing::tool_call_parser(model_id) {
+            Some(parser) => VllmToolConfig {
+                enabled: true,
+                tool_call_parser: Some(parser.to_string()),
+                default_chat_template_kwargs: self.default_chat_template_kwargs.clone(),
+                extra_args: self.extra_args.clone(),
+            },
+            None => VllmToolConfig {
+                enabled: false,
+                tool_call_parser: None,
+                default_chat_template_kwargs: None,
+                extra_args: self.extra_args.clone(),
+            },
+        }
+    }
+
     fn parser_label(&self) -> &str {
         self.tool_call_parser.as_deref().unwrap_or("auto")
     }
@@ -1722,6 +1763,44 @@ mod tests {
                 "value",
             ]
         );
+    }
+
+    #[test]
+    fn for_model_restricts_to_curated_top_models() {
+        // Tool calling off ⇒ every model stays off, untouched.
+        let off = VllmToolConfig::default();
+        assert!(!off.for_model("mlx-community/Qwen3.5-4B-MLX-4bit").enabled);
+
+        // On, parser left to cocore ⇒ a curated top model gets ITS parser…
+        let on = VllmToolConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let top = on.for_model("mlx-community/Qwen3.5-4B-MLX-4bit");
+        assert!(top.enabled);
+        assert_eq!(top.tool_call_parser.as_deref(), Some("hermes"));
+        let llama = on.for_model("mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit");
+        assert!(llama.enabled);
+        assert_eq!(llama.tool_call_parser.as_deref(), Some("llama4_pythonic"));
+
+        // …a legacy / off-catalog model with no vetted pairing stays OFF
+        // (served exactly as before — never a wrong-parser guess).
+        assert!(
+            !on.for_model("mlx-community/Qwen2.5-7B-Instruct-4bit")
+                .enabled
+        );
+        assert!(!on.for_model("some/custom-model").enabled);
+
+        // An explicit operator parser override applies to EVERY model verbatim,
+        // exactly as before the curated table existed.
+        let forced = VllmToolConfig {
+            enabled: true,
+            tool_call_parser: Some("mistral".into()),
+            ..Default::default()
+        };
+        let any = forced.for_model("some/custom-model");
+        assert!(any.enabled);
+        assert_eq!(any.tool_call_parser.as_deref(), Some("mistral"));
     }
 
     #[test]

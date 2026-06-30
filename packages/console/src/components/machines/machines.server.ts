@@ -52,6 +52,7 @@ type ProviderRecordBody = {
   shareLocation?: boolean;
   region?: string;
   proBono?: { mode?: string; dids?: string[] };
+  toolCalls?: boolean;
 };
 
 type ReceiptRecordBody = {
@@ -104,6 +105,7 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
     shareLocation: typeof o.shareLocation === "boolean" ? o.shareLocation : undefined,
     region: typeof o.region === "string" ? o.region : undefined,
     proBono: parseProBono(o.proBono),
+    toolCalls: typeof o.toolCalls === "boolean" ? o.toolCalls : undefined,
   };
 }
 
@@ -704,6 +706,7 @@ export function providerRowsToMachines(
           ? body.proBono.mode
           : undefined,
       proBonoDids: body.proBono?.dids,
+      toolCalls: body.toolCalls,
     };
 
     if (body.active === false) {

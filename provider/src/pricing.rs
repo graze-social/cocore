@@ -51,6 +51,19 @@ pub struct ModelRate {
     /// in the catalog (so a machine that already pinned one keeps its RAM
     /// floor + price) but are NOT recommended. UX-only; never on the wire.
     pub recommended: bool,
+    /// The vLLM `--tool-call-parser` name this model pairs with, when cocore
+    /// knows one (`hermes` for the Qwen rotation, `llama4_pythonic` for
+    /// Llama 4, …). `None` means cocore has no vetted parser pairing for this
+    /// id, so it stays OUT of the curated tool-calling set: when the owner
+    /// flips the per-machine `toolCalls` switch the agent only enables
+    /// automatic tool choice for entries that carry a parser here, then still
+    /// gates advertisement behind the forced-tool startup canary. This is the
+    /// "restrict to top models for now" boundary — adding a new model to the
+    /// tool-calling rotation is a one-line parser pairing here, not a code
+    /// change. UX/config only; never on the wire (the canary, not this field,
+    /// decides what the machine advertises). An operator can still force the
+    /// raw vLLM passthrough on any model via `COCORE_VLLM_TOOL_CALL_PARSER`.
+    pub tool_call_parser: Option<&'static str>,
 }
 
 /// Catalog of every model cocore knows about. `supportedModels` on
@@ -70,6 +83,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 0,
         description: "echo-only smoke-test target; not a real model",
         recommended: false,
+        tool_call_parser: None,
     },
     // ---- Current rotation (recommended) -------------------------------
     // The "latest & greatest" set the Secure Mode upgrade urges providers
@@ -85,6 +99,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 4,
         description: "Qwen3.5 0.8B — fast, low quality; fits any Apple Silicon",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-2B-MLX-4bit",
@@ -94,6 +109,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 6,
         description: "Qwen3.5 2B — small but coherent; good on 8GB",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-4B-MLX-4bit",
@@ -103,6 +119,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Qwen3.5 4B — balanced default for 8GB+ Macs",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     // NOTE: `mlx-community/gemma-4-e4b-it-4bit` was previously here. It is a
     // merged/multimodal (Gemma "E4B") checkpoint whose weights are nested under
@@ -120,6 +137,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 16,
         description: "Qwen3.5 9B — strong general-purpose; 16GB+ recommended",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.6-27B-4bit",
@@ -129,6 +147,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 24,
         description: "Qwen3.6 27B — frontier-class dense; 24GB+",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.6-35B-A3B-4bit",
@@ -138,6 +157,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 32,
         description: "Qwen3.6 35B-A3B MoE — fast for its size; 32GB+",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     ModelRate {
         model_id: "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit",
@@ -147,6 +167,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 64,
         description: "Llama 4 Scout 17B×16E MoE — heavyweight; 64GB+",
         recommended: true,
+        tool_call_parser: Some("llama4_pythonic"),
     },
     ModelRate {
         model_id: "mlx-community/Qwen3.5-122B-A10B-4bit",
@@ -156,6 +177,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 96,
         description: "Qwen3.5 122B-A10B MoE — flagship; 96GB+ Mac Studio/Ultra",
         recommended: true,
+        tool_call_parser: Some("hermes"),
     },
     // ---- Legacy catalog (still servable; not recommended) -------------
     // Kept so a machine that already pinned one of these keeps its RAM
@@ -169,6 +191,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 4,
         description: "Qwen 0.5B (legacy) — fast, low quality",
         recommended: false,
+        tool_call_parser: None,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-3B-Instruct-4bit",
@@ -178,6 +201,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Qwen 3B (legacy) — small but coherent",
         recommended: false,
+        tool_call_parser: None,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-7B-Instruct-4bit",
@@ -187,6 +211,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 16,
         description: "Qwen 7B (legacy) — strong general-purpose",
         recommended: false,
+        tool_call_parser: None,
     },
     ModelRate {
         model_id: "mlx-community/gemma-3-4b-it-qat-4bit",
@@ -196,6 +221,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 8,
         description: "Gemma 3 4B QAT (legacy) — balanced for 8GB+",
         recommended: false,
+        tool_call_parser: None,
     },
     ModelRate {
         model_id: "mlx-community/Qwen2.5-32B-Instruct-4bit",
@@ -205,6 +231,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 32,
         description: "Qwen 32B (legacy) — frontier-class",
         recommended: false,
+        tool_call_parser: None,
     },
     ModelRate {
         model_id: "mlx-community/Llama-3.3-70B-Instruct-4bit",
@@ -214,6 +241,7 @@ pub const RATES: &[ModelRate] = &[
         min_ram_gb: 64,
         description: "Llama 3.3 70B (legacy) — heavyweight",
         recommended: false,
+        tool_call_parser: None,
     },
 ];
 
@@ -236,6 +264,21 @@ pub fn min_ram_gb(model_id: &str) -> Option<u32> {
         .iter()
         .find(|r| r.model_id == model_id)
         .map(|r| r.min_ram_gb)
+}
+
+/// The vetted vLLM `--tool-call-parser` for a model id, or `None` when cocore
+/// has no parser pairing for it (off-catalog model, or a catalog entry we
+/// haven't vetted for tool calls — every legacy entry, the stub). This is the
+/// curated "top models" boundary the per-machine `toolCalls` switch reconciles
+/// against: only a model that returns `Some` here is eligible to attempt tool
+/// calling, and even then the forced-tool startup canary still decides whether
+/// the engine actually advertises it. Adding a model to the rotation is a
+/// one-line parser pairing in `RATES`, never a code change here.
+pub fn tool_call_parser(model_id: &str) -> Option<&'static str> {
+    RATES
+        .iter()
+        .find(|r| r.model_id == model_id)
+        .and_then(|r| r.tool_call_parser)
 }
 
 /// Overprovisioning guard. Pick the subset of `models` whose summed
@@ -560,6 +603,7 @@ mod tests {
             min_ram_gb: 0,
             description: "synthetic test rate",
             recommended: false,
+            tool_call_parser: None,
         };
         // 1M input × 1000 / 1M = 1000 cents = $10
         assert_eq!(price_minor(r, 1_000_000, 0), 1_000);
