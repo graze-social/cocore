@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
+pub mod openai;
 pub mod stub;
 pub mod subprocess;
 
