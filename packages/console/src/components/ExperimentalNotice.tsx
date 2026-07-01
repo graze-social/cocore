@@ -6,9 +6,8 @@
 // the guarantee actually becomes proven/audited, we soften the language in one
 // place. Rule of thumb for callers: describe what a mechanism *aims* to do,
 // never assert that it *holds* — pair any confidentiality/attestation/credit
-// claim with <ExperimentalBadge> (inline) or <ExperimentalNotice> (block).
+// claim with an <ExperimentalNotice>.
 
-import { Badge } from "@/design-system/badge";
 import { Alert, type AlertVariant } from "@/design-system/alert";
 
 export type ExperimentalTopic = "confidentiality" | "attestation" | "tokens";
@@ -17,7 +16,7 @@ export type ExperimentalTopic = "confidentiality" | "attestation" | "tokens";
  *  status note, not an alarm. The aim is that a reader comes away knowing the
  *  feature is a work in progress they shouldn't lean on for anything sensitive,
  *  without feeling shouted at. */
-export const EXPERIMENTAL_COPY: Record<ExperimentalTopic, { title: string; body: string }> = {
+const EXPERIMENTAL_COPY: Record<ExperimentalTopic, { title: string; body: string }> = {
   confidentiality: {
     title: "Confidential mode is experimental",
     body: "It aims to keep your prompt unreadable to the machine's operator, but that isn't proven or independently audited yet — a compromised OS, an agent bug, or a substituted build could still expose it. It's a meaningful raised bar, not a hardware enclave. Don't send anything you'd need kept private.",
@@ -31,25 +30,6 @@ export const EXPERIMENTAL_COPY: Record<ExperimentalTopic, { title: string; body:
     body: "Token metering, settlement, and payouts are still being proven out and can be incorrect, delayed, or lost. Credits aren't money — don't treat a balance as something you can count on.",
   },
 };
-
-/** The calm one-liner used for badge tooltips and tight spaces. */
-export const EXPERIMENTAL_TOOLTIP =
-  "Experimental — a work in progress, not independently proven. Don't rely on it for anything sensitive.";
-
-/** Small, neutral inline tag to sit next to a confidential/attested/credit
- *  label. Deliberately low-key (no alarm color or icon): it reads as an honest
- *  status, and the standard caveat is one hover away. */
-export function ExperimentalBadge({
-  title = EXPERIMENTAL_TOOLTIP,
-}: {
-  title?: string;
-}): React.ReactNode {
-  return (
-    <Badge size="sm" variant="default" title={title}>
-      Experimental
-    </Badge>
-  );
-}
 
 /** Block-level note for a page/section that leans on one of these features.
  *  Defaults to a calm `info` tone; a surface where the caveat is genuinely
