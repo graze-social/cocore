@@ -3666,7 +3666,6 @@ mod active_gate_tests {
 
 #[cfg(test)]
 mod offline_marker_tests {
-    use super::*;
     use cocore_provider::pds::{ProviderRecord, TrustLevel};
 
     /// A provider record as the AGENT builds it in-memory: the
