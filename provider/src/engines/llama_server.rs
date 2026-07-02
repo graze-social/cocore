@@ -613,8 +613,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.path().join("fake-llama-server");
         std::fs::write(&path, script).expect("write fake server");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
         LlamaServerConfig {
             server_bin: path,
             n_gpu_layers: 0,
@@ -711,7 +710,9 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 
         engine.restart().expect("respawn");
         assert!(engine.ready(), "respawned child serves again");
-        let resp = engine.generate_once(&gguf_request()).expect("inference after restart");
+        let resp = engine
+            .generate_once(&gguf_request())
+            .expect("inference after restart");
         assert_eq!(resp.text, "fake reply");
         engine.terminate();
     }
@@ -723,7 +724,8 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
     #[test]
     fn startup_failure_surfaces_child_output() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let script = "#!/usr/bin/env bash\necho 'boom: fake llama-server refusing to start' >&2\nexit 3\n";
+        let script =
+            "#!/usr/bin/env bash\necho 'boom: fake llama-server refusing to start' >&2\nexit 3\n";
         let engine = LlamaCppEngine::new("test/model-GGUF", fake_server_config(&dir, script));
         let err = engine.start().unwrap_err().to_string();
         assert!(

@@ -625,7 +625,8 @@ mod tests {
     fn splits_inline_think_tags_in_content_field() {
         // A model with no reasoning_content field but inline <think> in its
         // content stream is still separated by the ThinkTagSplitter.
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>why</think>because\"}}]}\n\
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>why</think>because\"}}]}\n\
                     data: [DONE]\n";
         let (out, _) = drain(body, "test-model");
         assert_eq!(channel_text(&out, DeltaChannel::Reasoning), "why");

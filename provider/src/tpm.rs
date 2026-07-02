@@ -244,6 +244,16 @@ mod tests {
     }
 
     #[test]
+    fn garbage_ak_key_is_rejected() {
+        // An AK that isn't a valid SEC1 P-256 point (here: a correct-length
+        // buffer that isn't on the curve) must be a clean error, not a panic
+        // or a bogus verify.
+        let bad_ak = [0x04u8; 65];
+        let err = verify_quote(&quoted(), &sig(), &bad_ak, &pubkey()).unwrap_err();
+        assert!(err.to_string().contains("not valid SEC1"), "{err}");
+    }
+
+    #[test]
     fn non_tpm_blob_rejected_by_magic() {
         let err = parse_quote_extra_data(&[0u8; 16]).unwrap_err();
         assert!(err.to_string().contains("TPM_GENERATED_VALUE"));

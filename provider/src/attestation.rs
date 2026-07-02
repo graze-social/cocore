@@ -213,13 +213,26 @@ fn detect_secure_boot() -> bool {
 }
 
 /// Linux kernel lockdown LSM mode from `/sys/kernel/security/lockdown`.
-/// The file reads e.g. `none [integrity] confidentiality` — the ACTIVE mode is
-/// the bracketed one. Returns it lowercased, or `None` when the file is absent
+/// Returns the active mode lowercased, or `None` when the file is absent
 /// (kernel built without the lockdown LSM) or unreadable. This is the Linux
 /// analogue of macOS SIP for the confidential OS-integrity gate.
 #[cfg(target_os = "linux")]
 fn detect_kernel_lockdown() -> Option<String> {
-    let content = std::fs::read_to_string("/sys/kernel/security/lockdown").ok()?;
+    parse_lockdown_mode(&std::fs::read_to_string("/sys/kernel/security/lockdown").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_kernel_lockdown() -> Option<String> {
+    None
+}
+
+/// Parse the ACTIVE mode out of a lockdown-file body: the file reads e.g.
+/// `none [integrity] confidentiality` and the active mode is the bracketed
+/// one. `None` for malformed/empty content — treated as "no lockdown" (the
+/// honest floor). Only read on Linux, but kept un-gated so its unit tests
+/// build (and run) on every platform — like `pick_confidential_native_model`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_lockdown_mode(content: &str) -> Option<String> {
     let start = content.find('[')?;
     let rest = &content[start + 1..];
     let end = rest.find(']')?;
@@ -229,11 +242,6 @@ fn detect_kernel_lockdown() -> Option<String> {
     } else {
         Some(mode)
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_kernel_lockdown() -> Option<String> {
-    None
 }
 
 pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> AttestationInputs {
@@ -920,6 +928,58 @@ mod tests {
             kernel_lockdown: lockdown.map(|s| s.to_string()),
             tpm_quote: None,
         }
+    }
+
+    #[test]
+    fn parse_lockdown_mode_picks_the_bracketed_mode() {
+        // The kernel marks the ACTIVE mode with brackets; position varies.
+        assert_eq!(
+            parse_lockdown_mode("none [integrity] confidentiality\n").as_deref(),
+            Some("integrity")
+        );
+        assert_eq!(
+            parse_lockdown_mode("[none] integrity confidentiality").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            parse_lockdown_mode("none integrity [confidentiality]").as_deref(),
+            Some("confidentiality")
+        );
+    }
+
+    #[test]
+    fn parse_lockdown_mode_rejects_malformed_content() {
+        // Malformed content must read as "no lockdown" (the honest floor),
+        // never as some mode.
+        assert_eq!(parse_lockdown_mode(""), None);
+        assert_eq!(parse_lockdown_mode("none integrity confidentiality"), None);
+        assert_eq!(parse_lockdown_mode("[]"), None);
+        assert_eq!(parse_lockdown_mode("[ ]"), None);
+        assert_eq!(parse_lockdown_mode("garbage ["), None);
+    }
+
+    /// Wire-shape guard for the additive Linux fields: absent evidence must be
+    /// OMITTED from the serialized record, not emitted as `null` — verifiers
+    /// reconstruct the canonical bytes, and a spurious `"kernelLockdown": null`
+    /// on every macOS record would change them. Present evidence serializes
+    /// under the lexicon's camelCase name.
+    #[test]
+    fn optional_linux_evidence_is_omitted_when_absent() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+
+        let mut inputs = confidential_inputs_with_lockdown(true, None);
+        inputs.tpm_quote = None;
+        let rec = build(inputs, &*signer).unwrap();
+        let v = serde_json::to_value(&rec).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("kernelLockdown"), "None must be omitted");
+        assert!(!obj.contains_key("tpmQuote"), "None must be omitted");
+
+        let inputs = confidential_inputs_with_lockdown(false, Some("integrity"));
+        let rec = build(inputs, &*signer).unwrap();
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["kernelLockdown"], "integrity");
     }
 
     /// Fail-closed: a TPM quote present on the inputs MUST be dropped (not
