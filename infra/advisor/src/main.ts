@@ -105,9 +105,7 @@ const CONFIG = Effect.runSync(
     internalApiKey: Config.string("COCORE_INTERNAL_API_KEY").pipe(Config.option),
     // Backstop bound on total concurrent WS connections (registry + per-conn
     // state grow with connections; without a cap a flood can exhaust memory).
-    maxConnections: Config.integer("COCORE_ADVISOR_MAX_CONNECTIONS").pipe(
-      Config.withDefault(2000),
-    ),
+    maxConnections: Config.integer("COCORE_ADVISOR_MAX_CONNECTIONS").pipe(Config.withDefault(2000)),
   }),
 );
 
