@@ -153,9 +153,14 @@ mod tests {
     /// qualifyingData is `sha256(EXPECTED_PUBKEY)`. See the `tpm` feature's
     /// acquisition for how it was generated.
     const VECTOR: &str = include_str!("testdata/swtpm_quote.txt");
+    /// A genuine quote from an AMD firmware TPM (Ryzen 7 3700X / X570 Taichi),
+    /// captured on real silicon — not swtpm. Proves the parser + crypto handle
+    /// real hardware output, and that swtpm and hardware produce the same
+    /// verifiable structure.
+    const AMD_VECTOR: &str = include_str!("testdata/amd_ftpm_quote.txt");
 
-    fn field(name: &str) -> Vec<u8> {
-        let line = VECTOR
+    fn field(vector: &str, name: &str) -> Vec<u8> {
+        let line = vector
             .lines()
             .find_map(|l| l.strip_prefix(&format!("{name}=")))
             .unwrap_or_else(|| panic!("missing {name} in vector"));
@@ -163,16 +168,16 @@ mod tests {
     }
 
     fn quoted() -> Vec<u8> {
-        field("QUOTED_HEX")
+        field(VECTOR, "QUOTED_HEX")
     }
     fn sig() -> Vec<u8> {
-        field("SIG_RS_HEX")
+        field(VECTOR, "SIG_RS_HEX")
     }
     fn ak() -> Vec<u8> {
-        field("AK_SEC1_HEX")
+        field(VECTOR, "AK_SEC1_HEX")
     }
     fn pubkey() -> Vec<u8> {
-        field("EXPECTED_PUBKEY_HEX")
+        field(VECTOR, "EXPECTED_PUBKEY_HEX")
     }
 
     #[test]
@@ -180,6 +185,20 @@ mod tests {
         // The whole point: a genuine TPM quote passes structure + signature +
         // binding against the key it was bound to.
         verify_quote(&quoted(), &sig(), &ak(), &pubkey()).expect("real swtpm quote must verify");
+    }
+
+    #[test]
+    fn real_amd_ftpm_quote_verifies() {
+        // The same verifier, against a quote from a real AMD firmware TPM
+        // (hardware, not swtpm). Structure + ECDSA signature + key-binding all
+        // hold — the verifier is validated against genuine silicon output.
+        verify_quote(
+            &field(AMD_VECTOR, "QUOTED_HEX"),
+            &field(AMD_VECTOR, "SIG_RS_HEX"),
+            &field(AMD_VECTOR, "AK_SEC1_HEX"),
+            &field(AMD_VECTOR, "EXPECTED_PUBKEY_HEX"),
+        )
+        .expect("real AMD fTPM quote must verify");
     }
 
     #[test]
