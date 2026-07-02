@@ -233,7 +233,10 @@ export type PollResult =
  *  cannot use it as a code-existence oracle. */
 export type ConfirmResult = { ok: true; status: "approved" | "denied" } | { ok: false };
 
-export class PairError extends Error {
+// Not exported: only the legacy `approve`/`deny` methods throw it, and the
+// XRPC handler now goes through `confirm` (which returns a uniform result
+// instead of throwing). Kept module-internal so knip doesn't flag it.
+class PairError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {
     super(message);
