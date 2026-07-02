@@ -19,7 +19,8 @@ an annotation:
 
 | Area | Status |
 |---|---|
-| Build + full test suite on Linux | ✅ 259 tests, clippy clean, rustfmt clean (default features) |
+| Build + full test suite on Linux | ✅ 269 tests, clippy clean, rustfmt clean (default features; rebased on v0.9.39 main) |
+| **Validated live against the production network** | ✅ see [Live validation](#live-validation-against-production) |
 | Real machine telemetry (`/proc`, `/sys`, `/etc/os-release`, DMI, NVIDIA GPU count) | ✅ |
 | Managed inference: agent spawns/supervises/restarts `llama-server` per model, GGUF auto-download from HF | ✅ |
 | Unmanaged escape hatch: proxy to any OpenAI-compatible endpoint | ✅ |
@@ -236,7 +237,7 @@ unverified measurement never elevates trust (tested).
 > into `load_or_create_identity()` behind the same feature.
 
 > **NOTE** — CLAUDE.md's extension workflow says lexicon changes land first
-> in a lexicon-only PR. Commit `ee23151` (adds `kernelLockdown` + `tpmQuote`
+> in a lexicon-only PR. Commit `3a68216` (adds `kernelLockdown` + `tpmQuote`
 > to `attestation.json`) is cleanly separable if maintainers want that split.
 
 > **DECISION** — who updates the AppView + SDK verifiers (TypeScript) for
@@ -244,13 +245,46 @@ unverified measurement never elevates trust (tested).
 > author or the core team? Provider-side is done; the lexicon documents the
 > exact rules a verifier must apply.
 
+## Live validation against production
+
+The full chain was exercised against the real network from an Ubuntu
+24.04 box (Ryzen 7 3700X, RTX 2060 + RTX 3060, prebuilt Vulkan
+llama.cpp b9860), 2026-07-02. Every artifact below is public and
+independently verifiable on the provider's PDS
+(`did:plc:rfrx5n26phualqc6x54n6myq`):
+
+- **Pair → serve → register**: device-pair, provisioning + real provider
+  records published, attestation published, registered with
+  `wss://advisor.cocore.dev/v1/agent`, heartbeats; `doctor` cross-system
+  health reported `diagnosis=healthy`.
+- **The published attestation is the branch's Linux shape**, live on the
+  wire: `kernelLockdown: "none"` (the new additive field, accepted by the
+  PDS), `chipName: "AMD Ryzen 7 3700X"`, `osVersion: "Ubuntu 24.04.4
+  LTS"`, honest `sipEnabled: false` / `tier: "best-effort"`, and a 64-hex
+  `cdHash` (the `/proc/self/exe` self-measurement).
+- **Managed engine**: cold spawn → automatic GGUF download
+  (`bartowski/Qwen2.5-0.5B-Instruct-GGUF`) → ready + advertised in
+  **35 s**; respawn from cache in ~7 s on a fresh port; the model
+  layer-split across **both GPUs** (Vulkan0 + Vulkan1); the model
+  appeared in the network's public model directory (`/api/v1/models`).
+- **Owner controls**: flipping the tier toggle in the console produced
+  the designed live behavior — clean llama-server SIGTERM teardown +
+  `exit(3)` supervisor reload.
+- **A real job end-to-end**: encrypted prompt → advisor → decrypt →
+  llama-server on the GPUs → sealed streamed response → **signed receipt**
+  `at://…/dev.cocore.compute.receipt/3mpp6cpixda2m` with exact
+  llama-server usage counts `tokens {in:42, out:135}` and
+  `price {amount:177, currency:CC}` — 42+135 at the uniform 1:1 rate,
+  i.e. the off-catalog GGUF billing path priced a live receipt correctly
+  by construction.
+
 ## Verification
 
 ```bash
 cd provider
 cargo fmt --check          # clean
 cargo clippy --all-features --all-targets   # 0 errors; 2 pre-existing upstream warnings (untouched by this branch)
-cargo test                 # 259 passed, 0 failed
+cargo test                 # 269 passed, 0 failed  (rebased on v0.9.39 main)
 ```
 
 Test coverage follows the upstream conventions (descriptive-sentence
@@ -278,14 +312,15 @@ Foundation → engine → ops → attestation, in commit order:
 
 | Commits | What |
 |---|---|
-| `c7ce5c9` `35b39c7` | rustls TLS backend (no system OpenSSL) + process-default CryptoProvider (prevents the dual aws-lc-rs/ring panic) |
-| `49093e3` `d813e98` `de4e7b1` `38d0af7` `0e0ed6d` | Linux telemetry + honest attestation inputs: system profile, aarch64 hypervisor detect, binary self-measurement, Yama anti-debug, Secure Boot / sysctl equivalents |
-| `cf47f6b` `ef36034` `e6a44e0` | OpenAI-compatible HTTP engine (the unmanaged escape hatch) + wiring |
-| `0916308` `f11c419` | **Managed llama-server engine** + `build_engines` wiring (the primary Linux path) |
-| `eb80826` | Off-catalog receipt rate decoupled from the stub entry (GGUF billing correct by construction) |
-| `cf40648` `9b1ce35` | systemd service parity (`service.rs` + Linux arms in models/doctor/update/pair) + unit template + install script |
-| `ee23151` | **Lexicon (additive)**: `kernelLockdown` + `tpmQuote` |
-| `9b6a6ae` `7d91419` | kernelLockdown populated + wired as the Linux SIP gate; tpmQuote data path + trustLevel wiring (fail-closed) |
-| `1141b14` `8622b94` | TPM quote verifier + real swtpm and real AMD-fTPM test vectors |
-| `9331d00` | rustfmt sweep |
-| `1a4d5c0` `6deeb0e` `8987bc5` | test hardening: reasoning_content routing fix + full engine channel/body/canary coverage, managed-lifecycle tests against a fake llama-server, lockdown-parse/wire-shape/AK negatives |
+| `bf7b839` `71b2b95` | rustls TLS backend (no system OpenSSL) + process-default CryptoProvider (prevents the dual aws-lc-rs/ring panic) |
+| `fa4e84f` `889e39a` `4b4e1b0` `184d9d4` `82ef8c0` | Linux telemetry + honest attestation inputs: system profile, aarch64 hypervisor detect, binary self-measurement, Yama anti-debug, Secure Boot / sysctl equivalents |
+| `8df520a` `a41783f` `e5fe86d` | OpenAI-compatible HTTP engine (the unmanaged escape hatch) + wiring |
+| `f9ba947` `163b68d` | **Managed llama-server engine** + `build_engines` wiring (the primary Linux path) |
+| `f4468d0` | Off-catalog receipt rate decoupled from the stub entry (GGUF billing correct by construction) |
+| `ebe61cc` `adecb0b` | systemd service parity (`service.rs` + Linux arms in models/doctor/update/pair) + unit template + install script |
+| `3a68216` | **Lexicon (additive)**: `kernelLockdown` + `tpmQuote` |
+| `c168efd` `4386efc` | kernelLockdown populated + wired as the Linux SIP gate; tpmQuote data path + trustLevel wiring (fail-closed) |
+| `44fef38` `6290379` | TPM quote verifier + real swtpm and real AMD-fTPM test vectors |
+| `f6e4a6c` `f511001` | rustfmt sweep + this document |
+| `3a1498c` `d79e745` `757f918` `20de0f9` | test hardening: reasoning_content routing fix + full engine channel/body/canary coverage, managed-lifecycle tests against a fake llama-server, lockdown-parse/wire-shape/AK negatives |
+| `b0f44ac` | rebase adaptation to v0.9.39 main (ModelRate.tool_call_parser, new AttestationInputs site) |
