@@ -24,9 +24,12 @@ import {
   authenticateAgent,
   authenticateChainIngest,
   fetchAttestationChain,
+  getDeviceProvisioningDid,
   ingestAttestationChain,
   isValidSerial,
   mdmJson,
+  WEBHOOK_DEBUG_SERIAL,
+  webhookDebugEnabled,
 } from "@/lib/mdm-coordinator.server.ts";
 
 // We STORE the chain as base64 DER (the ingest contract below), but the agent's
@@ -48,10 +51,34 @@ export const Route = createFileRoute("/api/agent/mdm/attestation-chain")({
       GET: async ({ request }) => {
         const auth = authenticateAgent(request);
         if (!auth.ok) return auth.response;
+        const callerDid = auth.caller.did;
 
         const serial = new URL(request.url).searchParams.get("serial");
         if (!isValidSerial(serial)) {
           return mdmJson({ error: "serial query param required (8–24 alphanumeric chars)" }, 400);
+        }
+
+        // Debug seam: the reserved WEBHOOK_DEBUG_SERIAL stashes raw NanoMDM
+        // bodies and has no owning DID. It is a bring-up-only inspection
+        // aid, so refuse it entirely unless the debug stash is enabled
+        // (which webhookDebugEnabled() hard-disables in production).
+        if (serial === WEBHOOK_DEBUG_SERIAL && !webhookDebugEnabled()) {
+          return mdmJson({ error: "not found" }, 404);
+        }
+
+        // SECURITY (cross-tenant IDOR fix): a serial may only be read by the
+        // DID that provisioned it (bound at request-attestation time). This
+        // gate is enforced BEFORE fetchAttestationChain so it applies no
+        // matter where the chain data comes from (local SQLite OR the
+        // external COCORE_MDM_CHAIN_STORE_URL fallback). Fail-closed: an
+        // unprovisioned serial (no owner row) is treated as not authorized,
+        // so a guessed serial never leaks a chain. The debug serial above is
+        // the only ownerless serial that can be read, and only in non-prod.
+        if (serial !== WEBHOOK_DEBUG_SERIAL) {
+          const owner = getDeviceProvisioningDid(serial);
+          if (owner !== callerDid) {
+            return mdmJson({ error: "forbidden: serial not provisioned to this caller" }, 403);
+          }
         }
 
         const result = await fetchAttestationChain(serial);

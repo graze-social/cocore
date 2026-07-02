@@ -24,6 +24,7 @@ import {
   isValidSerial,
   isValidUdid,
   mdmJson,
+  putDeviceProvisioning,
   requestDeviceInformationAttestation,
 } from "@/lib/mdm-coordinator.server.ts";
 
@@ -46,6 +47,9 @@ export const Route = createFileRoute("/api/agent/mdm/request-attestation")({
         if (!auth.ok) return auth.response;
 
         let body: { serial?: unknown; udid?: unknown; publicKey?: unknown };
+        // The authenticated caller's DID; bound to the device serial below so
+        // only this owner may later read the serial's attestation chain.
+        const callerDid = auth.caller.did;
         try {
           body = (await request.json()) as typeof body;
         } catch {
@@ -60,6 +64,12 @@ export const Route = createFileRoute("/api/agent/mdm/request-attestation")({
         if (!isValidPublicKey(body.publicKey)) {
           return mdmJson({ error: "publicKey required (base64 of a raw 64-byte P-256 key)" }, 400);
         }
+
+        // SECURITY: bind this serial to the authenticated caller's DID at
+        // provisioning time. The attestation-chain GET enforces this binding
+        // (fail-closed), so establishing it here is what stops another agent
+        // from later reading this device's Apple attestation chain by serial.
+        putDeviceProvisioning(body.serial, callerDid, new Date().toISOString());
 
         const result = await requestDeviceInformationAttestation(
           body.serial,

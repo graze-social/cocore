@@ -527,6 +527,14 @@ const ALLOWED_PROXY_PREFIXES = [
   "/xrpc/com.atproto.server.getServiceAuth",
 ];
 
+// TODO(security, defense-in-depth): narrow the getServiceAuth arm further by
+// parsing its `lxm` query param and allowlisting only the method NSIDs the
+// console actually mints service-auth for (today: dev.cocore.devicePair.confirm
+// and dev.cocore.inference.dispatch — see console-xrpc-http.server.ts and
+// inference-dispatch-forward.server.ts). Left as a path-prefix allowlist for
+// now to avoid breaking any getServiceAuth lxm the console legitimately uses;
+// the internal-secret is the primary trust boundary and repo.* is already the
+// minimum the console needs, so this is a hardening follow-up, not a fix.
 function isAllowedProxyPath(p: string): boolean {
   return ALLOWED_PROXY_PREFIXES.some((pre) => p.startsWith(pre));
 }

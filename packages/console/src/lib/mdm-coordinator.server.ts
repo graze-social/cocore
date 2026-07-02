@@ -60,7 +60,18 @@
 import { createHash } from "node:crypto";
 
 import { resolveBearerKey, type ResolvedKey } from "@/lib/api-keys.server.ts";
-import { getAttestationChain, putAttestationChain } from "@/lib/mdm-chain-store.server.ts";
+import {
+  getAttestationChain,
+  getDeviceProvisioningDid,
+  putAttestationChain,
+  putDeviceProvisioning,
+} from "@/lib/mdm-chain-store.server.ts";
+
+// Re-export the device→owner provisioning helpers so the MDM routes can
+// import the whole coordinator surface from one module (matches how the
+// attestation-chain helpers are consumed). See mdm-chain-store.server.ts
+// for the SECURITY rationale (cross-tenant IDOR on the chain read).
+export { getDeviceProvisioningDid, putDeviceProvisioning };
 
 // ---------------------------------------------------------------------------
 // Auth — same bearer-API-key surface every other /api/agent/* route uses.
@@ -960,7 +971,20 @@ function extractSerialFromPlist(plistXml: string): string | null {
  *  `chain` field holds `[base64(rawBody)]`). Alphanumeric so it passes
  *  isValidSerial. Leave the env UNSET in production — MDM payloads carry device
  *  info; this is a debug-only seam for bringing up a new device. */
-const WEBHOOK_DEBUG_SERIAL = "zzwebhookdebuglast";
+export const WEBHOOK_DEBUG_SERIAL = "zzwebhookdebuglast";
+
+/** Whether the webhook-debug stash is enabled for this process.
+ *
+ *  SECURITY: the debug stash bypasses the per-device owner binding — its
+ *  reserved serial has no owning DID, and its `chain` holds raw NanoMDM
+ *  bodies (device info). It is a bring-up-only seam, so we HARD-DISABLE it
+ *  in production regardless of the env flag (fail-closed): never stash and
+ *  never serve `zzwebhookdebuglast` when NODE_ENV === "production". Outside
+ *  production it stays gated behind COCORE_MDM_WEBHOOK_DEBUG. */
+export function webhookDebugEnabled(): boolean {
+  if (process.env["NODE_ENV"] === "production") return false;
+  return Boolean(env("COCORE_MDM_WEBHOOK_DEBUG"));
+}
 
 /** Newest-N webhook bodies kept by the debug stash. A device's command result
  *  arrives immediately before a trailing `Status: Idle` poll, and the stash is
@@ -973,7 +997,9 @@ const WEBHOOK_DEBUG_KEEP = 20;
  *  `GET attestation-chain?serial=zzwebhookdebuglast` (the `chain` field is the
  *  base64 bodies, oldest→newest). Returns whether it stashed. */
 export function maybeStashWebhookDebug(rawBody: string, nowIso: string): boolean {
-  if (!env("COCORE_MDM_WEBHOOK_DEBUG")) return false;
+  // Fail-closed in production (see webhookDebugEnabled): never stash raw
+  // device payloads under the ownerless debug serial in prod.
+  if (!webhookDebugEnabled()) return false;
   try {
     const prior = getAttestationChain(WEBHOOK_DEBUG_SERIAL)?.chain ?? [];
     const next = [...prior, Buffer.from(rawBody, "utf8").toString("base64")].slice(

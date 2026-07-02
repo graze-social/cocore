@@ -41,3 +41,38 @@ export function getAttestationChain(
   }
   return null;
 }
+
+// ── Device → owner (DID) provisioning binding ─────────────────────────
+//
+// SECURITY (cross-tenant IDOR fix): the attestation-chain store is keyed
+// by serial alone, so without an owner binding any authenticated agent
+// could read ANY device's Apple attestation chain by guessing a serial.
+// We record which authenticated DID provisioned a serial (at
+// request-attestation time) and enforce it on the chain read: a caller may
+// only read the chain for a serial it owns. See getDeviceProvisioningDid
+// and its use in routes/api/agent.mdm.attestation-chain.ts.
+
+/** Bind (or re-bind) a device serial to the authenticated DID that
+ *  provisioned it. Idempotent; a re-provision by the same owner just
+ *  refreshes `provisioned_at`. */
+export function putDeviceProvisioning(serial: string, did: string, provisionedAt: string): void {
+  consoleDb()
+    .prepare(
+      `INSERT INTO mdm_device_provisioning (serial, did, provisioned_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(serial) DO UPDATE SET
+         did = excluded.did,
+         provisioned_at = excluded.provisioned_at`,
+    )
+    .run(serial, did, provisionedAt);
+}
+
+/** Return the owning DID for a provisioned serial, or null when the serial
+ *  has never been provisioned (fail-closed: callers treat null as "not
+ *  authorized"). */
+export function getDeviceProvisioningDid(serial: string): string | null {
+  const row = consoleDb()
+    .prepare(`SELECT did FROM mdm_device_provisioning WHERE serial = ?`)
+    .get(serial) as { did: string } | undefined;
+  return row ? row.did : null;
+}

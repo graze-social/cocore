@@ -22,7 +22,7 @@ import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { AccountStore } from "../operational/account-store.ts";
 import { hydrateDids } from "../bsky-hydrate.ts";
 import { bearer, err, jsonBody, ok, searchParams } from "../api/http-app.ts";
-import { PairError, type PairStore, type ProviderSession } from "./pair-store.ts";
+import { type PairStore, type ProviderSession } from "./pair-store.ts";
 
 export interface DevicePairContext {
   /** Mints the scoped API key handed to the paired agent. */
@@ -35,6 +35,40 @@ export interface DevicePairContext {
   apiBase: string;
 }
 
+/** Whether an `apiBase` is a safe target for a paired agent to POST records
+ *  to. The agent trusts whatever apiBase we bind into its ProviderSession
+ *  and sends its scoped API key there, so an attacker-supplied apiBase in
+ *  the confirm body is a credential-exfiltration vector. Tighten it:
+ *   - require https:, EXCEPT localhost/127.0.0.1 over http for dev; and
+ *   - when COCORE_DEVICEPAIR_ALLOWED_HOSTS (comma-separated hostnames) is
+ *     set, the apiBase host MUST be in that allowlist.
+ *  Anything else (plain http to a non-loopback host, an unlisted host, or an
+ *  unparseable URL) is rejected. */
+function isAllowedApiBase(apiBase: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(apiBase);
+  } catch {
+    return false;
+  }
+  const isLoopback = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  if (url.protocol === "http:") {
+    if (!isLoopback) return false; // http only for local dev
+  } else if (url.protocol !== "https:") {
+    return false; // no ws:, file:, etc.
+  }
+
+  const allowed = process.env["COCORE_DEVICEPAIR_ALLOWED_HOSTS"];
+  if (allowed && allowed.trim().length > 0) {
+    const hosts = allowed
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter((h) => h.length > 0);
+    if (!hosts.includes(url.hostname.toLowerCase())) return false;
+  }
+  return true;
+}
+
 function isProviderSession(v: unknown): v is ProviderSession {
   if (typeof v !== "object" || v === null) return false;
   const s = v as Record<string, unknown>;
@@ -45,7 +79,10 @@ function isProviderSession(v: unknown): v is ProviderSession {
     typeof s.apiKey === "string" &&
     s.apiKey.startsWith("cocore-") &&
     typeof s.apiBase === "string" &&
-    s.apiBase.startsWith("http")
+    // SECURITY: was `s.apiBase.startsWith("http")`, which accepted any
+    // http(s) origin (an apiBase-injection / key-exfil vector). Require a
+    // vetted target (https or loopback, plus optional host allowlist).
+    isAllowedApiBase(s.apiBase)
   );
 }
 
@@ -115,25 +152,32 @@ export function buildDevicePairRouter(
         const code = (typeof body.userCode === "string" ? body.userCode : "").trim().toUpperCase();
         if (!code) return err(400, { error: "InvalidRequest", message: "missing userCode" });
 
-        if (body.decision === "deny") {
-          try {
-            store.deny(code);
-          } catch {
-            return err(404, { error: "unknown code" });
-          }
-          return ok({ ok: true, status: "denied" });
-        }
-        if (body.decision !== "approve") {
+        if (body.decision !== "approve" && body.decision !== "deny") {
           return err(400, {
             error: "InvalidRequest",
             message: "decision must be approve|deny",
           });
         }
 
+        // SECURITY: any non-approve outcome returns this SAME response
+        // (status + body) whether the code was unknown, in the wrong state,
+        // or over the confirm-attempt cap — so confirm is not a code-
+        // existence oracle and mismatched attempts are throttled in the
+        // store. Deny needs no session; build one only for approve.
+        const uniformFailure = err(409, { ok: false, status: "denied" });
+
+        if (body.decision === "deny") {
+          const r = store.confirm(code, "deny", null);
+          return r.ok ? ok({ ok: true, status: r.status }) : uniformFailure;
+        }
+
         // Approve: bind a ProviderSession to the pairing. When the console
         // forwards confirm it mints the key in its own store (so Bearer
         // auth on `/api/pds/*` resolves) and passes the session here.
         // Fall back to minting on the AppView for direct callers / tests.
+        // A providerSession with a rejected apiBase (see isAllowedApiBase)
+        // fails isProviderSession and is treated as absent — we mint a fresh
+        // key against the trusted ctx.apiBase rather than trust the caller's.
         const bodySession = body.providerSession;
         let session: ProviderSession;
         if (isProviderSession(bodySession)) {
@@ -152,13 +196,8 @@ export function buildDevicePairRouter(
           });
           session = { did, handle, apiKey: secret, apiBase: ctx.apiBase };
         }
-        try {
-          const entry = store.approve(code, session);
-          return ok({ ok: true, status: entry.status });
-        } catch (e) {
-          if (e instanceof PairError) return err(409, { error: e.message });
-          return err(409, { error: e instanceof Error ? e.message : String(e) });
-        }
+        const r = store.confirm(code, "approve", session);
+        return r.ok ? ok({ ok: true, status: r.status }) : uniformFailure;
       }).pipe(Effect.withSpan("appview.devicePair.confirm")),
     ),
   );

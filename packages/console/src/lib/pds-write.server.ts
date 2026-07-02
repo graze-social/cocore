@@ -37,6 +37,22 @@ import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
  *  repo; never anything outside the namespace. */
 const COLLECTION_PREFIX = "dev.cocore.";
 
+// TODO(security, authz-scoping): the review proposed rejecting
+// dev.cocore.compute.{receipt,settlement,attestation} through this generic
+// proxy on the theory that they're provider/exchange-authored and a requester
+// writing them is always wrong. That reject is UNSAFE here and was deliberately
+// NOT applied: this proxy is exactly the path the provider and exchange use to
+// publish those records — the Rust provider writes compute.receipt and
+// compute.attestation via `POST /api/pds/createRecord` (provider/src/pds.rs
+// publish()), and the exchange/services write compute.settlement the same way
+// (packages/exchange/src/publisher.ts, infra/services/src/main.ts). All three
+// authenticate with a bearer key scoped to their OWN DID and write to their own
+// repo, which is indistinguishable at this layer from a requester write. A
+// blanket collection reject would break real receipt/settlement/attestation
+// publishing. Proper scoping needs a per-key role/capability (e.g. "may author
+// receipts") on the API key, checked here against the collection — a larger
+// change than this pass. Until then, keep the namespace-only gate below.
+
 function rkeyFromUri(uri: string): string {
   const parts = uri.split("/");
   return parts[parts.length - 1] ?? "";

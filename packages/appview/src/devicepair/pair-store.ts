@@ -37,6 +37,10 @@ export interface PairEntry {
   expiresAt: number;
   status: PairStatus;
   session: ProviderSession | null;
+  /** Count of failed/mismatched confirm attempts against this code.
+   *  Bounded by MAX_CONFIRM_ATTEMPTS to blunt online brute-forcing of the
+   *  short user_code — once exceeded the code is force-denied. */
+  failedAttempts: number;
 }
 
 export interface StartResult {
@@ -50,6 +54,11 @@ export interface StartResult {
 const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // omit ambiguous I, L, O, 0, 1
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_POLL_INTERVAL_S = 3;
+/** Max failed confirm attempts per code before it is force-denied. The
+ *  user_code is short (8 chars from a 30-symbol alphabet) and confirm is
+ *  network-reachable, so cap online guessing. A legitimate approve succeeds
+ *  on the first try, well under this. */
+const MAX_CONFIRM_ATTEMPTS = 10;
 
 export class PairStore {
   private byDevice = new Map<string, PairEntry>();
@@ -77,6 +86,7 @@ export class PairStore {
       expiresAt: now + this.ttlMs,
       status: "pending",
       session: null,
+      failedAttempts: 0,
     };
     this.byDevice.set(entry.deviceId, entry);
     this.byCode.set(entry.userCode, entry.deviceId);
@@ -111,6 +121,57 @@ export class PairStore {
     const entry = this.lookupByCode(userCode);
     if (!entry) throw new PairError("unknown", "no such pair code");
     if (entry.status === "pending") entry.status = "denied";
+  }
+
+  /** Single uniform confirm path used by the XRPC handler.
+   *
+   *  SECURITY: this exists so unknown-vs-known codes are indistinguishable
+   *  to the caller (both yield `{ ok: false }` — no 404-vs-409 oracle that
+   *  would confirm a code exists) AND so guessing is throttled: each failed
+   *  attempt against a live code is counted, and past MAX_CONFIRM_ATTEMPTS
+   *  the code is force-denied (consumed). A first-try legitimate approve is
+   *  well under the cap.
+   *
+   *  Returns `{ ok: true, status }` only on a successful approve/deny of a
+   *  live pending code; every other outcome (unknown code, wrong state,
+   *  over-cap) returns `{ ok: false }` with the same shape. */
+  confirm(
+    userCode: string,
+    decision: "approve" | "deny",
+    session: ProviderSession | null,
+  ): ConfirmResult {
+    const entry = this.lookupByCode(userCode);
+    // Unknown code: nothing to throttle (no entry to key attempts on) and,
+    // critically, the response is identical to a mismatched-but-known code,
+    // so this does not reveal whether the code exists.
+    if (!entry) return { ok: false };
+
+    if (entry.status !== "pending") {
+      // Not actionable (already approved/denied/expired/consumed). Count it
+      // as a failed attempt so repeated hammering still trips the cap.
+      this.registerFailedAttempt(entry);
+      return { ok: false };
+    }
+
+    if (decision === "deny") {
+      entry.status = "denied";
+      return { ok: true, status: "denied" };
+    }
+
+    if (!session) return { ok: false }; // approve requires a session
+    entry.status = "approved";
+    entry.session = session;
+    return { ok: true, status: "approved" };
+  }
+
+  /** Bump the failed-attempt counter for a code; force-deny once the cap is
+   *  exceeded so a live pending code can't be brute-forced indefinitely. */
+  private registerFailedAttempt(entry: PairEntry): void {
+    entry.failedAttempts += 1;
+    if (entry.failedAttempts >= MAX_CONFIRM_ATTEMPTS && entry.status === "pending") {
+      entry.status = "denied";
+      this.byCode.delete(entry.userCode);
+    }
   }
 
   poll(deviceId: string): PollResult {
@@ -166,6 +227,11 @@ export type PollResult =
   | { kind: "expired" }
   | { kind: "consumed" }
   | { kind: "session"; session: ProviderSession };
+
+/** Uniform outcome of `PairStore.confirm`. On failure the shape is identical
+ *  regardless of cause (unknown code, wrong state, over-cap) so the caller
+ *  cannot use it as a code-existence oracle. */
+export type ConfirmResult = { ok: true; status: "approved" | "denied" } | { ok: false };
 
 export class PairError extends Error {
   readonly code: string;

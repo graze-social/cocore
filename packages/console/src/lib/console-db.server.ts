@@ -142,6 +142,21 @@ CREATE TABLE IF NOT EXISTS mdm_attestation_chains (
   chain_json TEXT NOT NULL,
   captured_at TEXT NOT NULL
 );
+
+-- Owner binding for a device serial: which authenticated agent DID
+-- provisioned (requested attestation for) it. WITHOUT this binding the
+-- attestation-chain store is keyed by serial alone, so any authenticated
+-- agent could read ANY device's Apple attestation chain by guessing a
+-- serial (a cross-tenant IDOR). We record the caller's DID at
+-- request-attestation time and enforce it (fail-closed) on the
+-- attestation-chain GET: a caller may only read the chain for a serial it
+-- provisioned. See mdm-coordinator.server.ts putDeviceProvisioning /
+-- getDeviceProvisioningDid and routes/api/agent.mdm.attestation-chain.ts.
+CREATE TABLE IF NOT EXISTS mdm_device_provisioning (
+  serial TEXT PRIMARY KEY,
+  did TEXT NOT NULL,
+  provisioned_at TEXT NOT NULL
+);
 `;
 
 // Indexes run after runMigrations() so they can reference columns
@@ -158,6 +173,9 @@ CREATE INDEX IF NOT EXISTS pending_disputes_status_idx
   ON pending_disputes(status);
 
 CREATE INDEX IF NOT EXISTS bug_reports_did_idx ON bug_reports(did);
+
+CREATE INDEX IF NOT EXISTS mdm_device_provisioning_did_idx
+  ON mdm_device_provisioning(did);
 `;
 
 // ── Schema migrations ─────────────────────────────────────────────────
