@@ -60,7 +60,9 @@ export const jsonBody: Effect.Effect<unknown, Error, HttpServerRequest.HttpServe
           });
     }),
     Effect.catchAll((e) =>
-      Effect.fail(e instanceof Error && e.message === "body too large" ? e : new Error("body must be JSON")),
+      Effect.fail(
+        e instanceof Error && e.message === "body too large" ? e : new Error("body must be JSON"),
+      ),
     ),
   );
 
