@@ -388,8 +388,7 @@ impl Engine for OpenAiEngine {
                 "endpoint returned HTTP {status} (streaming body elided to avoid content logging)"
             );
         }
-        let (tokens_in, tokens_out) =
-            read_sse_stream(&mut resp, on_delta, &request.model)?;
+        let (tokens_in, tokens_out) = read_sse_stream(&mut resp, on_delta, &request.model)?;
         Ok(GenerateResponse {
             text: String::new(),
             tokens_in,

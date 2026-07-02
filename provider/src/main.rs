@@ -3315,7 +3315,8 @@ const LLAMA_START_MAX_ATTEMPTS: u32 = 3;
 fn start_llama_engine_with_recovery(
     model: &str,
     config: &cocore_provider::engines::llama_server::LlamaServerConfig,
-) -> std::result::Result<cocore_provider::engines::llama_server::LlamaCppEngine, LlamaStartFailure> {
+) -> std::result::Result<cocore_provider::engines::llama_server::LlamaCppEngine, LlamaStartFailure>
+{
     use cocore_provider::engines::llama_server::LlamaCppEngine;
     let mut last_err: Option<String> = None;
     for attempt in 1..=LLAMA_START_MAX_ATTEMPTS {

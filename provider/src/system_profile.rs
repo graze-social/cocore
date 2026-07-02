@@ -344,7 +344,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_ram_is_nonzero() {
-        assert!(linux::total_ram_gb() > 0, "/proc/meminfo should be readable");
+        assert!(
+            linux::total_ram_gb() > 0,
+            "/proc/meminfo should be readable"
+        );
     }
 
     #[cfg(target_os = "linux")]

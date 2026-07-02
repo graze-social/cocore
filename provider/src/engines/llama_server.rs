@@ -200,7 +200,13 @@ impl LlamaCppEngine {
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
                 Ok(())
             });
         }
@@ -518,7 +524,10 @@ mod tests {
     fn model_source_hf_for_repo_id() {
         assert_eq!(
             model_source_args("bartowski/Qwen2.5-7B-Instruct-GGUF"),
-            vec!["-hf".to_string(), "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string()]
+            vec![
+                "-hf".to_string(),
+                "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string()
+            ]
         );
     }
 

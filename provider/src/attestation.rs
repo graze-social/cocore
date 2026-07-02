@@ -472,8 +472,8 @@ pub fn build(
     // lockdown in "confidentiality" mode (its analogue: denies ptrace of other
     // tasks, kprobes, /dev/mem, BPF kernel reads, unsigned modules). See the
     // `kernelLockdown` lexicon field. A verifier applies the same substitution.
-    let os_integrity_locked = inputs.sip_enabled
-        || inputs.kernel_lockdown.as_deref() == Some("confidentiality");
+    let os_integrity_locked =
+        inputs.sip_enabled || inputs.kernel_lockdown.as_deref() == Some("confidentiality");
     let confidential_capable = inputs.in_process_backend
         && !inputs.get_task_allow
         && inputs.hardened_runtime

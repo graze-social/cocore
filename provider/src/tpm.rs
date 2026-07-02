@@ -123,7 +123,10 @@ impl<'a> Reader<'a> {
             .checked_add(n)
             .ok_or_else(|| anyhow::anyhow!("length overflow"))?;
         if end > self.b.len() {
-            bail!("TPMS_ATTEST truncated (wanted {n} bytes at offset {})", self.i);
+            bail!(
+                "TPMS_ATTEST truncated (wanted {n} bytes at offset {})",
+                self.i
+            );
         }
         let s = &self.b[self.i..end];
         self.i = end;
@@ -204,7 +207,10 @@ mod tests {
     #[test]
     fn parser_finds_magic_type_and_qualifying_data() {
         let q = quoted();
-        assert_eq!(u32::from_be_bytes([q[0], q[1], q[2], q[3]]), TPM_GENERATED_VALUE);
+        assert_eq!(
+            u32::from_be_bytes([q[0], q[1], q[2], q[3]]),
+            TPM_GENERATED_VALUE
+        );
         assert_eq!(u16::from_be_bytes([q[4], q[5]]), TPM_ST_ATTEST_QUOTE);
         // extraData must equal sha256(pubkey).
         let extra = parse_quote_extra_data(&q).unwrap();

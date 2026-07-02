@@ -244,7 +244,11 @@ mod tests {
         //   macOS: 40 chars (20-byte cdhash from csops)
         //   Linux: 64 chars (32-byte SHA-256 of /proc/self/exe)
         if let Some(h) = &info.cd_hash {
-            assert!(h.len() == 40 || h.len() == 64, "unexpected hash length {}", h.len());
+            assert!(
+                h.len() == 40 || h.len() == 64,
+                "unexpected hash length {}",
+                h.len()
+            );
             assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
         }
     }
