@@ -302,6 +302,21 @@ export function handleConnection(
     void onMessage(msg);
   });
 
+  // A session-targeting frame (chunk/keepalive/complete) is honored only from
+  // the exact socket the session was dispatched to. An unregistered socket, or
+  // one registered as a different provider/machine, cannot inject into or
+  // complete a session it doesn't own.
+  const ownsSession = (sessionId: string): boolean => {
+    const owner = sessions.ownerOf(sessionId);
+    return (
+      !!owner &&
+      !!registeredDid &&
+      !!registeredMachineId &&
+      owner.providerDid === registeredDid &&
+      owner.providerMachineId === registeredMachineId
+    );
+  };
+
   const onMessage = async (msg: AdvisorMessage): Promise<void> => {
     switch (msg.type) {
       case "register": {
@@ -445,9 +460,7 @@ export function handleConnection(
         return;
       }
       case "inference_chunk": {
-        if (!sessions.has(msg.session_id)) {
-          return;
-        }
+        if (!ownsSession(msg.session_id)) return;
         sessions.write(msg.session_id, {
           type: "chunk",
           sessionId: msg.session_id,
@@ -461,12 +474,16 @@ export function handleConnection(
         // "Still generating" — reset the session idle timer so a slow-but-
         // alive job (long prefill / slow decode) isn't killed as silent.
         // Not relayed to the requester; doesn't count as a token.
-        if (sessions.has(msg.session_id)) {
+        if (ownsSession(msg.session_id)) {
           sessions.keepalive(msg.session_id);
         }
         return;
       }
       case "inference_complete": {
+        // Only the provider a session was dispatched to may complete it —
+        // otherwise any connected provider could forge another session's
+        // completion (bogus receipt_uri / token counts, premature close).
+        if (!ownsSession(msg.session_id)) return;
         // A completion proves this machine isn't silently dropping work —
         // record it so the silent-failure detector clears, bad standing is
         // restored, and the dispatch counter has a denominator.

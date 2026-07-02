@@ -1,6 +1,6 @@
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 import {
   type CasRecordStore,
   isRecordNotFound,
@@ -17,7 +17,7 @@ function mirrorDeleteToBridge(uri: string): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.unpublish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({ uri }),
   }).catch(() => {
     // swallowed — the AppView will eventually catch up via firehose
@@ -44,7 +44,7 @@ function mirrorPutToBridge(args: {
   const uri = `at://${args.did}/${PROVIDER_COLLECTION}/${args.rkey}`;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({
       uri,
       cid: args.cid,

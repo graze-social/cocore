@@ -602,8 +602,13 @@ async function main() {
   const appview = buildAppviewSplit(store, {
     accountStore,
     appviewDid: APPVIEW_DID,
-    // The bridge runs in this same process; mirror PDS writes to it.
+    // The bridge runs in this same process; mirror PDS writes to it. The
+    // bridge's mutating routes now require the internal key, so hand the
+    // AppView the same token to authenticate its best-effort mirror POSTs.
     bridgeUrl: BRIDGE_URL,
+    bridgeAuthToken: Option.isSome(INTERNAL_API_KEY)
+      ? Redacted.value(INTERNAL_API_KEY.value)
+      : undefined,
     internalSecret: Option.isSome(INTERNAL_SECRET)
       ? Redacted.value(INTERNAL_SECRET.value)
       : undefined,
@@ -670,6 +675,7 @@ async function main() {
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.publish",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as IndexedRecord;
@@ -727,6 +733,7 @@ async function main() {
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.unpublish",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as { uri?: string };
@@ -738,6 +745,7 @@ async function main() {
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.purge",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as { did?: string };
@@ -957,6 +965,23 @@ async function main() {
           return err(403, {
             error: "wipe disabled; set COCORE_ALLOW_WIPE=1 on the services container",
           });
+        }
+        // Railway copies production env vars (incl. COCORE_INTERNAL_API_KEY)
+        // into forked preview environments. Refuse to run a destructive wipe in
+        // any non-production Railway env unless explicitly overridden, so an
+        // inherited key can't wipe from a preview origin. Locales without
+        // RAILWAY_ENVIRONMENT_NAME (bare-node / docker dev) are unaffected.
+        {
+          const railwayEnv = process.env["RAILWAY_ENVIRONMENT_NAME"];
+          if (
+            railwayEnv &&
+            railwayEnv !== "production" &&
+            process.env["COCORE_ALLOW_WIPE_NONPROD"] !== "1"
+          ) {
+            return err(403, {
+              error: `wipe blocked in non-production Railway env '${railwayEnv}'; set COCORE_ALLOW_WIPE_NONPROD=1 to override`,
+            });
+          }
         }
         try {
           const counts: Record<string, number> = {};

@@ -50,6 +50,10 @@ export interface PdsWriteContext {
   /** Bridge base URL for the best-effort AppView-cache mirror. When unset,
    *  writes still land on the PDS and the firehose catches up. */
   bridgeUrl?: string;
+  /** Internal API key the bridge's mutating routes now require. Attached as a
+   *  Bearer to the best-effort mirror POSTs; when unset the mirror is sent
+   *  unauthenticated (dev/local bridges without the gate). */
+  bridgeAuthToken?: string;
 }
 
 // ---- small helpers --------------------------------------------------
@@ -83,11 +87,15 @@ function mirrorPublish(
     repo: string;
     record: Record<string, unknown>;
   },
+  token?: string,
 ): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl.replace(/\/$/, "")}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({
       uri: args.uri,
       cid: args.cid,
@@ -101,11 +109,14 @@ function mirrorPublish(
   });
 }
 
-function mirrorUnpublish(bridgeUrl: string | undefined, uri: string): void {
+function mirrorUnpublish(bridgeUrl: string | undefined, uri: string, token?: string): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl.replace(/\/$/, "")}/xrpc/dev.cocore.bridge.unpublish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ uri }),
   }).catch(() => {
     /* swallowed — firehose catches up */
@@ -247,13 +258,17 @@ async function doCreate(
     cid: string;
     commit?: { cid: string; rev: string };
   };
-  mirrorPublish(ctx.bridgeUrl, {
-    uri: out.uri,
-    cid: out.cid,
-    collection: a.collection,
-    repo: did,
-    record: a.record,
-  });
+  mirrorPublish(
+    ctx.bridgeUrl,
+    {
+      uri: out.uri,
+      cid: out.cid,
+      collection: a.collection,
+      repo: did,
+      record: a.record,
+    },
+    ctx.bridgeAuthToken,
+  );
   return ok({ uri: out.uri, cid: out.cid, commit: out.commit });
 }
 
@@ -288,13 +303,17 @@ async function doPut(
     });
   }
   const out = (await r.json()) as { uri: string; cid: string };
-  mirrorPublish(ctx.bridgeUrl, {
-    uri: out.uri,
-    cid: out.cid,
-    collection: a.collection,
-    repo: did,
-    record: a.record,
-  });
+  mirrorPublish(
+    ctx.bridgeUrl,
+    {
+      uri: out.uri,
+      cid: out.cid,
+      collection: a.collection,
+      repo: did,
+      record: a.record,
+    },
+    ctx.bridgeAuthToken,
+  );
   return ok({ uri: out.uri, cid: out.cid });
 }
 
@@ -325,7 +344,7 @@ async function doDelete(
     const text = await r.text().catch(() => "");
     // Already-gone collapses to success so the agent's dedup loop moves on.
     if (r.status === 404 || /not.*locate|InvalidSwap|not.*found/i.test(text)) {
-      mirrorUnpublish(ctx.bridgeUrl, uri);
+      mirrorUnpublish(ctx.bridgeUrl, uri, ctx.bridgeAuthToken);
       return ok({ uri, alreadyGone: true });
     }
     return err(r.status >= 500 ? 502 : r.status, {
@@ -333,7 +352,7 @@ async function doDelete(
       message: `deleteRecord ${a.collection}: ${text.slice(0, 300)}`,
     });
   }
-  mirrorUnpublish(ctx.bridgeUrl, uri);
+  mirrorUnpublish(ctx.bridgeUrl, uri, ctx.bridgeAuthToken);
   return ok({ uri });
 }
 

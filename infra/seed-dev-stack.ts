@@ -58,7 +58,12 @@ function encodeInt(b: Uint8Array): number[] {
 async function publish(bridge: string, record: Record<string, unknown>): Promise<void> {
   const res = await fetch(`${bridge}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(process.env["COCORE_INTERNAL_API_KEY"]
+        ? { authorization: `Bearer ${process.env["COCORE_INTERNAL_API_KEY"]}` }
+        : {}),
+    },
     body: JSON.stringify(record),
   });
   if (!res.ok) throw new Error(`publish ${record["uri"]}: ${res.status} ${await res.text()}`);

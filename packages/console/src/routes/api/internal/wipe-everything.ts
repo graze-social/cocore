@@ -156,6 +156,28 @@ export const Route = createFileRoute("/api/internal/wipe-everything")({
             403,
           );
         }
+        // Railway forks preview environments from production and copies its
+        // variables (including COCORE_INTERNAL_API_KEY). This endpoint deletes
+        // every signed-in user's dev.cocore.* records off their real PDS, so
+        // refuse to run in any non-production Railway env unless explicitly
+        // overridden — an inherited key must not be able to wipe from a preview
+        // origin. Environments without RAILWAY_ENVIRONMENT_NAME (local dev) are
+        // unaffected.
+        {
+          const railwayEnv = process.env["RAILWAY_ENVIRONMENT_NAME"];
+          if (
+            railwayEnv &&
+            railwayEnv !== "production" &&
+            process.env["COCORE_ALLOW_WIPE_NONPROD"] !== "1"
+          ) {
+            return jsonResponse(
+              {
+                error: `wipe blocked in non-production Railway env '${railwayEnv}'; set COCORE_ALLOW_WIPE_NONPROD=1 to override`,
+              },
+              403,
+            );
+          }
+        }
 
         // 1. Walk every stored OAuth session and wipe that DID's PDS.
         //    Run BEFORE truncating oauth_sessions so we still have the

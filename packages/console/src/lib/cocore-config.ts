@@ -27,6 +27,16 @@ export interface CocoreConfig {
   internalApiKey: string;
 }
 
+/** Headers for a best-effort mirror POST to the services bridge. Includes the
+ *  internal API key the bridge's mutating routes now require. */
+export function bridgeHeaders(): Record<string, string> {
+  const key = process.env["COCORE_INTERNAL_API_KEY"] ?? "";
+  return {
+    "content-type": "application/json",
+    ...(key ? { authorization: `Bearer ${key}` } : {}),
+  };
+}
+
 export function cocoreConfig(): CocoreConfig {
   return {
     bridgeUrl: process.env["COCORE_BRIDGE_URL"] ?? "http://localhost:8080",

@@ -43,6 +43,10 @@ export interface BuildServerOptions {
   appviewDid?: string;
   /** Bridge base URL for the best-effort cache mirror on PDS writes. */
   bridgeUrl?: string;
+  /** Internal API key the bridge's mutating routes now require. Threaded into
+   *  the PDS-write + inference mirror paths so their best-effort bridge POSTs
+   *  carry the Bearer the gate expects. */
+  bridgeAuthToken?: string;
   /** Shared secret the console presents to hand off a freshly minted
    *  OAuth session (`POST /internal/oauth-session`). When unset, the
    *  handoff endpoints are not registered. */
@@ -228,7 +232,12 @@ function buildAppviewRouters(
   // PDS-write executor + its `/api/pds/*` alias (a paired agent's apiBase
   // points at this AppView and appends `/api/pds/...`).
   if (opts.accountStore && oauth) {
-    const pctx = { accounts: opts.accountStore, oauth, bridgeUrl: opts.bridgeUrl };
+    const pctx = {
+      accounts: opts.accountStore,
+      oauth,
+      bridgeUrl: opts.bridgeUrl,
+      bridgeAuthToken: opts.bridgeAuthToken,
+    };
     const pds = buildPdsRouter(pctx);
     routers.push(pds, pds.pipe(HttpRouter.prefixAll("/api")));
     // Deprecated legacy alias: agents still on the pre-cutover
@@ -274,6 +283,7 @@ function buildAppviewRouters(
         advisorUrl: opts.advisorUrl,
         exchangeDid: opts.exchangeDid ?? "did:web:exchange.local",
         bridgeUrl: opts.bridgeUrl,
+        bridgeAuthToken: opts.bridgeAuthToken,
       }),
     );
     console.error("appview: inference.dispatch endpoint enabled");
@@ -357,6 +367,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     accountStore,
     appviewDid,
     bridgeUrl: process.env["COCORE_BRIDGE_URL"],
+    bridgeAuthToken: process.env["COCORE_INTERNAL_API_KEY"],
     internalSecret: process.env["COCORE_INTERNAL_SECRET"],
   });
   createServer(handler).listen(port, () => {

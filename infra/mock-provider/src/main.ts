@@ -20,7 +20,12 @@ let attCount = 0;
 async function publish(rec: IndexedRecord): Promise<void> {
   const res = await fetch(`${BRIDGE}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(process.env["COCORE_INTERNAL_API_KEY"]
+        ? { authorization: `Bearer ${process.env["COCORE_INTERNAL_API_KEY"]}` }
+        : {}),
+    },
     body: JSON.stringify(rec),
   });
   if (!res.ok) {

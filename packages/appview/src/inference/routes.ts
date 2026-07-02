@@ -53,6 +53,9 @@ export interface InferenceContext {
   /** Bridge base URL for the best-effort AppView-cache mirror on the job
    *  write. When unset, writes still land on the PDS and firehose catches up. */
   bridgeUrl?: string;
+  /** Internal API key the bridge's mutating routes now require. Attached as a
+   *  Bearer to the best-effort mirror POST; unset ⇒ unauthenticated mirror. */
+  bridgeAuthToken?: string;
 }
 
 interface DispatchBody {
@@ -226,6 +229,7 @@ function parseDispatch(body: DispatchBody): ParsedDispatch | string {
 function sessionTransport(
   session: RestoredSession,
   bridgeUrl: string | undefined,
+  bridgeAuthToken?: string,
 ): RecordTransport {
   return {
     async publish<T extends Record<string, unknown>>(args: {
@@ -253,7 +257,10 @@ function sessionTransport(
         const rkey = out.uri.split("/").pop() ?? "";
         void fetch(`${bridgeUrl.replace(/\/$/, "")}/xrpc/dev.cocore.bridge.publish`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            ...(bridgeAuthToken ? { authorization: `Bearer ${bridgeAuthToken}` } : {}),
+          },
           body: JSON.stringify({
             uri: out.uri,
             cid: out.cid,
@@ -333,7 +340,7 @@ export function buildInferenceRouter(ctx: InferenceContext): HttpRouter.HttpRout
           {
             advisorUrl: ctx.advisorUrl,
             exchangeDid: ctx.exchangeDid,
-            transport: sessionTransport(session, ctx.bridgeUrl),
+            transport: sessionTransport(session, ctx.bridgeUrl, ctx.bridgeAuthToken),
             getProfile: storeProfileFetcher(ctx.store),
           },
         );

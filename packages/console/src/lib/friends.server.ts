@@ -24,7 +24,7 @@
 
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
 const FRIEND_COLLECTION = "dev.cocore.account.friend";
 
@@ -44,7 +44,7 @@ function mirrorFriendToBridge(args: {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({
       uri: args.uri,
       cid: args.cid,
@@ -63,7 +63,7 @@ function mirrorFriendDeleteToBridge(uri: string): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.unpublish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({ uri }),
   }).catch(() => {});
 }

@@ -29,7 +29,7 @@ import type { OAuthSession } from "@atcute/oauth-node-client";
 
 import { deleteConsoleUserPrefsForDid } from "@/lib/console-user-prefs.server.ts";
 import { consoleDb } from "@/lib/console-db.server.ts";
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
 // Every `dev.cocore.compute.*` collection the user might have written
 // to. Keep this in lockstep with `lexicons/dev/cocore/compute/*` — a
@@ -111,7 +111,7 @@ async function purgeAppview(did: string): Promise<number> {
   try {
     const r = await fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.purge`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: bridgeHeaders(),
       body: JSON.stringify({ did }),
     });
     if (!r.ok) return 0;

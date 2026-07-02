@@ -146,6 +146,17 @@ export class SessionManager {
     return this.bySessionId.has(sessionId);
   }
 
+  /** The provider (DID + machine) a session was dispatched to, or undefined
+   *  if there's no such session. The WS handler uses this to reject
+   *  `inference_*` frames from any socket other than the one the job was
+   *  actually sent to — without it, any connected provider could inject
+   *  chunks into, or forge the completion of, another provider's session. */
+  ownerOf(sessionId: string): { providerDid: string; providerMachineId: string } | undefined {
+    const e = this.bySessionId.get(sessionId);
+    if (!e) return undefined;
+    return { providerDid: e.providerDid, providerMachineId: e.providerMachineId };
+  }
+
   size(): number {
     return this.bySessionId.size;
   }

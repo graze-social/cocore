@@ -42,13 +42,17 @@ export interface RecordTransport {
 }
 
 /** Bridge transport. Targets the in-process firehose used by
- *  `infra/services` and the local docker stack. The bridge does not
- *  authenticate writes — caller passes the requester's DID directly. */
+ *  `infra/services` and the local docker stack. The caller passes the
+ *  requester's DID directly. The dev bridge's mutating routes now require the
+ *  internal API key, so pass `token` (COCORE_INTERNAL_API_KEY) to attach it as
+ *  a Bearer; omit it only for a bridge deployed without the gate. */
 export class BridgeRecordTransport implements RecordTransport {
   private readonly endpoint: string;
+  private readonly token: string | undefined;
 
-  constructor(opts: { endpoint: string }) {
+  constructor(opts: { endpoint: string; token?: string }) {
     this.endpoint = opts.endpoint.replace(/\/$/, "");
+    this.token = opts.token;
   }
 
   async publish<T extends Record<string, unknown>>(args: {
@@ -69,7 +73,10 @@ export class BridgeRecordTransport implements RecordTransport {
     };
     const res = await fetch(`${this.endpoint}/xrpc/dev.cocore.bridge.publish`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+      },
       body: JSON.stringify(body),
     });
     if (!res.ok) {

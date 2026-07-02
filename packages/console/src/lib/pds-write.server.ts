@@ -25,7 +25,7 @@ import {
 } from "@/integrations/auth/atproto.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
 import { forwardPdsWrite, isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
 /** Collection NSIDs these endpoints will write to a user's PDS. We allow
  *  the full `dev.cocore.*` namespace (compute.* receipts/jobs/etc. AND
@@ -56,7 +56,7 @@ function mirrorToBridge(args: {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({
       uri: args.uri,
       cid: args.cid,
@@ -75,7 +75,7 @@ function mirrorDeleteToBridge(uri: string): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.unpublish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({ uri }),
   }).catch(() => {
     // swallowed — AppView eventually catches up via firehose
