@@ -39,8 +39,9 @@ const HOST_ALLOWLIST = (process.env["COCORE_IMAGE_FETCH_ALLOW_HOSTS"] ?? "")
   .filter((h) => h.length > 0);
 
 /** A deliberately opaque error — callers surface it verbatim so no upstream
- *  status, content-type, host, or reachability signal leaks to the requester. */
-export class ImageFetchError extends Error {
+ *  status, content-type, host, or reachability signal leaks to the requester.
+ *  Internal to this module (not exported): callers just see the generic message. */
+class ImageFetchError extends Error {
   constructor() {
     super("image fetch failed");
     this.name = "ImageFetchError";
@@ -93,7 +94,12 @@ function isBlockedIpv6(ip: string): boolean {
   const embedded = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
   if (embedded) return isBlockedIpv4(embedded[1]!);
   if (lower === "::" || lower === "::1") return true; // unspecified / loopback
-  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
+  if (
+    lower.startsWith("fe8") ||
+    lower.startsWith("fe9") ||
+    lower.startsWith("fea") ||
+    lower.startsWith("feb")
+  ) {
     return true; // fe80::/10 link-local
   }
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // fc00::/7 ULA
