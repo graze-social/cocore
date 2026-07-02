@@ -14,7 +14,21 @@
 //   * Strings escaped with the smallest legal form: \", \\, \b, \f, \n,
 //     \r, \t, and \u00XX (lowercase hex) for control characters.
 //   * Numbers: integers only. Floats throw. Lexicon-defined numeric
-//     fields are integer; we never sign over a float.
+//     fields are integer; we never sign over a float. Integer magnitude
+//     is capped to the JS safe-integer range (|n| <= 2^53-1); anything
+//     larger throws rather than emitting a silently-rounded value. This
+//     stays inside Rust's i64/u64 range (canonical.rs), so the byte
+//     contract holds for every value we can faithfully round-trip.
+//
+// Byte-identical contract: this serializer, provider/src/canonical.rs, and
+// sdk/py/cocore/canonical.py MUST emit the same bytes for the same value.
+// The one subtle divergence is object-key ordering — Rust sorts by UTF-8
+// byte order (== Unicode code point order) and Python by code point, but
+// JS Array.prototype.sort orders by UTF-16 code unit, which disagrees for
+// astral-plane (surrogate-pair) keys. Every key in our lexicons is ASCII,
+// so rather than reimplement a code-point sort we REJECT any non-ASCII
+// object key here (and Python rejects the same). That keeps all three
+// implementations provably byte-identical.
 //   * Booleans: true / false.
 //   * null is allowed.
 //   * Bytes (signatures etc.) are base64-encoded by callers BEFORE
@@ -54,10 +68,24 @@ function emit(out: string[], v: unknown): void {
     if (!Number.isInteger(v)) {
       throw new CanonicalError("floating-point numbers are not allowed in signed records");
     }
+    // Cap to the JS safe-integer range. Above it, `String(v)` emits a
+    // silently-rounded value that no other implementation would reproduce,
+    // so reject rather than sign over an ambiguous number.
+    if (!Number.isSafeInteger(v)) {
+      throw new CanonicalError(
+        `integer ${v} exceeds the safe-integer range (|n| <= 2^53-1) and cannot be canonicalised`,
+      );
+    }
     out.push(String(v));
     return;
   }
   if (typeof v === "bigint") {
+    // Bound to Rust's i64/u64 range (canonical.rs uses as_i64 || as_u64).
+    if (v < -(2n ** 63n) || v > 2n ** 64n - 1n) {
+      throw new CanonicalError(
+        `bigint ${v} is outside the signed/unsigned 64-bit range and cannot be canonicalised`,
+      );
+    }
     out.push(v.toString());
     return;
   }
@@ -76,7 +104,22 @@ function emit(out: string[], v: unknown): void {
   }
   if (typeof v === "object") {
     const obj = v as Record<string, unknown>;
-    const keys = Object.keys(obj).sort();
+    const keys = Object.keys(obj);
+    // Reject non-ASCII keys: Array.prototype.sort orders by UTF-16 code unit,
+    // which diverges from the code-point order Rust/Python use for astral-plane
+    // keys. Every key in our lexicons is ASCII, so rejecting keeps all three
+    // canonicalisers byte-identical instead of risking a silent sort mismatch.
+    for (const k of keys) {
+      for (let i = 0; i < k.length; i++) {
+        if (k.charCodeAt(i) > 0x7f) {
+          throw new CanonicalError(
+            `object key ${JSON.stringify(k)} contains a non-ASCII character; ` +
+              "canonical keys must be ASCII for cross-language byte parity",
+          );
+        }
+      }
+    }
+    keys.sort();
     out.push("{");
     for (let i = 0; i < keys.length; i++) {
       if (i > 0) out.push(",");

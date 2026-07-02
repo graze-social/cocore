@@ -35,6 +35,32 @@ import { Cache, Duration, Effect, Exit } from "effect";
 /** Tolerance for clock skew between the issuing PDS and us. */
 const CLOCK_SKEW_SECONDS = 30;
 
+/** Max accepted token lifetime (L9). A captured service-auth JWT replays until
+ *  its `exp`; a malicious or buggy issuer can set `exp` far in the future,
+ *  widening that window arbitrarily. Reject any token whose `exp` is more than
+ *  this far out, so even a leaked token expires quickly. Service-auth tokens
+ *  are minted per-call right before use, so a few minutes is ample. */
+const MAX_TOKEN_LIFETIME_SECONDS = 5 * 60;
+
+/** In-memory replay guard (L9). When a token carries a `jti`, remember it for
+ *  the token's remaining lifetime and reject a second presentation — a captured
+ *  token can't be replayed within its (now short) validity window. Best-effort:
+ *  per-process only (fine for our single-listener AppView) and additive (tokens
+ *  without a `jti` are unaffected). Entries are pruned lazily on insert. */
+const seenJti = new Map<string, number>();
+
+function jtiAlreadySeen(jti: string, expMs: number): boolean {
+  const now = Date.now();
+  // Opportunistic prune so the map can't grow without bound.
+  if (seenJti.size > 10_000) {
+    for (const [k, v] of seenJti) if (v <= now) seenJti.delete(k);
+  }
+  const prior = seenJti.get(jti);
+  if (prior !== undefined && prior > now) return true;
+  seenJti.set(jti, expMs);
+  return false;
+}
+
 /** Success carries the authenticated DID; failure carries everything a
  *  handler needs to emit an error response. Distinct error codes mirror
  *  the standard atproto auth-failure vocabulary so callers can tell an
@@ -111,6 +137,7 @@ interface JwtPayload {
   lxm?: unknown;
   exp?: unknown;
   nbf?: unknown;
+  jti?: unknown;
 }
 
 function decodeJson(segment: string): unknown {
@@ -165,7 +192,7 @@ export async function verifyServiceAuthToken(
     return fail(401, "BadJwt", "unsupported JWT alg (expected ES256 or ES256K)");
   }
 
-  const { iss, aud, lxm, exp, nbf } = payload;
+  const { iss, aud, lxm, exp, nbf, jti } = payload;
 
   if (typeof iss !== "string" || !isDid(iss)) {
     return fail(401, "BadJwtIssuer", "iss must be a DID");
@@ -188,6 +215,13 @@ export async function verifyServiceAuthToken(
   }
   if (typeof nbf === "number" && nbf > now + CLOCK_SKEW_SECONDS) {
     return fail(401, "BadJwt", "token not yet valid");
+  }
+  // L9: cap the accepted lifetime so a captured (or maliciously long-lived)
+  // token can't replay for hours. `nbf` when present anchors the lower bound;
+  // otherwise measure from now.
+  const issuedFloor = typeof nbf === "number" ? nbf : now;
+  if (exp - issuedFloor > MAX_TOKEN_LIFETIME_SECONDS + CLOCK_SKEW_SECONDS) {
+    return fail(401, "BadJwt", "token lifetime exceeds the maximum allowed");
   }
 
   // Resolve the issuer's DID document and pull the atproto signing key.
@@ -214,6 +248,16 @@ export async function verifyServiceAuthToken(
     return fail(401, "BadJwtSignature", "signature verification failed");
   }
   if (!verified) return fail(401, "BadJwtSignature", "signature verification failed");
+
+  // L9: single-use replay guard for tokens carrying a `jti`. Recorded only
+  // AFTER the signature verifies, so an attacker can't pre-poison the cache
+  // with a victim's jti on an unsigned token to deny the legitimate call.
+  // Additive — tokens without a `jti` are accepted exactly as before.
+  if (typeof jti === "string" && jti.length > 0) {
+    if (jtiAlreadySeen(jti, exp * 1000)) {
+      return fail(401, "JwtReplayed", "token already used");
+    }
+  }
 
   return { ok: true, did: iss };
 }

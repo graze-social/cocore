@@ -19,7 +19,10 @@
 // which receipts we've already settled, and that's recoverable from
 // our PDS.
 
+import type { Database as DB } from "better-sqlite3";
+
 import { SettlementPublisher, type PublishedRecord } from "./publisher.ts";
+import { SettlementStore } from "./settlement-store.ts";
 import { type PrivateJwk, signSettlement } from "./signing.ts";
 import type {
   AttestationRecord,
@@ -72,6 +75,14 @@ export interface ExchangeConfig {
   /** Resolves a strong-ref to its body. The firehose subscriber
    *  fills this out at runtime; tests pass an in-memory Map. */
   resolveRecord: (uri: string) => Promise<IndexedRecord | null>;
+  /** Durable settlement-side state (settlement idempotency, single-use
+   *  authorization consumption, sessionBudget accrual). When provided,
+   *  settlement idempotency + authorization single-use survive a
+   *  restart and are enforced atomically with each charge. Wire the
+   *  same sqlite handle the TokenLedger uses. When omitted the exchange
+   *  falls back to in-memory idempotency only (fine for unit tests that
+   *  never restart, but NOT safe for production — pass a db). */
+  db?: DB;
 }
 
 export type SettlementOutcome =
@@ -82,10 +93,16 @@ export type SettlementOutcome =
 
 export class Exchange {
   private readonly cfg: ExchangeConfig;
+  /** In-memory fast-path cache in FRONT of the durable store. NOT the
+   *  sole idempotency guard — the atomic INSERT in SettlementStore is
+   *  authoritative and survives restarts / concurrent calls (M4). */
   private readonly settledByReceiptUri = new Map<string, PublishedRecord>();
+  /** Durable settlement state. Present iff cfg.db was supplied. */
+  private readonly store: SettlementStore | null;
 
   constructor(cfg: ExchangeConfig) {
     this.cfg = cfg;
+    this.store = cfg.db ? new SettlementStore(cfg.db) : null;
   }
 
   /** Process one receipt observation. Idempotent on receipt URI.
@@ -97,8 +114,30 @@ export class Exchange {
   async onReceipt(receiptIndexed: IndexedRecord<ReceiptRecord>): Promise<SettlementOutcome> {
     const receiptUri = receiptIndexed.uri;
 
+    // Fast-path duplicate check. The AUTHORITATIVE idempotency guard is
+    // the atomic INSERT in SettlementStore.consume below (M4) — this
+    // Map is only a cache in front of it and is empty after a restart.
     const prior = this.settledByReceiptUri.get(receiptUri);
     if (prior) return { kind: "duplicate", settlement: prior };
+    if (this.store?.isReceiptSettled(receiptUri)) {
+      // Settled in a prior process life; the settlement record itself
+      // lives on the PDS. We don't hold the PublishedRecord in memory,
+      // so surface a rejection with a clear code rather than a
+      // fabricated duplicate — the receipt is not re-charged either way.
+      return {
+        kind: "rejected",
+        report: {
+          ok: false,
+          findings: [
+            {
+              severity: "error",
+              code: "already-settled",
+              message: `receipt ${receiptUri} was already settled in a prior process`,
+            },
+          ],
+        },
+      };
+    }
 
     // Resolve the records the verifier needs.
     const jobRow = await this.cfg.resolveRecord(receiptIndexed.body.job.uri);
@@ -108,6 +147,31 @@ export class Exchange {
     const authRow = await this.cfg.resolveRecord(job.paymentAuthorization.uri);
     if (!authRow) return { kind: "resolve-failed", missing: job.paymentAuthorization.uri };
     const authorization = authRow.body as PaymentAuthorizationRecord;
+
+    // H2: the authorization MUST belong to the requester being debited.
+    // verifyForChargeStrict already ties the authorization to THIS
+    // exchange (authorization.exchange == exchangeDid) and to the job
+    // (job.paymentAuthorization.uri == auth uri), but nothing checked
+    // the authorization's OWNING REPO against receipt.requester. Without
+    // it, a provider could point the receipt's job at some other party's
+    // authorization and debit a stranger's budget. Mirror the
+    // attestation-owner binding below: the exchange holds both record
+    // repos, so it can bind identity here.
+    if (authRow.repo !== receiptIndexed.body.requester) {
+      return {
+        kind: "rejected",
+        report: {
+          ok: false,
+          findings: [
+            {
+              severity: "error",
+              code: "authorization-owner-mismatch",
+              message: `authorization ${job.paymentAuthorization.uri} is owned by ${authRow.repo}, not the receipt requester ${receiptIndexed.body.requester}`,
+            },
+          ],
+        },
+      };
+    }
 
     const attestationRow = await this.cfg.resolveRecord(receiptIndexed.body.attestation.uri);
     if (!attestationRow)
@@ -144,7 +208,12 @@ export class Exchange {
     const report = await verifyForChargeStrict(
       {
         exchangeDid: this.cfg.exchangeDid,
-        settledReceipts: new Set(this.settledByReceiptUri.keys()),
+        // Draw already-settled URIs from the durable store when present
+        // so the gate survives a restart; fall back to the in-memory
+        // cache otherwise.
+        settledReceipts: this.store
+          ? this.store.settledReceiptUris()
+          : new Set(this.settledByReceiptUri.keys()),
       },
       {
         receipt: receiptIndexed.body,
@@ -170,15 +239,85 @@ export class Exchange {
     // drive providerShare negative and break amountCharged = payout + fee.
     const isProBono = receiptIndexed.body.proBono === true;
     const isSelfLoop = jobRow.repo === receiptIndexed.repo;
+    const price = receiptIndexed.body.price.amount;
     const fee = isProBono
       ? 0
-      : computeFeeWithSelfLoop(
-          receiptIndexed.body.price.amount,
-          this.cfg.feePolicy,
-          this.cfg.selfLoop,
-          isSelfLoop,
-        );
-    const providerShare = receiptIndexed.body.price.amount - fee;
+      : computeFeeWithSelfLoop(price, this.cfg.feePolicy, this.cfg.selfLoop, isSelfLoop);
+    // M5: `fee` is already clamped to `price` inside computeFee, so
+    // providerShare can never go negative (which the PDS would reject —
+    // money.amount minimum:0 — stranding the receipt in a retry loop).
+    const providerShare = price - fee;
+
+    // H1/M4: atomically consume the authorization and durably record
+    // the settlement BEFORE publishing. This is the single point that
+    // rejects (a) a duplicate receipt across restarts/concurrency, (b) a
+    // second receipt spending an already-consumed singleJob
+    // authorization, and (c) a settlement that would push a session
+    // authorization past its sessionBudget. Done in one DB transaction
+    // so there is no window between check and record. When no db is
+    // configured (unit tests) we fall back to the in-memory guard only.
+    if (this.store) {
+      const outcome = this.store.consume({
+        receiptUri,
+        authorizationKey: authorizationIdentity(job.paymentAuthorization.uri, authorization),
+        // Pro-bono receipts charge 0 and take no exchange cut; they must
+        // not consume a single-use authorization or accrue against a
+        // session budget (all-zero invariant), so treat them as
+        // non-single-use with a 0 charge — the receipt-URI idempotency
+        // still applies.
+        singleUse: !isProBono && authorization.scope === "singleJob",
+        amountCharged: price,
+        sessionBudget:
+          authorization.scope === "session" ? authorization.sessionBudget?.amount : undefined,
+      });
+      if (outcome.kind === "duplicate-receipt") {
+        const cached = this.settledByReceiptUri.get(receiptUri);
+        if (cached) return { kind: "duplicate", settlement: cached };
+        return {
+          kind: "rejected",
+          report: {
+            ok: false,
+            findings: [
+              {
+                severity: "error",
+                code: "already-settled",
+                message: `receipt ${receiptUri} was already settled`,
+              },
+            ],
+          },
+        };
+      }
+      if (outcome.kind === "authorization-consumed") {
+        return {
+          kind: "rejected",
+          report: {
+            ok: false,
+            findings: [
+              {
+                severity: "error",
+                code: "authorization-already-consumed",
+                message: `payment authorization ${job.paymentAuthorization.uri} (scope=singleJob) was already consumed by another receipt`,
+              },
+            ],
+          },
+        };
+      }
+      if (outcome.kind === "budget-exceeded") {
+        return {
+          kind: "rejected",
+          report: {
+            ok: false,
+            findings: [
+              {
+                severity: "error",
+                code: "session-budget-exceeded",
+                message: `charge ${outcome.attempted} on top of ${outcome.alreadyCharged} already charged exceeds sessionBudget ${outcome.budget} for authorization ${job.paymentAuthorization.uri}`,
+              },
+            ],
+          },
+        };
+      }
+    }
 
     // Build + publish the settlement. The processor reference tags
     // settlement as internal-ledger rather than an external chain id.
@@ -205,13 +344,27 @@ export class Exchange {
   }
 }
 
-function computeFee(amountMinor: number, policy: FeePolicy): number {
+/** THE single fee computation. Both the settlement fee (here) and the
+ *  ledger's treasury-fee split (token-balance.ts) MUST derive their
+ *  fee from this so the published settlement and the recorded ledger
+ *  movement can never disagree (M5). Integer minor units only — no
+ *  floats near money.
+ *
+ *  M5 clamp: the bps fee is floored up to `minMinor`, then clamped DOWN
+ *  to `amountMinor` so the fee never exceeds the price and providerShare
+ *  (= amountMinor - fee) is never negative. A negative payout is
+ *  unpublishable (money.amount minimum:0), which would otherwise strand
+ *  a small-price receipt in an infinite retry loop. */
+export function computeFee(amountMinor: number, policy: FeePolicy): number {
   const bpsAmount = Math.floor((amountMinor * policy.bps) / 10_000);
-  return Math.max(bpsAmount, policy.minMinor);
+  const floored = Math.max(bpsAmount, policy.minMinor);
+  return Math.min(floored, amountMinor);
 }
 
 /** Self-loop-aware fee. Falls back to {@link computeFee} when the
- *  receipt isn't a self-loop or no rule is configured. */
+ *  receipt isn't a self-loop or no rule is configured. Self-loop flat
+ *  floors are likewise clamped to the price so a self-loop payout can't
+ *  go negative either. */
 function computeFeeWithSelfLoop(
   amountMinor: number,
   policy: FeePolicy,
@@ -220,5 +373,16 @@ function computeFeeWithSelfLoop(
 ): number {
   if (!isSelfLoop || !selfLoop) return computeFee(amountMinor, policy);
   if (selfLoop.feeWaived) return 0;
-  return selfLoop.minMinor ?? 0;
+  return Math.min(selfLoop.minMinor ?? 0, amountMinor);
+}
+
+/** Authorization identity for single-use / budget bookkeeping. Prefer
+ *  the lexicon's `nonce` (the requester-signed replay-protection field:
+ *  16 random bytes hex-encoded) — it is what makes the authorization
+ *  uniquely spendable. Fall back to the authorization record URI for any
+ *  authorization shape lacking a usable nonce. */
+function authorizationIdentity(uri: string, auth: PaymentAuthorizationRecord): string {
+  const nonce = auth.nonce;
+  if (typeof nonce === "string" && nonce.length > 0) return `nonce:${nonce}`;
+  return `uri:${uri}`;
 }

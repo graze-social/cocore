@@ -305,6 +305,18 @@ export function resolveConsoleDbPath(): string {
     return candidate;
   }
 
+  // In production, a :memory: DB silently makes API keys and OAuth/app
+  // sessions ephemeral — a durability *and* security footgun (auth state
+  // that evaporates on restart). Fail closed rather than boot into that
+  // state; keep the in-memory fallback for dev/CI/test only.
+  if (process.env["NODE_ENV"] === "production") {
+    throw new Error(
+      "[console-db] refusing to start in production without a durable database. " +
+        "Set COCORE_CONSOLE_DB=/path/to/console.sqlite, or attach a Railway volume " +
+        "(RAILWAY_VOLUME_MOUNT_PATH is auto-detected), or provide a /data mount.",
+    );
+  }
+
   console.error(
     `[console-db] WARNING: using :memory:. OAuth sessions, app sessions, and API keys\n` +
       `[console-db]   will not survive process restart — every signed-in user gets bounced\n` +

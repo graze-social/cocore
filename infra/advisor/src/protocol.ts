@@ -72,6 +72,16 @@ export interface Register {
    *  Additive — pre-version agents omit it, and a version floor treats a
    *  machine that omits it as below the floor (fail-closed). */
   binary_version?: string;
+  /** atproto service-auth JWT that binds this Register to `provider_did`.
+   *  The provider mints it via `com.atproto.server.getServiceAuth` with
+   *  `aud = COCORE_ADVISOR_DID` and `lxm = "dev.cocore.compute.register"`; its
+   *  PDS signs it with the DID's repo signing key. The advisor verifies it and
+   *  requires the authenticated DID to equal `provider_did` before accepting
+   *  the registration — without it a client could register as any provider and
+   *  swap in its own attestation key. Additive: optional on the wire so the
+   *  fleet can upgrade before the advisor flips `COCORE_ADVISOR_REQUIRE_AUTH`
+   *  on (see connection.ts). */
+  auth_jwt?: string;
 }
 
 /** Content-free crash signature the provider folds into its heartbeat
@@ -256,8 +266,102 @@ export type AdvisorMessage =
   | ({ type: "recover_request" } & RecoverRequest)
   | ({ type: "recover_result" } & RecoverResult);
 
+// --- Inbound frame validation --------------------------------------
+// `JSON.parse` proves a frame is JSON; it proves nothing about its shape.
+// The handlers dereference per-type fields directly (e.g.
+// `msg.supported_models.length`), so a frame like `{"type":"register"}` — or
+// an `attestation_response` missing `signature` — would throw a TypeError deep
+// in a handler, surface as an unhandled rejection, and kill the process. We
+// validate the shape of the fields each handler touches BEFORE dispatch and
+// close the socket cleanly on a mismatch instead. Lightweight and hand-written
+// (no schema dep): it only checks the fields the advisor actually reads, and
+// stays additive (unknown fields and unknown `type`s are tolerated — an
+// advisor that doesn't know a frame simply ignores it).
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+const isStr = (v: unknown): v is string => typeof v === "string";
+/** Bytes on the wire: a base64 string OR a JSON array of byte values. */
+const isBytes = (v: unknown): boolean =>
+  typeof v === "string" || (Array.isArray(v) && v.every((n) => typeof n === "number"));
+
+/** Result of validating a raw inbound frame: either the typed message or a
+ *  reason string for the `close(1008,"bad-frame")` log. */
+export type FrameCheck = { ok: true; msg: AdvisorMessage } | { ok: false; reason: string };
+
+/** Validate a JSON-parsed inbound frame against the fields the advisor's
+ *  handlers dereference. Only provider→advisor frames are checked; advisor→
+ *  provider frames (which the advisor never receives) fall through as accepted
+ *  so an unexpected echo is ignored rather than closing the socket. */
+export function validateFrame(raw: unknown): FrameCheck {
+  if (!isRecord(raw)) return { ok: false, reason: "frame is not a JSON object" };
+  const type = raw["type"];
+  if (!isStr(type)) return { ok: false, reason: "missing string `type`" };
+  switch (type) {
+    case "register": {
+      if (!isStr(raw["provider_did"])) return { ok: false, reason: "register: provider_did" };
+      if (!Array.isArray(raw["supported_models"])) {
+        return { ok: false, reason: "register: supported_models" };
+      }
+      if (!isStr(raw["encryption_pub_key"]))
+        return { ok: false, reason: "register: encryption_pub_key" };
+      if (!isStr(raw["attestation_pub_key"]))
+        return { ok: false, reason: "register: attestation_pub_key" };
+      break;
+    }
+    case "attestation_response": {
+      if (!isStr(raw["nonce"])) return { ok: false, reason: "attestation_response: nonce" };
+      // `signature` is fed to bytesToBase64 during verify; require it present
+      // and byte-shaped so verify can't throw on undefined.
+      if (!isBytes(raw["signature"]))
+        return { ok: false, reason: "attestation_response: signature" };
+      break;
+    }
+    case "code_attestation_response": {
+      if (!isStr(raw["nonce"])) return { ok: false, reason: "code_attestation_response: nonce" };
+      if (!isBytes(raw["signature"]))
+        return { ok: false, reason: "code_attestation_response: signature" };
+      break;
+    }
+    case "inference_chunk": {
+      if (!isStr(raw["session_id"])) return { ok: false, reason: "inference_chunk: session_id" };
+      if (!isBytes(raw["ciphertext"])) return { ok: false, reason: "inference_chunk: ciphertext" };
+      break;
+    }
+    case "inference_keepalive": {
+      if (!isStr(raw["session_id"]))
+        return { ok: false, reason: "inference_keepalive: session_id" };
+      break;
+    }
+    case "inference_complete": {
+      if (!isStr(raw["session_id"])) return { ok: false, reason: "inference_complete: session_id" };
+      break;
+    }
+    case "pong": {
+      if (!isStr(raw["nonce"])) return { ok: false, reason: "pong: nonce" };
+      break;
+    }
+    // heartbeat / recover_result carry only optional fields the handlers
+    // guard individually; the `type` check above is enough. Advisor→provider
+    // frame `type`s (and any unknown `type`) fall through as accepted and are
+    // ignored by onMessage's switch.
+    default:
+      break;
+  }
+  return { ok: true, msg: raw as unknown as AdvisorMessage };
+}
+
 export function bytesToBase64(b: number[] | string): string {
   if (typeof b === "string") return b;
+  // Defend against a malformed frame handing us a non-array (e.g. an
+  // `attestation_response` with `signature` missing → `undefined`): fail with a
+  // clear, catchable error instead of throwing deep inside the for-of loop with
+  // an opaque message. The message-dispatch wrapper turns this into a clean
+  // `close(1008,"bad-frame")` rather than a process-killing rejection.
+  if (!Array.isArray(b)) {
+    throw new TypeError("bytesToBase64: expected number[] or base64 string");
+  }
   let bin = "";
   for (const byte of b) bin += String.fromCharCode(byte);
   return btoa(bin);

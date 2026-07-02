@@ -10,7 +10,9 @@ import { withAppviewServer } from "./http-app.ts";
 // shared internal secret (console<->AppView trust boundary), so we build
 // the app with one and present it via the x-cocore-internal-secret header.
 
-const SECRET = "test-internal-secret";
+// >= 32 chars: the AppView refuses to mount /internal/* behind a weaker
+// secret (H5), so the test secret must clear that bar.
+const SECRET = "test-internal-secret-0123456789abcdef";
 const ALICE = "did:plc:alice";
 const BOB = "did:plc:bob";
 

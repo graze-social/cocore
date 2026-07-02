@@ -14,6 +14,7 @@
 
 import type { Firehose, IndexedRecord } from "@cocore/sdk";
 import { Store } from "../store.ts";
+import { validateIngest } from "./validate-ingest.ts";
 
 // Re-export the relay wire transport so consumers (e.g. the
 // infra/services container) can wire it up via the same package
@@ -52,9 +53,18 @@ export class Indexer {
     this.store = store;
   }
 
-  /** Process a single firehose event. Used by tests and by the wire layer. */
+  /** Process a single firehose event. Used by tests and by the wire layer.
+   *  Returns true only when the record was actually indexed. Records that fail
+   *  ingest validation (H4: lexicon-invalid, signer-mismatch, or oversized)
+   *  are dropped and logged — the AppView is a cache and must never surface a
+   *  forged or malformed record as canonical. */
   ingest(ev: FirehoseEvent): boolean {
     if (!isCocoreCollection(ev.collection)) return false;
+    const check = validateIngest(ev.collection, ev.repo, ev.record);
+    if (!check.ok) {
+      console.error(`indexer: dropped ${ev.collection} ${ev.uri} from ${ev.repo}: ${check.reason}`);
+      return false;
+    }
     this.store.upsert({
       uri: ev.uri,
       cid: ev.cid,

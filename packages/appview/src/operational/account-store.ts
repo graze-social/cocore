@@ -281,6 +281,21 @@ export class AccountStore {
     return { ticketId, did, filePath, sizeBytes: bytes.byteLength, createdAt };
   }
 
+  /** Rolling-window upload usage for a DID (L8): how many bundles and how many
+   *  total bytes this DID has stored since `sinceIso`. Backs the per-DID quota
+   *  that stops a single key holder from disk-filling the volume with unbounded
+   *  25 MB uploads. */
+  bugReportUsageForDid(did: string, sinceIso: string): { count: number; totalBytes: number } {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS totalBytes
+           FROM bug_reports
+          WHERE did = ? AND created_at >= ?`,
+      )
+      .get(did, sinceIso) as { count: number; totalBytes: number };
+    return { count: row.count, totalBytes: row.totalBytes };
+  }
+
   // ---- OAuth sessions ----------------------------------------------
   //
   // Opaque per-DID session blob. The console's atproto OAuth client

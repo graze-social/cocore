@@ -26,9 +26,15 @@
 //! the old binary is still there).
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const REQUEST_TIMEOUT_SECS: u64 = 60; // tarball download
+
+/// The release asset `/agent/dl` streams back (the console proxy hardcodes
+/// this — see `github-releases.server.ts`). Its published SHA-256 in
+/// `SHA256SUMS` is what we verify the download against before installing.
+const RELEASE_TARBALL_ASSET: &str = "cocore-mac-arm64.tar.gz";
 
 // v0.5.x shipped two tarball variants (stub vs. inference). v0.6.0
 // collapsed them into a single binary that always supports real
@@ -65,6 +71,30 @@ pub async fn run(console: &str, check_only: bool) -> Result<()> {
     println!("==> downloading {url}");
     let bytes = download_tarball(&url).await?;
     println!("  size: {} bytes", bytes.len());
+
+    // 3b. Verify the download against the release's published SHA-256 BEFORE
+    // we extract or install it. `/agent/dl` performs an HTTPS download, but
+    // TLS only authenticates the transport — it does not prove the bytes are
+    // the exact binary the release published (a compromised proxy, a swapped
+    // asset, or a corrupted download would all pass TLS). The release flow
+    // publishes a `SHA256SUMS` asset with a line for `cocore-mac-arm64.tar.gz`
+    // (see scripts/.publish-*.sh); the console re-serves it at
+    // `/agent/binary-hashes`. We fetch the expected hash for THIS tag, compute
+    // the SHA-256 of what we downloaded, and refuse to install on any mismatch
+    // — so a tampered or truncated artifact can never be renamed over the
+    // running binary. (Signature verification against a pinned key would be
+    // strictly stronger, but no signing key is available to the agent in this
+    // repo; the published-hash check closes the "unverified binary" gap.)
+    let expected = fetch_expected_sha256(console, &latest, RELEASE_TARBALL_ASSET).await?;
+    let actual = sha256_hex(&bytes);
+    if !hashes_equal(&actual, &expected) {
+        bail!(
+            "checksum mismatch for {RELEASE_TARBALL_ASSET} at {latest}: \
+             expected {expected}, got {actual}. Refusing to install — the download \
+             does not match the release's published SHA-256."
+        );
+    }
+    println!("  verified sha256: {actual}");
 
     // 4. Extract to a sibling tmp path.
     let target = std::env::current_exe().context("current_exe")?;
@@ -154,6 +184,69 @@ async fn download_tarball(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Fetch the release's `SHA256SUMS` (via the console's `/agent/binary-hashes`
+/// proxy, HTTPS, GITHUB_TOKEN-authed server-side) for `tag` and return the
+/// expected lowercase-hex SHA-256 of `asset`. Errors if the release has no
+/// SHA256SUMS or no line for that asset — a missing hash is a verification
+/// failure, not a reason to skip the check (fail-closed).
+async fn fetch_expected_sha256(console: &str, tag: &str, asset: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!("{console}/agent/binary-hashes?tag={tag}");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!(
+            "GET {url} returned {} (cannot verify the download)",
+            resp.status()
+        );
+    }
+    let body = resp.text().await.context("read SHA256SUMS response")?;
+    parse_sha256sums(&body, asset)
+        .ok_or_else(|| anyhow::anyhow!("no SHA-256 entry for {asset} in the release's SHA256SUMS"))
+}
+
+/// Parse a `SHA256SUMS` file (`<hex>␠␠<name>` per line, the shasum/coreutils
+/// format) and return the hash for the entry whose filename equals `asset`.
+/// Matches on the exact trailing filename, so a `cocore-mac-arm64.tar.gz` line
+/// is not confused with the inner-binary lines (`cocore-mac-arm64/bin/cocore`).
+fn parse_sha256sums(contents: &str, asset: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split into "<hash>" and "<name>" on the first run of whitespace.
+        // coreutils uses two spaces; be liberal and accept any whitespace.
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let hash = parts.next()?.trim();
+        let name = parts.next()?.trim();
+        // A "*" prefix marks a binary-mode entry in some shasum variants.
+        let name = name.strip_prefix('*').unwrap_or(name);
+        if name == asset {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Case-insensitive hex comparison of two SHA-256 digests.
+fn hashes_equal(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 /// Pick a sibling path the rename below will replace atomically.
 /// Same directory ensures the rename is intra-filesystem (POSIX
 /// requires that for atomic rename).
@@ -230,4 +323,61 @@ fn bounce_launchagent_if_installed() {
 #[cfg(not(target_os = "macos"))]
 fn bounce_launchagent_if_installed() {
     println!("Note: not on macOS; restart your serve daemon manually to pick up the new binary.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_tarball_line_not_the_inner_binary_line() {
+        // Mirror the real 4-entry SHA256SUMS layout (see scripts/.publish-*.sh):
+        // the tarball, the two inner binaries, and the app zip. We must pick the
+        // tarball line — the one `/agent/dl` actually serves — not any of the
+        // `.../cocore` inner-binary lines that share the "cocore" leaf name.
+        let sums = "\
+aaaa000000000000000000000000000000000000000000000000000000000000  cocore.app.zip
+bbbb111111111111111111111111111111111111111111111111111111111111  cocore-mac-arm64.tar.gz
+cccc222222222222222222222222222222222222222222222222222222222222  cocore-mac-arm64/bin/cocore
+dddd333333333333333333333333333333333333333333333333333333333333  cocore.app/Contents/MacOS/cocore
+";
+        let got = parse_sha256sums(sums, "cocore-mac-arm64.tar.gz").unwrap();
+        assert_eq!(
+            got,
+            "bbbb111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn missing_asset_entry_returns_none() {
+        let sums = "aaaa  some-other-asset.tar.gz\n";
+        assert!(parse_sha256sums(sums, "cocore-mac-arm64.tar.gz").is_none());
+    }
+
+    #[test]
+    fn tolerates_binary_mode_star_prefix_and_any_whitespace() {
+        let sums = "  abc123\t*cocore-mac-arm64.tar.gz  \n";
+        assert_eq!(
+            parse_sha256sums(sums, "cocore-mac-arm64.tar.gz").unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        // SHA-256("") — the canonical empty-input digest.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hash_comparison_is_case_insensitive() {
+        assert!(hashes_equal(
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        assert!(!hashes_equal("dead", "beef"));
+    }
 }

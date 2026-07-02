@@ -27,6 +27,13 @@ export interface AgentBugReportContext {
  *  headroom while bounding what an authenticated client can push. */
 const MAX_BUNDLE_BYTES = 25 * 1024 * 1024;
 const BUNDLE_CONTENT_TYPE = "application/gzip";
+// Per-DID rolling-window quota (L8). Without it any key holder can push
+// unlimited 25 MB bundles and fill the volume. A day's window with these caps
+// still leaves ample room for a genuine "send a few bug reports" flow while
+// bounding the worst case to ~250 MB/DID/day.
+const QUOTA_WINDOW_MS = 24 * 60 * 60 * 1000;
+const QUOTA_MAX_COUNT = 10;
+const QUOTA_MAX_BYTES = 250 * 1024 * 1024;
 // Accept the canonical gzip type plus equivalents different HTTP clients
 // emit for a .tar.gz, so a correct upload isn't rejected on a technicality.
 const ACCEPTED_CONTENT_TYPES = new Set([
@@ -87,6 +94,20 @@ export function buildAgentBugReportRouter(
           return err(413, {
             error: "PayloadTooLarge",
             message: `bundle too large: ${bytes.byteLength} bytes exceeds ${MAX_BUNDLE_BYTES}`,
+          });
+        }
+
+        // Per-DID quota (L8): reject once this DID's rolling-window count or
+        // total bytes (including this upload) would exceed the cap.
+        const sinceIso = new Date(Date.now() - QUOTA_WINDOW_MS).toISOString();
+        const usage = ctx.accounts.bugReportUsageForDid(resolved.did, sinceIso);
+        if (
+          usage.count + 1 > QUOTA_MAX_COUNT ||
+          usage.totalBytes + bytes.byteLength > QUOTA_MAX_BYTES
+        ) {
+          return err(429, {
+            error: "TooManyRequests",
+            message: "bug-report upload quota exceeded; try again later",
           });
         }
 

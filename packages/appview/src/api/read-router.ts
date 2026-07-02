@@ -17,7 +17,7 @@ import { Effect } from "effect";
 import { MdaError, verifyChain } from "@cocore/sdk/mda";
 import { verifyAppAttestB64, APP_ATTEST_APP_ID } from "@cocore/sdk/appattest";
 import { freshnessBindsKey } from "@cocore/sdk/verify-provider";
-import { verifyReceiptSignature } from "@cocore/sdk/p256";
+import { verifyAttestationSignature, verifyReceiptSignature } from "@cocore/sdk/p256";
 import { ids, lexicons } from "@cocore/sdk/lex";
 import type {
   AttestationRecord,
@@ -50,6 +50,13 @@ function decodeBytesFields(body: Record<string, unknown>): Record<string, unknow
   }
   return out;
 }
+
+// M8: memoize the heaviest unauthenticated aggregate (modelActivity re-parses
+// up to 5000 receipt bodies per GET) for a short TTL, so a burst of public
+// requests can't turn into repeated full-collection scans. The result is a
+// coarse activity roll-up; a few seconds of staleness is invisible to callers.
+const MODEL_ACTIVITY_TTL_MS = 5_000;
+let modelActivityCache: { at: number; body: unknown } | null = null;
 
 export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, never> {
   return HttpRouter.empty.pipe(
@@ -167,6 +174,18 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
         const provider = sp.get("provider");
         const requester = sp.get("requester");
         const job = sp.get("job");
+        // Trust model (H4): the `provider` filter matches on `r.repo`, the
+        // firehose signing DID — an AUTHENTICATED claim (a receipt is
+        // authoritative only in the provider's own repo; the indexer drops any
+        // receipt whose body.provider disagrees with its repo). The `requester`
+        // filter matches on the provider-set `body.requester`, which the
+        // lexicon documents as DENORMALIZED convenience, NOT an authenticated
+        // claim: a provider chooses this value freely. So a match here means
+        // "some provider ASSERTS this requester," not "this requester authored
+        // the request." Callers that need an authenticated requester binding
+        // must corroborate against the requester-signed job/authorization
+        // records (which live in the requester's own repo). We keep the
+        // convenience filter for the dashboards but never present it as proof.
         const items = store.listByCollection("dev.cocore.compute.receipt", 200).filter((r) => {
           if (provider && r.repo !== provider) return false;
           const body = r.body as { requester?: string; job?: { uri?: string } };
@@ -217,6 +236,11 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
     HttpRouter.get(
       "/xrpc/dev.cocore.compute.modelActivity",
       Effect.sync(() => {
+        // Serve a memoized roll-up when fresh — avoids re-scanning 5000 receipt
+        // bodies on every unauthenticated GET (M8).
+        if (modelActivityCache && Date.now() - modelActivityCache.at < MODEL_ACTIVITY_TTL_MS) {
+          return ok(modelActivityCache.body);
+        }
         // Aggregate receipt activity per model + per time window (1h/24h/7d/
         // 30d), with per-provider counts, over the 5000 most-recent receipts.
         const now = Date.now();
@@ -282,7 +306,9 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
             stats: s,
           })),
         }));
-        return ok({ generatedAt: new Date().toISOString(), models });
+        const body = { generatedAt: new Date().toISOString(), models };
+        modelActivityCache = { at: Date.now(), body };
+        return ok(body);
       }).pipe(Effect.withSpan("appview.modelActivity")),
     ),
     HttpRouter.get(
@@ -306,6 +332,48 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
           ),
         );
         const findings = [...structural.findings];
+
+        // H4 / H1: bind the strong-ref'd attestation to the receipt's provider,
+        // the same check the exchange enforces before settling (exchange.ts).
+        // Verifying the receipt against `att.publicKey` is meaningless if the
+        // attestation is forged or borrowed: a provider could point its receipt
+        // at another machine's (or a self-minted, foreign-DID) attestation to
+        // launder a tier/posture it never earned. Two ties are required —
+        //   (a) OWNER: the attestation record lives in the receipt provider's
+        //       own repo (attRow.repo === receiptRow.repo), and
+        //   (b) SELF-SIG: the attestation authenticates its own publicKey via
+        //       its `selfSignature` (so the key the receipt is checked against
+        //       is genuinely the enclave's, not attacker-chosen).
+        if (attRow.repo !== receiptRow.repo) {
+          findings.push({
+            severity: "error",
+            code: "attestation-owner-mismatch",
+            message: `attestation ${receipt.attestation.uri} is owned by ${attRow.repo}, not the receipt provider ${receiptRow.repo}`,
+          });
+        }
+        let attSelfSigOk = true;
+        if (att.selfSignature && att.selfSignature.length > 0) {
+          attSelfSigOk = yield* Effect.promise(() =>
+            verifyAttestationSignature(
+              att as unknown as { selfSignature?: string } & Record<string, unknown>,
+              att.publicKey,
+            ).catch(() => false),
+          );
+          if (!attSelfSigOk) {
+            findings.push({
+              severity: "error",
+              code: "attestation-selfsig-invalid",
+              message: "attestation.selfSignature did not verify against attestation.publicKey",
+            });
+          }
+        } else {
+          attSelfSigOk = false;
+          findings.push({
+            severity: "error",
+            code: "attestation-unsigned",
+            message: "attestation is missing selfSignature",
+          });
+        }
         try {
           lexicons.assertValidRecord(ids.DevCocoreComputeReceipt, {
             $type: ids.DevCocoreComputeReceipt,
@@ -393,6 +461,8 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
           ok:
             structural.ok &&
             sigOk &&
+            attRow.repo === receiptRow.repo &&
+            attSelfSigOk &&
             !findings.some((f) => f.code.startsWith("mda-")) &&
             !findings.some((f) => f.code.startsWith("appattest-")) &&
             !findings.some((f) => f.code === "lexicon-invalid"),

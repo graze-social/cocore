@@ -116,7 +116,11 @@ async function signedReceiptFixture() {
   const derSig = rawToDer(rawSig);
   const sigB64 = btoa(String.fromCharCode(...derSig));
 
-  const att = {
+  // Build the attestation body WITHOUT its selfSignature, then sign the
+  // canonical bytes with the same enclave key — the AppView's verifyReceipt now
+  // authenticates the attestation's own selfSignature (H4/H1), so the fixture
+  // must carry a real one, not the receipt's signature.
+  const attUnsigned = {
     publicKey: pubB64,
     encryptionPubKey: "B",
     chipName: "M3",
@@ -129,10 +133,15 @@ async function signedReceiptFixture() {
     secureEnclaveAvailable: true,
     authenticatedRootEnabled: true,
     rdmaDisabled: true,
-    selfSignature: sigB64,
     attestedAt: "2026-05-07T11:00:00Z",
     expiresAt: "2026-05-08T11:00:00Z",
   };
+  const attMessage = new TextEncoder().encode(canonicalize(attUnsigned));
+  const attRawSig = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, kp.privateKey, attMessage),
+  );
+  const attSelfSigB64 = btoa(String.fromCharCode(...rawToDer(attRawSig)));
+  const att = { ...attUnsigned, selfSignature: attSelfSigB64 };
   const receipt = { ...receiptUnsigned, enclaveSignature: sigB64 };
   return { RECEIPT_URI, JOB_URI, ATT_URI, job, att, receipt };
 }
@@ -261,6 +270,55 @@ test("verifyReceipt rejects a tampered receipt at the signature check", async ()
       `unexpected structural failures: ${JSON.stringify(onlyStructuralCodes)}`,
     );
     assert.equal(onlyStructuralCodes[0]!.code, "model-mismatch");
+  });
+});
+
+test("H4: verifyReceipt rejects an attestation owned by a different repo than the receipt provider", async () => {
+  // The attestation is authentic (real selfSignature) but lives in a DIFFERENT
+  // repo than the receipt's provider — a borrowed/laundered attestation. The
+  // AppView must bind attestation-owner to receipt-provider (the same tie the
+  // exchange enforces) and report ok=false with attestation-owner-mismatch.
+  const dir = mkdtempSync(join(tmpdir(), "cocore-api-owner-"));
+  const store = new Store(join(dir, "appview.db"));
+  const ctx = await signedReceiptFixture();
+  store.upsert({
+    uri: ctx.JOB_URI,
+    cid: "bafyreigh2akiscaildc5sgz5wybizysiehxiv4dhpwwqouytxnvgkpkcaq",
+    collection: "dev.cocore.compute.job",
+    repo: "did:plc:r",
+    rkey: "1",
+    body: ctx.job,
+  });
+  // Attestation indexed under a foreign repo (did:plc:other), not the receipt
+  // provider (did:plc:p).
+  store.upsert({
+    uri: ctx.ATT_URI,
+    cid: "bafyreidqs7iyhjmkkdiekz5wlerpcjzmifgl2hpvgflzbcjfjsljbjlhmm",
+    collection: "dev.cocore.compute.attestation",
+    repo: "did:plc:other",
+    rkey: "1",
+    body: ctx.att,
+  });
+  store.upsert({
+    uri: ctx.RECEIPT_URI,
+    cid: "rcid",
+    collection: "dev.cocore.compute.receipt",
+    repo: "did:plc:p",
+    rkey: "1",
+    body: ctx.receipt,
+  });
+
+  await withAppviewServer(buildAppviewApp(store), async (base) => {
+    const res = await fetch(
+      `${base}/xrpc/dev.cocore.compute.verifyReceipt?uri=${encodeURIComponent(ctx.RECEIPT_URI)}`,
+    );
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { ok: boolean; findings: { code: string }[] };
+    assert.equal(body.ok, false, "borrowed attestation must fail verification");
+    assert.ok(
+      body.findings.some((f) => f.code === "attestation-owner-mismatch"),
+      `expected attestation-owner-mismatch, got ${JSON.stringify(body.findings)}`,
+    );
   });
 });
 

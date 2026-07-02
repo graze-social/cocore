@@ -21,6 +21,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Connect + total request timeouts for the device-pair HTTP calls. A slow or
+/// hostile console must not be able to wedge the pairing flow indefinitely;
+/// each call here is a small JSON request/response with no streaming body.
+const PAIR_CONNECT_TIMEOUT_SECS: u64 = 10;
+const PAIR_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairStartResponse {
@@ -68,6 +74,8 @@ pub async fn start_pair(console_url: &str) -> Result<PairStartResponse, OauthErr
         console_url.trim_end_matches('/')
     );
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(PAIR_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(PAIR_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|e| OauthError::Transport(e.to_string()))?;
     let resp = client
@@ -91,6 +99,8 @@ pub async fn start_pair(console_url: &str) -> Result<PairStartResponse, OauthErr
 pub async fn poll_pair(console_url: &str, device_id: &str) -> Result<Session, OauthError> {
     let base = console_url.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(PAIR_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(PAIR_REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|e| OauthError::Transport(e.to_string()))?;
 

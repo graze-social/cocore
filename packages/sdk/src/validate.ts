@@ -72,6 +72,29 @@ function ok(findings: Finding[]): boolean {
   return findings.every((f) => f.severity !== "error");
 }
 
+/** A SHA-256 commitment on the wire is 64 lowercase hex chars, no prefix
+ *  (CLAUDE.md "Hashes" convention). Anything else is malformed. */
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/** Shape-check a commitment field as a bare lowercase-hex SHA-256 digest.
+ *  A commitment is the whole point of a receipt — an unchecked one lets a
+ *  provider publish garbage (wrong length, uppercase, `0x`-prefixed, empty)
+ *  that no consumer can meaningfully compare. Pushes a finding when invalid. */
+function checkCommitmentHex(
+  value: unknown,
+  field: string,
+  code: string,
+  findings: Finding[],
+): void {
+  if (typeof value !== "string" || !SHA256_HEX.test(value)) {
+    err(
+      findings,
+      code,
+      `${field} is not a lowercase-hex SHA-256 digest (64 hex chars): ${JSON.stringify(value)}`,
+    );
+  }
+}
+
 /** Verify a receipt is internally consistent against its job and attestation. */
 export function verifyReceipt(
   receipt: ReceiptRecord,
@@ -79,6 +102,23 @@ export function verifyReceipt(
   attestation: AttestationRecord,
 ): ValidationReport {
   const findings: Finding[] = [];
+
+  // Shape-check the commitments before comparing them: a well-formed digest is
+  // 64 lowercase hex chars (SHA-256, CLAUDE.md convention). An out-of-shape
+  // commitment can never be a genuine digest, so flag it even if it happens to
+  // equal the job's (equally malformed) value.
+  checkCommitmentHex(
+    receipt.inputCommitment,
+    "receipt.inputCommitment",
+    "input-commitment-shape",
+    findings,
+  );
+  checkCommitmentHex(
+    receipt.outputCommitment,
+    "receipt.outputCommitment",
+    "output-commitment-shape",
+    findings,
+  );
 
   if (receipt.inputCommitment !== job.inputCommitment) {
     err(
@@ -146,15 +186,51 @@ export function verifyReceipt(
   return { ok: ok(findings), findings };
 }
 
+/** Options for {@link verifyReceiptStrict}. */
+export interface VerifyReceiptStrictOptions {
+  /** The DID the verifier expects owns BOTH the receipt and the referenced
+   *  attestation. This closes the H3 forge: without it, an attacker mints a
+   *  keypair, hand-builds an `AttestationRecord{publicKey: theirs}`, signs a
+   *  receipt with the matching key, and every crypto check passes against a
+   *  self-chosen key. Binding the attestation to the receipt's provider (and to
+   *  the DID the caller independently expects) makes the attestation
+   *  load-bearing.
+   *
+   *  FAIL CLOSED: omitting this means the owner binding cannot be asserted, so
+   *  verification fails. A caller that genuinely cannot supply it must opt out
+   *  explicitly with `allowUnboundAttestation: true` and accept the weaker
+   *  guarantee. */
+  expectedProvider?: string;
+  /** Escape hatch for the (rare) caller that cannot know the provider DID up
+   *  front. Skips ONLY the owner-DID binding; the attestation's own
+   *  selfSignature is still verified. Defaults to false (fail closed). */
+  allowUnboundAttestation?: boolean;
+}
+
 /** Strict superset of {@link verifyReceipt}: appends a real ES256
- *  verification of `receipt.enclaveSignature` over the canonical
- *  bytes of every other field, against `attestation.publicKey`.
- *  Async because WebCrypto is async; otherwise the API mirrors the
- *  sync version. */
+ *  verification of `receipt.enclaveSignature` against `attestation.publicKey`,
+ *  authenticates the ATTESTATION itself (its `selfSignature`), and binds the
+ *  attestation to the receipt's provider. Async because WebCrypto is async.
+ *
+ *  H3: verifying the receipt against `attestation.publicKey` is meaningless if
+ *  the attestation is forged — an attacker can mint a fresh key, publish an
+ *  attestation carrying it, and sign the receipt with it. So this ALSO:
+ *    1. verifies `attestation.selfSignature` against `attestation.publicKey`
+ *       (the key/posture are authentically the enclave's — mirrors
+ *       {@link verifyForChargeStrict}); and
+ *    2. asserts the attestation-owner binding: `receipt.provider` (if present)
+ *       and the caller-supplied `expectedProvider` must agree, so the
+ *       attestation being trusted belongs to the party the receipt claims.
+ *
+ *  The `provider` DID on a receipt is denormalised (see CLAUDE.md); when the
+ *  receipt omits it, the caller's `expectedProvider` alone carries the binding.
+ *  A caller that supplies neither and does not opt into
+ *  `allowUnboundAttestation` FAILS CLOSED. */
 export async function verifyReceiptStrict(
   receipt: ReceiptRecord,
   job: JobRecord,
   attestation: AttestationRecord,
+  options: VerifyReceiptStrictOptions = {},
 ): Promise<ValidationReport> {
   const baseline = verifyReceipt(receipt, job, attestation);
   const findings: Finding[] = [...baseline.findings];
@@ -185,6 +261,58 @@ export async function verifyReceiptStrict(
       );
     }
   }
+
+  // Authenticate the attestation itself (mirrors verifyForChargeStrict): the key
+  // the receipt is checked against must be authentically the enclave's, or the
+  // whole chain is self-chosen.
+  if (attestation.selfSignature && attestation.selfSignature.length > 0) {
+    let attestOk: boolean;
+    try {
+      attestOk = await verifyAttestationSignature(
+        attestation as unknown as { selfSignature?: string } & Record<string, unknown>,
+        attestation.publicKey,
+      );
+    } catch (e) {
+      err(
+        findings,
+        "attestation-verify-error",
+        `attestation selfSignature verification threw: ${(e as Error).message}`,
+      );
+      return { ok: ok(findings), findings };
+    }
+    if (!attestOk) {
+      err(
+        findings,
+        "attestation-selfsig-invalid",
+        "attestation.selfSignature did not verify against attestation.publicKey",
+      );
+    }
+  } else {
+    err(findings, "attestation-unsigned", "attestation is missing selfSignature");
+  }
+
+  // Owner-DID binding. `verifyReceiptStrict` (unlike the exchange path) does not
+  // hold the record repos, so the caller asserts the expected provider. Fail
+  // closed unless the caller supplies it or explicitly opts out.
+  const receiptProvider = (receipt as { provider?: string }).provider;
+  const { expectedProvider, allowUnboundAttestation } = options;
+  if (expectedProvider) {
+    if (receiptProvider && receiptProvider !== expectedProvider) {
+      err(
+        findings,
+        "attestation-owner-mismatch",
+        `receipt.provider ${receiptProvider} does not match expected provider ${expectedProvider}`,
+      );
+    }
+  } else if (!allowUnboundAttestation) {
+    err(
+      findings,
+      "attestation-owner-unverified",
+      "no expectedProvider supplied and allowUnboundAttestation is not set; " +
+        "cannot bind the attestation to the receipt's provider (fail closed)",
+    );
+  }
+
   return { ok: ok(findings), findings };
 }
 
@@ -282,6 +410,18 @@ export function verifyForCharge(ctx: PreChargeContext, inputs: PreChargeInputs):
   if (Date.parse(authorization.expiresAt) <= now.getTime()) {
     err(findings, "auth-expired", `authorization expired at ${authorization.expiresAt}`);
   }
+  checkCommitmentHex(
+    receipt.inputCommitment,
+    "receipt.inputCommitment",
+    "input-commitment-shape",
+    findings,
+  );
+  checkCommitmentHex(
+    receipt.outputCommitment,
+    "receipt.outputCommitment",
+    "output-commitment-shape",
+    findings,
+  );
   if (receipt.inputCommitment !== job.inputCommitment) {
     err(findings, "commitment-mismatch", "receipt.inputCommitment != job.inputCommitment");
   }

@@ -1591,7 +1591,13 @@ async fn cmd_serve(
     // unset for this serve; sharing-off omits it entirely so the next
     // re-publish drops any prior value.
     let (region, region_source, region_observed_at) = if share_location_at_start {
-        let http = reqwest::Client::new();
+        // Bound the geoip lookup: a slow/hostile geo endpoint must not stall the
+        // provider record publish at serve start.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         match cocore_provider::geoip::resolve_country(&http).await {
             Some(cc) => {
                 tracing::info!(country = %cc, "location sharing on — stamping provider record region");
@@ -1733,6 +1739,10 @@ async fn cmd_serve(
     // heartbeats, not here.
     let register = Register {
         provider_did: session.did.clone(),
+        // Left None here; `AdvisorClient::run` mints a fresh service-auth JWT
+        // for THIS registration (and on every reconnect) right before sending
+        // the frame, since the token is short-lived.
+        auth_jwt: None,
         // This machine's provider-record rkey — the advisor's stable
         // per-machine id, so this machine and any sibling under the same DID
         // both stay connected instead of evicting each other.

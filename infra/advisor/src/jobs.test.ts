@@ -75,7 +75,11 @@ function fakeProvider(
       machine_label: "fake",
       chip: "fake-chip",
       ram_gb: 8,
-      supported_models: [],
+      // Advertise the model the /jobs tests dispatch ("stub"). Empty
+      // supportedModels no longer matches any requested model (M2 —
+      // empty is not a wildcard), so an explicit advertisement is required
+      // for the open-pool path to route these fake providers.
+      supported_models: ["stub"],
       encryption_pub_key: encryptionPubKey,
       attestation_pub_key: "fake-attest",
       attestation_uri: "",

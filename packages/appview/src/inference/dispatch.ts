@@ -550,14 +550,46 @@ export function classifyDispatchError(e: unknown): DispatchErrorCode {
   return "advisor-transport";
 }
 
+/** Largest single SSE frame (bytes between `\n\n` delimiters) we'll buffer.
+ *  A chunk frame carries one base64/JSON-encoded ciphertext block; a few
+ *  hundred KB is ample. Beyond this the upstream is either malfunctioning or
+ *  hostile (M8: an unbounded accumulate-until-`\n\n` is a memory-exhaustion
+ *  primitive — a provider that never sends the delimiter grows `buf` without
+ *  limit). */
+const MAX_SSE_FRAME_BYTES = 512 * 1024;
+
+/** Hard cap on total bytes read from one advisor stream. A legitimate
+ *  completion is bounded by the model's max tokens; this backstops a provider
+ *  that streams forever. */
+const MAX_SSE_TOTAL_BYTES = 64 * 1024 * 1024;
+
+class SseOverflowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SseOverflowError";
+  }
+}
+
 async function* readSse(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let total = 0;
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
+    total += value.byteLength;
+    if (total > MAX_SSE_TOTAL_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new SseOverflowError("advisor stream exceeded the maximum total size");
+    }
     buf += decoder.decode(value, { stream: true });
+    // A single un-delimited frame that grows past the cap is aborted rather
+    // than buffered indefinitely.
+    if (Buffer.byteLength(buf, "utf8") > MAX_SSE_FRAME_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new SseOverflowError("advisor SSE frame exceeded the maximum size");
+    }
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const block = buf.slice(0, idx);

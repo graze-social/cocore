@@ -81,8 +81,14 @@ test("applyReceipt conserves tokens for odd-bps rounding", () => {
   assert.equal(l.peekBalance("did:plc:bob"), 1_000_000 + 95);
   assert.equal(l.peekBalance("did:plc:treasury"), 1_000_000 + 5);
 
-  // 99 tokens at 500 bps → floor(99 * 9500 / 10000) = 94; treasury gets 5.
-  // Sum: 94 + 5 = 99. Conserved.
+  // 99 tokens at 500 bps. The fee is now derived from the SAME shared
+  // `computeFee` the settlement path uses (M5), which floors the TREASURY
+  // fee: floor(99 * 500 / 10000) = floor(4.95) = 4; provider gets the
+  // remainder 99 - 4 = 95. Sum: 95 + 4 = 99. Conserved. (The prior
+  // implementation floored the provider share instead — 94 to provider,
+  // 5 to treasury — which conserved too but rounded the opposite way and
+  // diverged from the published settlement's exchangeFee. Unifying on
+  // computeFee makes the ledger fee and the settlement fee identical.)
   l.applyReceipt(
     {
       uri: "at://did:plc:alice/dev.cocore.compute.job/y",
@@ -93,8 +99,8 @@ test("applyReceipt conserves tokens for odd-bps rounding", () => {
     POLICY,
   );
   assert.equal(l.peekBalance("did:plc:alice"), 1_000_000 - 199);
-  assert.equal(l.peekBalance("did:plc:bob"), 1_000_000 + 95 + 94);
-  assert.equal(l.peekBalance("did:plc:treasury"), 1_000_000 + 5 + 5);
+  assert.equal(l.peekBalance("did:plc:bob"), 1_000_000 + 95 + 95);
+  assert.equal(l.peekBalance("did:plc:treasury"), 1_000_000 + 5 + 4);
 });
 
 test("applyReceipt with treasuryFeeBps=0 routes 100% to provider, no treasury-fee event", () => {

@@ -146,6 +146,18 @@ export class SessionManager {
     return this.bySessionId.has(sessionId);
   }
 
+  /** H6b: is `(providerDid, providerMachineId)` the provider this session was
+   *  dispatched to? Session frames (chunk / keepalive / complete) must come
+   *  from the ASSIGNED provider — otherwise any socket that learns a
+   *  `session_id` could inject chunks, complete with an attacker receipt_uri,
+   *  or clear its own bad standing off someone else's job. Returns false for an
+   *  unknown session (so a frame for a session we don't track is dropped). */
+  ownedBy(sessionId: string, providerDid: string, providerMachineId: string): boolean {
+    const entry = this.bySessionId.get(sessionId);
+    if (!entry) return false;
+    return entry.providerDid === providerDid && entry.providerMachineId === providerMachineId;
+  }
+
   size(): number {
     return this.bySessionId.size;
   }

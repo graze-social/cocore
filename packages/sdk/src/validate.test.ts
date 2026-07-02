@@ -358,21 +358,25 @@ async function signedAttestation(
   return { ...draft, selfSignature: base64Encode(sig) };
 }
 
-test("verifyReceiptStrict: valid signature passes", async () => {
+test("verifyReceiptStrict: valid signature + authentic attestation + owner binding passes", async () => {
   const kp = await genP256Keypair();
-  const att = fixtureAttestation({ publicKey: kp.publicKeyB64 });
+  const att = await signedAttestation(kp);
   const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
-  const r = await verifyReceiptStrict(receipt, fixtureJob(), att);
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), att, {
+    expectedProvider: "did:plc:p",
+  });
   assert.equal(r.ok, true, JSON.stringify(r.findings));
 });
 
 test("verifyReceiptStrict: tampered receipt fails with signature-invalid", async () => {
   const kp = await genP256Keypair();
-  const att = fixtureAttestation({ publicKey: kp.publicKeyB64 });
+  const att = await signedAttestation(kp);
   const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
   // Tamper after signing.
   const tampered = { ...receipt, outputCommitment: "f".repeat(64) };
-  const r = await verifyReceiptStrict(tampered, fixtureJob(), att);
+  const r = await verifyReceiptStrict(tampered, fixtureJob(), att, {
+    expectedProvider: "did:plc:p",
+  });
   assert.equal(r.ok, false);
   assert.ok(
     r.findings.some((f) => f.code === "signature-invalid"),
@@ -382,8 +386,10 @@ test("verifyReceiptStrict: tampered receipt fails with signature-invalid", async
 
 test("verifyReceiptStrict: missing signature fails the cheap check, no crypto error fires", async () => {
   const kp = await genP256Keypair();
-  const att = fixtureAttestation({ publicKey: kp.publicKeyB64 });
-  const r = await verifyReceiptStrict(fixtureReceipt({ enclaveSignature: "" }), fixtureJob(), att);
+  const att = await signedAttestation(kp);
+  const r = await verifyReceiptStrict(fixtureReceipt({ enclaveSignature: "" }), fixtureJob(), att, {
+    expectedProvider: "did:plc:p",
+  });
   assert.equal(r.ok, false);
   assert.ok(r.findings.some((f) => f.code === "no-signature"));
   assert.ok(!r.findings.some((f) => f.code === "signature-invalid"));
@@ -394,14 +400,75 @@ test("verifyReceiptStrict: malformed publicKey surfaces signature-verify-error",
   // Generate a real signature, then verify against a too-short pubkey.
   const kp = await genP256Keypair();
   const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
-  const att = fixtureAttestation({ publicKey: "AAAA" }); // 3 bytes — wrong
-  const r = await verifyReceiptStrict(receipt, fixtureJob(), att);
+  const att = fixtureAttestation({ publicKey: "AAAA", selfSignature: "sigsig" }); // 3 bytes — wrong
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), att, {
+    expectedProvider: "did:plc:p",
+  });
   // verifyReceiptSignature swallows SignatureVerifyError + returns
   // false → we surface as signature-invalid, not -error. The
   // -error path fires only on non-SignatureVerifyError throws,
   // which is currently unreachable.
   assert.equal(r.ok, false);
   assert.ok(r.findings.some((f) => f.code === "signature-invalid"));
+});
+
+test("verifyReceiptStrict: H3 forged attestation (self-chosen key) is rejected", async () => {
+  // The exploit: mint a keypair, hand-build an attestation carrying its
+  // publicKey but NO valid selfSignature, sign the receipt with the matching
+  // key so enclaveSignature verifies — but the attestation's own selfSignature
+  // does NOT verify against its publicKey (it's signed by an unrelated key).
+  // Without the H3 check this forged attestation would be trusted.
+  const kp = await genP256Keypair();
+  const other = await genP256Keypair();
+  // Real, well-formed DER selfSignature — just produced by the wrong key.
+  const forged = await signedAttestation(other, { publicKey: kp.publicKeyB64 });
+  const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), forged, {
+    expectedProvider: "did:plc:p",
+  });
+  assert.equal(r.ok, false);
+  assert.ok(
+    r.findings.some((f) => f.code === "attestation-selfsig-invalid"),
+    JSON.stringify(r.findings),
+  );
+});
+
+test("verifyReceiptStrict: fails closed when expectedProvider is omitted", async () => {
+  const kp = await genP256Keypair();
+  const att = await signedAttestation(kp);
+  const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), att);
+  assert.equal(r.ok, false);
+  assert.ok(
+    r.findings.some((f) => f.code === "attestation-owner-unverified"),
+    JSON.stringify(r.findings),
+  );
+});
+
+test("verifyReceiptStrict: allowUnboundAttestation opts out of the owner binding only", async () => {
+  const kp = await genP256Keypair();
+  const att = await signedAttestation(kp);
+  const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw);
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), att, {
+    allowUnboundAttestation: true,
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.findings));
+});
+
+test("verifyReceiptStrict: expectedProvider mismatch is rejected", async () => {
+  const kp = await genP256Keypair();
+  const att = await signedAttestation(kp);
+  const receipt = await signedReceipt(kp.publicKeyB64, kp.signRaw, {
+    provider: "did:plc:p",
+  } as Partial<ReceiptRecord>);
+  const r = await verifyReceiptStrict(receipt, fixtureJob(), att, {
+    expectedProvider: "did:plc:someone-else",
+  });
+  assert.equal(r.ok, false);
+  assert.ok(
+    r.findings.some((f) => f.code === "attestation-owner-mismatch"),
+    JSON.stringify(r.findings),
+  );
 });
 
 const chargeCtx = {

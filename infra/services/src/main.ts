@@ -450,10 +450,20 @@ async function main() {
     }
   }
 
+  // TokenLedger's sqlite handle, created here (before the Exchange) so the
+  // Exchange can share it for its durable settlement state — settlement
+  // idempotency (M4) and single-use / sessionBudget authorization consumption
+  // (H1). Without a `db` the Exchange falls back to in-memory-only idempotency,
+  // which resets on restart and can't stop a second receipt from re-spending
+  // one authorization. Same handle → both live in one sqlite file.
+  const ledgerDb = new Database(TOKEN_LEDGER_DB);
   const exchange = new Exchange({
     exchangeDid: EXCHANGE_DID,
     feePolicy,
     selfLoop,
+    // H1/M4: durable settlement state (consumed authorizations + settled
+    // receipts) in the shared ledger db.
+    db: ledgerDb,
     ...(policyRef ? { policyRef } : {}),
     ...(attestationRef ? { attestationRef } : {}),
     ...(signingKey ? { signingKey } : {}),
@@ -483,14 +493,17 @@ async function main() {
 
   // 2b. TokenLedger. Single source of truth for per-DID balances.
   //     Lazy refresh runs as a side effect of every receipt;
-  //     monthly patronage is on a scheduler below.
-  const ledgerDb = new Database(TOKEN_LEDGER_DB);
+  //     monthly patronage is on a scheduler below. Shares `ledgerDb` with the
+  //     Exchange (created above).
   const ledger = new TokenLedger(ledgerDb);
   const ledgerPolicy: TokenLedgerPolicy = {
     tokenGrant: TOKEN_GRANT,
     tokenFloor: TOKEN_FLOOR,
     treasuryDid: TREASURY_DID,
     treasuryFeeBps: FEE_BPS,
+    // M5: mirror the settlement fee floor so the ledger fee and the settlement
+    // fee are driven from the same numbers (no divergence).
+    feeMinMinor: FEE_MIN_MINOR,
     selfLoopFeeWaived: SELF_LOOP_FEE_WAIVED,
     weeklyRefreshAmount: WEEKLY_REFRESH_AMOUNT,
     refreshCadenceMinutes: REFRESH_CADENCE_MINUTES,
@@ -755,14 +768,33 @@ async function main() {
     // which fails the *entire* merged router, 500ing every bridge request.
     // The liveness contract (Railway healthcheckPath, docker-compose probe,
     // infra/smoke.ts) only needs a 200; appview's `/healthz` provides it.
+    // Internal-only: the console mirrors a just-written PDS record into the
+    // AppView cache the instant an owner edits a setting. Gated on the same
+    // constant-time `authOk` the other operator routes use — an unauthed caller
+    // could otherwise dispatch an attacker-chosen (uri/cid/collection/repo/body)
+    // straight into the firehose and poison the index (the AppView is a cache,
+    // but a poisoned cache still misleads every dashboard read). Two extra
+    // structural gates make the mirror faithful even for an authed-but-buggy
+    // caller: the collection must be `dev.cocore.*`, and the record `repo` must
+    // match the DID authority of its own `at://<did>/…` URI (a receipt is only
+    // authoritative in its own repo).
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.publish",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as IndexedRecord;
         if (!body.uri || !body.cid || !body.collection || !body.repo) {
           return err(400, { error: "missing uri/cid/collection/repo" });
+        }
+        if (!body.collection.startsWith("dev.cocore.")) {
+          return err(400, { error: "collection must be under dev.cocore.*" });
+        }
+        const uriAuthority = didFromAtUri(body.uri);
+        if (!uriAuthority) return err(400, { error: "uri must be an at:// record URI" });
+        if (uriAuthority !== body.repo) {
+          return err(400, { error: "repo does not match the record uri authority" });
         }
         yield* Effect.promise(() => firehose.dispatch(body));
         return err(202, { ok: true });
@@ -812,9 +844,13 @@ async function main() {
         return ok({ record: { ...record, sig } });
       }).pipe(Effect.withSpan("services.exchange.signTermsAcceptance")),
     ),
+    // Internal-only: drop a single cached record (console fires this when an
+    // owner deletes a record from their PDS). Same auth gate as publish — an
+    // unauthed caller could otherwise evict arbitrary rows from the index.
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.unpublish",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as { uri?: string };
@@ -823,9 +859,13 @@ async function main() {
         return ok({ ok: true });
       }).pipe(Effect.withSpan("services.bridge.unpublish")),
     ),
+    // Internal-only: the console's "wipe my data" affordance evicts every
+    // cached row for a DID. Unauthed this is arbitrary data destruction (any
+    // DID's index rows), so gate it on the same constant-time `authOk`.
     HttpRouter.post(
       "/xrpc/dev.cocore.bridge.purge",
       Effect.gen(function* () {
+        if (!authOk(yield* header("authorization"))) return err(401, { error: "unauthorized" });
         const parsed = yield* Effect.either(jsonBody);
         if (parsed._tag === "Left") return err(400, { error: "body must be JSON" });
         const body = parsed.right as { did?: string };
@@ -1165,6 +1205,16 @@ function readLeaderboardCache(limit: number): unknown | null {
 
 function writeLeaderboardCache(limit: number, body: unknown): void {
   leaderboardCache.set(limit, { at: Date.now(), body });
+}
+
+/** Extract the DID authority from an `at://<did>/<collection>/<rkey>` URI.
+ *  Returns null when the URI isn't an at:// record URI whose authority is a
+ *  DID. Used to bind a mirrored record's `repo` to its own URI, so an authed
+ *  caller can't publish a record under one repo that claims to live in another
+ *  (a record is only authoritative in its own repo). */
+function didFromAtUri(uri: string): string | null {
+  const m = /^at:\/\/(did:[^/]+)\//.exec(uri);
+  return m ? (m[1] ?? null) : null;
 }
 
 function authOk(header: string | string[] | undefined): boolean {

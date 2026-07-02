@@ -119,6 +119,26 @@ describe("ProviderRegistry", () => {
     expect(r.size()).toBe(0);
   });
 
+  it("refuses NEW registrations over the size cap but allows a re-register (M1)", () => {
+    const r = new ProviderRegistry(new KnownGoodSet(), 2);
+    expect(
+      r.upsert({ ...baseReg, provider_did: "did:plc:a" }, noop, noopSend, noopPing, 1000),
+    ).not.toBe(false);
+    expect(
+      r.upsert({ ...baseReg, provider_did: "did:plc:b" }, noop, noopSend, noopPing, 1000),
+    ).not.toBe(false);
+    // At capacity → a NEW machine is refused.
+    expect(
+      r.upsert({ ...baseReg, provider_did: "did:plc:c" }, noop, noopSend, noopPing, 1000),
+    ).toBe(false);
+    expect(r.size()).toBe(2);
+    // A re-register of an ALREADY-present machine is fine (it replaces).
+    expect(
+      r.upsert({ ...baseReg, provider_did: "did:plc:a" }, noop, noopSend, noopPing, 2000),
+    ).not.toBe(false);
+    expect(r.size()).toBe(2);
+  });
+
   it("machineIdOf prefers machine_id, falls back to the attestation pubkey", () => {
     expect(ProviderRegistry.machineIdOf(baseReg)).toBe("m1");
     const { machine_id: _omit, ...noMachineId } = baseReg;
@@ -334,11 +354,16 @@ describe("ProviderRegistry", () => {
       );
     });
 
-    it("treats empty supportedModels as 'matches anything'", () => {
+    it("does NOT treat empty supportedModels as a wildcard for a requested model (M2)", () => {
+      // An attacker advertising `[]` used to be selected for any open-pool job
+      // (empty == "matches everything"). Empty now matches NO requested model,
+      // so it must explicitly advertise a model to be routed it.
       const r = new ProviderRegistry();
       r.upsert({ ...baseReg, supported_models: [] }, noop, noopSend, noopPing, 1000);
       r.markAttested(DID, MID, 1100);
-      expect(r.pickFor("anything")?.did).toBe(DID);
+      expect(r.pickFor("anything")).toBeNull();
+      // With no model requested, any attested machine is still eligible.
+      expect(r.pickFor(undefined)?.did).toBe(DID);
     });
 
     it("breaks ties by lastSeen (freshest wins)", () => {

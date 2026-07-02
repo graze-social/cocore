@@ -28,6 +28,13 @@ use crate::error::{ProviderError, Result};
 use crate::oauth::Session;
 use serde::{Deserialize, Serialize};
 
+/// Connect timeout for every PDS / console-proxy HTTP call. A hostile or
+/// half-open peer must not be able to hang the connect indefinitely.
+pub(crate) const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Total request timeout for PDS / console-proxy calls. Record writes and the
+/// small reads here have no long streaming body, so a modest ceiling is safe.
+pub(crate) const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 /// Inputs needed to publish a `dev.cocore.compute.provider` record.
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize, Clone)]
@@ -419,6 +426,13 @@ struct ListRecordsResponse {
     cursor: Option<String>,
 }
 
+/// Response shape of `com.atproto.server.getServiceAuth` (as re-served by the
+/// console proxy): a single short-lived JWT.
+#[derive(Debug, Deserialize)]
+struct ServiceAuthResponse {
+    token: String,
+}
+
 /// HTTP client over the console's `/api/pds/createRecord`
 /// endpoint. One instance per agent lifetime; the API key is
 /// captured at construction and never rotated.
@@ -432,7 +446,12 @@ pub struct PdsClient {
 
 impl PdsClient {
     pub fn new(session: Session) -> Self {
+        // Bound every PDS call: a slow or hostile PDS / console proxy must not
+        // be able to wedge publish/read paths indefinitely. Mirrors the timeout
+        // posture in `update.rs`.
         let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
             .build()
             .expect("reqwest client construction is infallible");
         Self {
@@ -740,6 +759,57 @@ impl PdsClient {
 
     pub async fn publish_receipt<R: Serialize>(&self, record: &R) -> Result<PublishedRecord> {
         self.publish("dev.cocore.compute.receipt", record).await
+    }
+
+    /// Mint a short-lived atproto service-auth JWT bound to `aud` (the
+    /// intended service's DID) and `lxm` (the method NSID the token authorizes)
+    /// via the caller's PDS `com.atproto.server.getServiceAuth`.
+    ///
+    /// The agent can't call getServiceAuth directly — like every other PDS
+    /// call, it lacks the DPoP-bound OAuth session; the console holds it. So
+    /// this goes through the console proxy (`POST /api/pds/getServiceAuth`,
+    /// bearer-key auth, same as createRecord/putRecord), which restores the
+    /// user's session, calls getServiceAuth on their PDS with `aud`/`lxm`, and
+    /// returns `{ "token": "<jwt>" }`.
+    ///
+    /// Used to prove real DID control to the advisor at Register time: the
+    /// advisor verifies the JWT's issuer == `provider_did` and its `lxm` ==
+    /// `dev.cocore.compute.register`, binding the registration to a DID the
+    /// caller actually controls (a machine can't register under someone else's
+    /// DID). The token is short-lived, so the agent mints a fresh one on every
+    /// (re)connect. Any failure is surfaced to the caller, which logs and
+    /// registers WITHOUT the jwt rather than crashing — the advisor's own
+    /// enforcement flag decides whether an unauthenticated Register is rejected.
+    pub async fn mint_service_auth(&self, aud: &str, lxm: &str) -> Result<String> {
+        let url = format!(
+            "{}/api/pds/getServiceAuth",
+            self.api_base.trim_end_matches('/')
+        );
+        let body = serde_json::json!({ "aud": aud, "lxm": lxm });
+        tracing::debug!(aud, lxm, did = %self.did, "minting service-auth JWT via console proxy");
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Pds(format!("transport: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Pds(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(ProviderError::Pds(format!(
+                "console proxy getServiceAuth returned {status}: {text}"
+            )));
+        }
+        let parsed: ServiceAuthResponse = serde_json::from_str(&text).map_err(|e| {
+            ProviderError::Pds(format!("decode getServiceAuth response: {e} body={text}"))
+        })?;
+        Ok(parsed.token)
     }
 
     /// Generic publish for any cocore collection. The console proxy

@@ -156,6 +156,15 @@ impl AdvisorClient {
         // per-model tool-call parser is chosen at build time).
         tool_calls_at_start: bool,
     ) -> Result<()> {
+        // Reject a plaintext advisor URL before we connect. A `ws://` link lets
+        // a network attacker read/inject job dispatch and control frames
+        // (spoofed InferenceRequests, forged ControlChanged/RecoverRequest) —
+        // the default is `wss://`, so a non-TLS URL is either a misconfig or an
+        // active downgrade. Allow it ONLY when the operator explicitly opts in
+        // via `COCORE_ALLOW_INSECURE_ADVISOR=1`, for local dev against a
+        // plaintext advisor.
+        require_secure_advisor_url(&self.url)?;
+
         tracing::info!(url = %self.url, "connecting to advisor");
         let (ws, _resp) =
             match tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&self.url)).await {
@@ -181,6 +190,30 @@ impl AdvisorClient {
         // frame — bound into every code-attestation response (0.9.23) so the
         // code-identity proof is tied to this specific binary.
         let my_cd_hash: Option<String> = register.cd_hash.clone();
+
+        // Mint a fresh atproto service-auth JWT for THIS registration, so the
+        // advisor can bind `provider_did` to real DID control (a machine can't
+        // register under a DID it doesn't hold). The token is minted by the
+        // provider's PDS (`com.atproto.server.getServiceAuth`) with
+        // `aud` = the advisor's DID and `lxm` = "dev.cocore.compute.register".
+        // It's short-lived, so we re-mint on every (re)connect. A mint failure
+        // is non-fatal: log it and register WITHOUT the jwt — the advisor's
+        // enforcement flag decides whether an unauthenticated Register is
+        // rejected, and we'd rather send an unsigned frame than crash the serve
+        // loop over a transient PDS / console-proxy blip.
+        let advisor_did = advisor_did();
+        match pds.mint_service_auth(&advisor_did, REGISTER_LXM).await {
+            Ok(jwt) => register.auth_jwt = Some(jwt),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    aud = %advisor_did,
+                    lxm = REGISTER_LXM,
+                    "could not mint service-auth JWT for advisor registration; registering without it"
+                );
+                register.auth_jwt = None;
+            }
+        }
 
         // Register
         let payload = serde_json::to_string(&AdvisorMessage::Register(register))
@@ -714,6 +747,60 @@ fn models_changed(a: &[String], b: &[String]) -> bool {
         s.into_iter().map(str::to_string).collect::<Vec<_>>()
     };
     norm(a) != norm(b)
+}
+
+/// Environment escape hatch that permits a plaintext (`ws://`) advisor URL.
+/// Set to `1`/`true` only for local development against a non-TLS advisor.
+const ALLOW_INSECURE_ADVISOR_ENV: &str = "COCORE_ALLOW_INSECURE_ADVISOR";
+
+/// Env var overriding the advisor's DID (the `aud` of the service-auth JWT we
+/// mint for registration). Defaults to the production advisor's `did:web`.
+const ADVISOR_DID_ENV: &str = "COCORE_ADVISOR_DID";
+
+/// Default advisor DID when `COCORE_ADVISOR_DID` is unset.
+const DEFAULT_ADVISOR_DID: &str = "did:web:advisor.cocore.dev";
+
+/// The `lxm` (lexicon method) the registration service-auth JWT is scoped to.
+/// The advisor checks the token was minted for exactly this method.
+const REGISTER_LXM: &str = "dev.cocore.compute.register";
+
+/// The advisor's DID used as the service-auth `aud`, from `COCORE_ADVISOR_DID`
+/// or the production default. An empty/whitespace override falls back to the
+/// default rather than minting a token bound to an empty audience.
+fn advisor_did() -> String {
+    match std::env::var(ADVISOR_DID_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_ADVISOR_DID.to_string(),
+    }
+}
+
+/// Reject a non-`wss://` advisor URL unless the operator has explicitly opted
+/// into insecure transport. Without TLS the advisor connection is trivially
+/// MITM-able: an attacker on the path can inject `InferenceRequest`s (making
+/// this machine serve arbitrary work) or forge control frames
+/// (`ControlChanged`, `RecoverRequest`, `HealthNotice`). The default advisor
+/// URL is `wss://`, so a `ws://` (or any other scheme) is a downgrade we refuse
+/// unless `COCORE_ALLOW_INSECURE_ADVISOR` is truthy.
+fn require_secure_advisor_url(url: &str) -> Result<()> {
+    let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
+    if scheme == "wss" {
+        return Ok(());
+    }
+    let allow_insecure = std::env::var(ALLOW_INSECURE_ADVISOR_ENV)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    if scheme == "ws" && allow_insecure {
+        tracing::warn!(
+            url = %url,
+            "connecting to advisor over PLAINTEXT ws:// because {ALLOW_INSECURE_ADVISOR_ENV} is set — \
+             the connection is not encrypted and can be MITM'd; use this only for local development"
+        );
+        return Ok(());
+    }
+    Err(ProviderError::Advisor(format!(
+        "refusing to connect to advisor over insecure transport: {url:?} (scheme {scheme:?}). \
+         Use a wss:// URL, or set {ALLOW_INSECURE_ADVISOR_ENV}=1 to allow ws:// for local dev."
+    )))
 }
 
 /// How often the serve loop checks that every previously-ready engine's
@@ -1709,6 +1796,32 @@ fn current_sip_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wss_advisor_url_is_always_accepted() {
+        assert!(require_secure_advisor_url("wss://advisor.cocore.dev/v1/agent").is_ok());
+        // Scheme match is case-insensitive.
+        assert!(require_secure_advisor_url("WSS://advisor.cocore.dev/v1/agent").is_ok());
+    }
+
+    #[test]
+    fn insecure_advisor_url_is_rejected_without_the_flag() {
+        // The env var governs the ws:// escape hatch; make sure it's off here so
+        // the test is deterministic regardless of the ambient environment.
+        std::env::remove_var(ALLOW_INSECURE_ADVISOR_ENV);
+        assert!(require_secure_advisor_url("ws://localhost:8080/v1/agent").is_err());
+        // A bogus scheme is refused too.
+        assert!(require_secure_advisor_url("http://advisor.cocore.dev").is_err());
+    }
+
+    #[test]
+    fn insecure_advisor_url_allowed_only_with_explicit_opt_in() {
+        std::env::set_var(ALLOW_INSECURE_ADVISOR_ENV, "1");
+        assert!(require_secure_advisor_url("ws://localhost:8080/v1/agent").is_ok());
+        // Even with the opt-in, a non-ws/wss scheme is still refused.
+        assert!(require_secure_advisor_url("http://localhost:8080").is_err());
+        std::env::remove_var(ALLOW_INSECURE_ADVISOR_ENV);
+    }
 
     #[test]
     fn models_changed_ignores_order_and_dupes_but_catches_edits() {

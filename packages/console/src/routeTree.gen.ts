@@ -61,6 +61,7 @@ import { Route as ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport } from
 import { Route as ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]createApiKey'
 import { Route as ApiV1ModelsRouteImport } from './routes/api/v1/models'
 import { Route as ApiPdsPutRecordRouteImport } from './routes/api/pds/putRecord'
+import { Route as ApiPdsGetServiceAuthRouteImport } from './routes/api/pds/getServiceAuth'
 import { Route as ApiPdsDeleteRecordRouteImport } from './routes/api/pds/deleteRecord'
 import { Route as ApiPdsCreateRecordRouteImport } from './routes/api/pds/createRecord'
 import { Route as ApiInternalWipeEverythingRouteImport } from './routes/api/internal/wipe-everything'
@@ -377,6 +378,11 @@ const ApiPdsPutRecordRoute = ApiPdsPutRecordRouteImport.update({
   path: '/api/pds/putRecord',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiPdsGetServiceAuthRoute = ApiPdsGetServiceAuthRouteImport.update({
+  id: '/api/pds/getServiceAuth',
+  path: '/api/pds/getServiceAuth',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiPdsDeleteRecordRoute = ApiPdsDeleteRecordRouteImport.update({
   id: '/api/pds/deleteRecord',
   path: '/api/pds/deleteRecord',
@@ -656,6 +662,7 @@ export interface FileRoutesByFullPath {
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
   '/api/pds/deleteRecord': typeof ApiPdsDeleteRecordRoute
+  '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
@@ -747,6 +754,7 @@ export interface FileRoutesByTo {
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
   '/api/pds/deleteRecord': typeof ApiPdsDeleteRecordRoute
+  '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
@@ -842,6 +850,7 @@ export interface FileRoutesById {
   '/api/internal/wipe-everything': typeof ApiInternalWipeEverythingRoute
   '/api/pds/createRecord': typeof ApiPdsCreateRecordRoute
   '/api/pds/deleteRecord': typeof ApiPdsDeleteRecordRoute
+  '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
@@ -936,6 +945,7 @@ export interface FileRouteTypes {
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
     | '/api/pds/deleteRecord'
+    | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
     | '/api/xrpc/dev.cocore.account.createApiKey'
@@ -1027,6 +1037,7 @@ export interface FileRouteTypes {
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
     | '/api/pds/deleteRecord'
+    | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
     | '/api/xrpc/dev.cocore.account.createApiKey'
@@ -1121,6 +1132,7 @@ export interface FileRouteTypes {
     | '/api/internal/wipe-everything'
     | '/api/pds/createRecord'
     | '/api/pds/deleteRecord'
+    | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
     | '/api/xrpc/dev.cocore.account.createApiKey'
@@ -1186,6 +1198,7 @@ export interface RootRouteChildren {
   ApiInternalWipeEverythingRoute: typeof ApiInternalWipeEverythingRoute
   ApiPdsCreateRecordRoute: typeof ApiPdsCreateRecordRoute
   ApiPdsDeleteRecordRoute: typeof ApiPdsDeleteRecordRoute
+  ApiPdsGetServiceAuthRoute: typeof ApiPdsGetServiceAuthRoute
   ApiPdsPutRecordRoute: typeof ApiPdsPutRecordRoute
   ApiV1ModelsRoute: typeof ApiV1ModelsRoute
   ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
@@ -1584,6 +1597,13 @@ declare module '@tanstack/react-router' {
       path: '/api/pds/putRecord'
       fullPath: '/api/pds/putRecord'
       preLoaderRoute: typeof ApiPdsPutRecordRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/pds/getServiceAuth': {
+      id: '/api/pds/getServiceAuth'
+      path: '/api/pds/getServiceAuth'
+      fullPath: '/api/pds/getServiceAuth'
+      preLoaderRoute: typeof ApiPdsGetServiceAuthRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/pds/deleteRecord': {
@@ -2015,6 +2035,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiInternalWipeEverythingRoute: ApiInternalWipeEverythingRoute,
   ApiPdsCreateRecordRoute: ApiPdsCreateRecordRoute,
   ApiPdsDeleteRecordRoute: ApiPdsDeleteRecordRoute,
+  ApiPdsGetServiceAuthRoute: ApiPdsGetServiceAuthRoute,
   ApiPdsPutRecordRoute: ApiPdsPutRecordRoute,
   ApiV1ModelsRoute: ApiV1ModelsRoute,
   ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute:

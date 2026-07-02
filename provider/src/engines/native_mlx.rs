@@ -158,6 +158,11 @@ impl Drop for NativeMlxEngine {
 /// FFI has no `tools` or `response_format` parameters, so requests using
 /// those features must be rejected rather than silently served as
 /// unconstrained plain text.
+// The only callers — the `generate` impl and the unit tests — are
+// `#[cfg(target_os = "macos")]`, so on non-macOS targets (CI runs clippy on
+// Linux with `--all-features`) this is dead. It's genuinely used on macOS, so
+// gate the allow rather than the function.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn check_native_capabilities(request: &GenerateRequest) -> Result<()> {
     if request.tools.is_some() {
         anyhow::bail!(

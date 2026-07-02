@@ -21,6 +21,42 @@ function newStore(): Store {
   return new Store(join(dir, "appview.db"));
 }
 
+/** A lexicon-valid provider record body (ingest now structurally validates —
+ *  see validate-ingest.ts). Spread `extra` to override the fields a given
+ *  test actually cares about (createdAt, shareLocation, machineLabel, …). */
+function providerBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    machineLabel: "MBP",
+    chip: "M3",
+    ramGB: 32,
+    supportedModels: ["llama-3.1-70b"],
+    priceList: [],
+    encryptionPubKey: "E",
+    attestationPubKey: "A",
+    trustLevel: "self-attested",
+    createdAt: "2026-05-07T12:00:00Z",
+    ...extra,
+  };
+}
+
+/** A lexicon-valid receipt record body; override via `extra`. */
+function receiptBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    job: { uri: "at://did:plc:r/dev.cocore.compute.job/1", cid: "jcid" },
+    requester: "did:plc:r",
+    model: "llama-3.1-70b",
+    inputCommitment: "a".repeat(64),
+    outputCommitment: "b".repeat(64),
+    tokens: { in: 32, out: 128 },
+    startedAt: "2026-05-07T12:00:00Z",
+    completedAt: "2026-05-07T12:00:03Z",
+    price: { amount: 50, currency: "USD" },
+    attestation: { uri: "at://did:plc:p/dev.cocore.compute.attestation/1", cid: "acid" },
+    enclaveSignature: "sig",
+    ...extra,
+  };
+}
+
 /** A small recorded event log. Real backfill replay tests would
  *  load CBOR-encoded firehose frames; for our purposes a plain
  *  JSON list of records is sufficient — the wire decoder lands in
@@ -87,6 +123,7 @@ const RECORDED_EVENTS: IndexedRecord[] = [
       priceCeiling: { amount: 100, currency: "USD" },
       acceptedTrustLevel: "self-attested",
       paymentAuthorization: { uri: "at://did:plc:r/auth/1", cid: "auth" },
+      nonce: "n".repeat(32),
       expiresAt: "2030-01-01T00:00:00Z",
       createdAt: "2026-05-07T12:00:00Z",
     },
@@ -215,13 +252,11 @@ test("stale provider re-ingest never clobbers a newer one (version guard)", () =
   ix.ingest({
     ...base,
     cid: "v2",
-    record: {
-      machineLabel: "MBP",
-      attestationPubKey: "A",
+    record: providerBody({
       shareLocation: true,
       proBono: { mode: "any" },
       createdAt: "2026-05-07T12:05:00Z",
-    },
+    }),
   });
 
   // A lagging / replayed firehose delivery of the PRE-EDIT commit (older
@@ -229,11 +264,7 @@ test("stale provider re-ingest never clobbers a newer one (version guard)", () =
   ix.ingest({
     ...base,
     cid: "v1",
-    record: {
-      machineLabel: "MBP",
-      attestationPubKey: "A",
-      createdAt: "2026-05-07T12:00:00Z",
-    },
+    record: providerBody({ createdAt: "2026-05-07T12:00:00Z" }),
   });
 
   const got = ix.store.get(uri);
@@ -254,19 +285,19 @@ test("equal or newer provider version still applies (idempotent + real updates)"
     repo: "did:plc:p",
     rkey: "1",
   };
-  ix.ingest({ ...base, record: { attestationPubKey: "A", createdAt: "2026-05-07T12:00:00Z" } });
+  ix.ingest({ ...base, record: providerBody({ createdAt: "2026-05-07T12:00:00Z" }) });
   // Equal createdAt, newer body — last-writer-wins is preserved.
   ix.ingest({
     ...base,
     cid: "c2",
-    record: { attestationPubKey: "A", machineLabel: "renamed", createdAt: "2026-05-07T12:00:00Z" },
+    record: providerBody({ machineLabel: "renamed", createdAt: "2026-05-07T12:00:00Z" }),
   });
   assert.equal((ix.store.get(uri)!.body as { machineLabel?: string }).machineLabel, "renamed");
   // Strictly newer — applies.
   ix.ingest({
     ...base,
     cid: "c3",
-    record: { attestationPubKey: "A", machineLabel: "newest", createdAt: "2026-05-07T12:10:00Z" },
+    record: providerBody({ machineLabel: "newest", createdAt: "2026-05-07T12:10:00Z" }),
   });
   assert.equal((ix.store.get(uri)!.body as { machineLabel?: string }).machineLabel, "newest");
 });
@@ -281,9 +312,15 @@ test("records without createdAt keep last-writer-wins (no guard)", () => {
     repo: "did:plc:p",
     rkey: "1",
   };
-  ix.ingest({ ...base, record: { model: "a" } });
-  ix.ingest({ ...base, cid: "r2", record: { model: "b" } });
-  assert.equal((ix.store.get(uri)!.body as { model?: string }).model, "b");
+  // Two receipts with no comparable createdAt — last write wins. Distinguish
+  // them by outputCommitment (model is unchanged so the guard has nothing to
+  // version by, matching the original intent).
+  ix.ingest({ ...base, record: receiptBody({ outputCommitment: "a".repeat(64) }) });
+  ix.ingest({ ...base, cid: "r2", record: receiptBody({ outputCommitment: "c".repeat(64) }) });
+  assert.equal(
+    (ix.store.get(uri)!.body as { outputCommitment?: string }).outputCommitment,
+    "c".repeat(64),
+  );
 });
 
 test("snapshot golden bytes (sentinel against silent body mutation)", async () => {

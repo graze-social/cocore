@@ -63,6 +63,7 @@ function fixtureScene() {
       priceCeiling: { amount: 100, currency: "USD" },
       acceptedTrustLevel: "self-attested",
       paymentAuthorization: { uri: "at://did:plc:requester/auth/1", cid: "auth" },
+      nonce: "n".repeat(32),
       expiresAt: "2030-01-01T00:00:00Z",
       createdAt: "2026-05-07T12:00:00Z",
     },

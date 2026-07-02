@@ -29,6 +29,21 @@ export async function verifyP256(
   publicKeyB64: string,
   signatureDerB64: string,
   message: Uint8Array,
+  // L6: opt-in signature-malleability guard. ECDSA admits two valid signatures
+  // per message — (r, s) and (r, n - s) — so an attacker can flip any known-good
+  // signature into a second valid form. Rejecting the high-S form (requiring
+  // s <= n/2) makes the signature canonical and closes that.
+  //
+  // Off by DEFAULT because the current producers do NOT normalise: the Rust
+  // provider signs via `p256::ecdsa::SigningKey::sign` WITHOUT calling
+  // `normalize_s`, so ~50% of real receipts/attestations/session keys are
+  // high-S (confirmed against target/confidential-attestation-fixture.json), and
+  // Apple CryptoKit likewise does not guarantee low-S. Rejecting high-S here
+  // would fail roughly half of all genuine signatures — a fail-OPEN-to-DoS, not
+  // a security win. Enabling this by default is a follow-up gated on the provider
+  // + enclave signers normalising to low-S first (a producer-side change). Until
+  // then callers that control their producers can pass `requireLowS: true`.
+  { requireLowS = false }: { requireLowS?: boolean } = {},
 ): Promise<boolean> {
   const pubRaw = decodeBase64(publicKeyB64);
   if (pubRaw.byteLength !== 64) {
@@ -39,6 +54,9 @@ export async function verifyP256(
   }
   const sigDer = decodeBase64(signatureDerB64);
   const sigRaw = derToRawSignature(sigDer);
+  if (requireLowS && isHighS(sigRaw.subarray(32, 64))) {
+    throw new SignatureVerifyError("high-s", "signature is not in canonical low-S form");
+  }
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     // Copy into a plain ArrayBuffer-backed view: TS 5.7+ types the generic
@@ -152,6 +170,32 @@ function legacyAttestationBody(signed: Record<string, unknown>): Record<string, 
 }
 
 // ---- internals -------------------------------------------------------
+
+// The order n of the P-256 (secp256r1) curve, and n/2 (the low-S ceiling).
+// A signature's s-component must satisfy s <= n/2 to be in canonical low-S form.
+const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+const P256_HALF_N = P256_N >> 1n;
+
+/** True iff the 32-byte big-endian s-component is above n/2 (high-S). */
+function isHighS(s32: Uint8Array): boolean {
+  let s = 0n;
+  for (const b of s32) s = (s << 8n) | BigInt(b);
+  return s > P256_HALF_N;
+}
+
+/** True iff a DER-encoded P-256 signature is in the malleable high-S form
+ *  (s > n/2). Exposed so producers/tests can assert their signers normalise to
+ *  low-S before {@link verifyP256}'s `requireLowS` guard is turned on by default.
+ *  Returns false for signatures that fail to parse (they can't be malleated
+ *  into a valid form anyway). */
+export function signatureIsHighS(signatureDerB64: string): boolean {
+  try {
+    const raw = derToRawSignature(decodeBase64(signatureDerB64));
+    return isHighS(raw.subarray(32, 64));
+  } catch {
+    return false;
+  }
+}
 
 function decodeBase64(b64: string): Uint8Array {
   // Node 18+ exposes Buffer; we avoid relying on it so this module

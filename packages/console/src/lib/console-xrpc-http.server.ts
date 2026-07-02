@@ -127,10 +127,21 @@ export async function devicePairConfirmResponse(request: Request): Promise<Respo
       return json({ error: `service-auth mint failed: ${(e as Error).message}` }, 502);
     }
 
+    // M6: authenticate the pre-minted `providerSession` we're forwarding with
+    // the shared internal secret. The AppView honors a caller-supplied session
+    // (apiKey/apiBase) ONLY behind this secret; without it the AppView ignores
+    // our session and mints its own — so a public confirm can't inject an
+    // attacker key/endpoint. When the secret is unset we still forward, but the
+    // AppView will (correctly) mint server-side.
+    const internalSecret = process.env["COCORE_INTERNAL_SECRET"];
     return passthrough(
       await fetch(`${base}/xrpc/dev.cocore.devicePair.confirm`, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+          ...(internalSecret ? { "x-cocore-internal-secret": internalSecret } : {}),
+        },
         body: JSON.stringify({
           userCode: body.userCode,
           decision: body.decision,

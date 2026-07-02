@@ -64,12 +64,78 @@ export interface BuildServerOptions {
   keepAliveIntervalMs?: number;
 }
 
+/** Minimum length for the shared internal secret. The `/internal/*` endpoints
+ *  mint API keys, overwrite OAuth sessions, and proxy repo writes for any DID,
+ *  so a weak secret is a full account-takeover primitive. Refuse to start with
+ *  a set-but-too-short secret rather than run with brute-forceable internal
+ *  auth. 32 chars is comfortably beyond online-guessing range for the
+ *  constant-time compare these routes use. */
+const MIN_INTERNAL_SECRET_LEN = 32;
+
+/** Normalize + validate `opts.internalSecret`. Returns the secret when it's
+ *  present AND long enough (so callers can gate `/internal/*` on a truthy
+ *  result), or undefined when unset (internal routes stay unmounted — fail
+ *  closed). Throws at startup when the secret is set but shorter than
+ *  {@link MIN_INTERNAL_SECRET_LEN}, so a misconfiguration is loud, not a silent
+ *  weak-auth deployment. */
+function validatedInternalSecret(secret: string | undefined): string | undefined {
+  if (!secret) return undefined;
+  if (secret.length < MIN_INTERNAL_SECRET_LEN) {
+    throw new Error(
+      `COCORE_INTERNAL_SECRET too short (${secret.length} chars); ` +
+        `require >= ${MIN_INTERNAL_SECRET_LEN} for the /internal/* endpoints`,
+    );
+  }
+  return secret;
+}
+
 /** Constant-time string compare that tolerates length differences. */
 function secretEquals(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+/** Upper bound on a persisted OAuth session blob. A StoredSession (DPoP
+ *  keypair + token set + metadata) is a few KB; 256 KiB is generous headroom
+ *  while rejecting a caller trying to stash an oversized payload under a DID. */
+const MAX_OAUTH_SESSION_BYTES = 256 * 1024;
+
+/** Validate the `data` field of an `/internal/oauth-session` write. Accepts a
+ *  JSON object (or a JSON string that parses to one), rejects scalars/arrays/
+ *  unparseable strings and anything over {@link MAX_OAUTH_SESSION_BYTES}.
+ *  Returns the canonical string form to persist on success. */
+function validateOAuthSessionData(
+  data: unknown,
+): { ok: true; data: string } | { ok: false; reason: string } {
+  let obj: unknown;
+  let serialized: string;
+  if (typeof data === "string") {
+    serialized = data;
+    try {
+      obj = JSON.parse(data);
+    } catch {
+      return { ok: false, reason: "data must be a JSON object (string was not valid JSON)" };
+    }
+  } else {
+    obj = data;
+    try {
+      serialized = JSON.stringify(data);
+    } catch {
+      return { ok: false, reason: "data is not serializable" };
+    }
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    return { ok: false, reason: "data must be a StoredSession object" };
+  }
+  if (Object.keys(obj as Record<string, unknown>).length === 0) {
+    return { ok: false, reason: "data must be a non-empty StoredSession object" };
+  }
+  if (Buffer.byteLength(serialized, "utf8") > MAX_OAUTH_SESSION_BYTES) {
+    return { ok: false, reason: "data exceeds the maximum session size" };
+  }
+  return { ok: true, data: serialized };
 }
 
 /** Console↔AppView internal endpoints (shared-secret gated): OAuth session
@@ -99,8 +165,17 @@ function buildInternalAccountRouter(
         if (body.data === undefined || body.data === null) {
           return err(400, { error: "InvalidRequest", message: "data (StoredSession) required" });
         }
-        const data = typeof body.data === "string" ? body.data : JSON.stringify(body.data);
-        accountStore.putOAuthSession(body.did, data);
+        // H5: validate the session blob's shape before we persist it as the
+        // AppView's sole restorable session for this DID. It's an opaque atcute
+        // StoredSession (the console owns the exact serialization), but it MUST
+        // parse to a non-empty JSON OBJECT (not a scalar/array/garbage string)
+        // and stay within a sane size — so a caller can't stash arbitrary junk
+        // (or a giant blob) under a DID and brick every subsequent restore.
+        const shape = validateOAuthSessionData(body.data);
+        if (!shape.ok) {
+          return err(400, { error: "InvalidRequest", message: shape.reason });
+        }
+        accountStore.putOAuthSession(body.did, shape.data);
         return ok({ ok: true });
       }).pipe(Effect.withSpan("appview.internal.oauthSession")),
     ),
@@ -183,6 +258,11 @@ function buildAppviewRouters(
   const routers: Array<HttpRouter.HttpRouter<never, never>> = [buildReadRouter(store)];
   const internalRouters: Array<HttpRouter.HttpRouter<never, never>> = [];
 
+  // Fail-closed on a weak internal secret: throw at startup rather than mount
+  // the /internal/* takeover surface behind brute-forceable auth. Unset →
+  // undefined → the /internal/* routers below stay unmounted entirely.
+  const internalSecret = validatedInternalSecret(opts.internalSecret);
+
   // Liveness probe.
   routers.push(
     HttpRouter.empty.pipe(
@@ -262,10 +342,9 @@ function buildAppviewRouters(
     // (watch the `deprecated.proxyAlias` span attribute).
     const proxyAlias = buildProxyAliasRouter(pctx);
     routers.push(proxyAlias, proxyAlias.pipe(HttpRouter.prefixAll("/api")));
-    if (opts.internalSecret)
-      internalRouters.push(buildInternalPdsRouter(pctx, opts.internalSecret));
+    if (internalSecret) internalRouters.push(buildInternalPdsRouter(pctx, internalSecret));
     console.error(
-      `appview: /pds write endpoints enabled${opts.internalSecret ? " (+ /internal/pds)" : ""} (+ deprecated dev.cocore.proxy.* aliases)`,
+      `appview: /pds write endpoints enabled${internalSecret ? " (+ /internal/pds)" : ""} (+ deprecated dev.cocore.proxy.* aliases)`,
     );
   }
 
@@ -305,8 +384,8 @@ function buildAppviewRouters(
   }
 
   // Internal console↔AppView handoff endpoints.
-  if (opts.accountStore && opts.internalSecret) {
-    internalRouters.push(buildInternalAccountRouter(opts.accountStore, opts.internalSecret));
+  if (opts.accountStore && internalSecret) {
+    internalRouters.push(buildInternalAccountRouter(opts.accountStore, internalSecret));
   }
 
   // Device pairing (start/poll public, confirm service-auth).
@@ -327,6 +406,7 @@ function buildAppviewRouters(
         accountStore: opts.accountStore,
         appviewDid: opts.appviewDid,
         apiBase,
+        ...(internalSecret ? { internalSecret } : {}),
       }),
     );
     console.error("appview: device-pair endpoints enabled");
@@ -378,16 +458,39 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const accountStore = appviewDid
     ? new AccountStore(process.env["COCORE_ACCOUNT_DB"] ?? "./appview-account.db")
     : undefined;
-  const handler = await buildAppviewNodeHandler(store, {
+  const opts: BuildServerOptions = {
     accountStore,
     appviewDid,
     bridgeUrl: process.env["COCORE_BRIDGE_URL"],
     internalSecret: process.env["COCORE_INTERNAL_SECRET"],
-  });
-  createServer(handler).listen(port, () => {
+  };
+
+  // H5: keep the `/internal/*` takeover surface (mint-key, reset-did,
+  // oauth-session handoff, repo-write proxy) OFF the public listener. The
+  // public port serves ONLY `.public`; the full app (public + internal) binds
+  // to a PRIVATE interface (loopback by default; override the host only for a
+  // trusted private network like Railway's). Without a valid internal secret
+  // there are no internal routers to serve, so no private listener is started.
+  const { full, public: publicApp } = buildAppviewSplit(store, opts);
+
+  const publicHandler = await appviewNodeHandler(publicApp);
+  createServer(publicHandler).listen(port, () => {
     console.error(
-      `appview api: listening on :${port} db=${dbPath}` +
+      `appview api: public listening on :${port} db=${dbPath}` +
         (appviewDid ? ` account=on(aud=${appviewDid})` : ""),
     );
   });
+
+  const internalPortRaw = process.env["COCORE_APPVIEW_INTERNAL_PORT"];
+  if (process.env["COCORE_INTERNAL_SECRET"] && internalPortRaw) {
+    const internalPort = Number(internalPortRaw);
+    // Loopback by default so the internal endpoints are unreachable off-host.
+    // Set COCORE_APPVIEW_INTERNAL_HOST to a private-network address (e.g. the
+    // Railway service's internal interface) when the console runs elsewhere.
+    const internalHost = process.env["COCORE_APPVIEW_INTERNAL_HOST"] ?? "127.0.0.1";
+    const internalHandler = await appviewNodeHandler(full);
+    createServer(internalHandler).listen(internalPort, internalHost, () => {
+      console.error(`appview api: internal listening on ${internalHost}:${internalPort}`);
+    });
+  }
 }

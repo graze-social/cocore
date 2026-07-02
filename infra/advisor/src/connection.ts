@@ -24,7 +24,9 @@ import {
   verifyAttestation,
   verifyCodeAttestation,
 } from "./attest.ts";
+import { type DidDocumentResolver, LXM_REGISTER, verifyServiceAuthToken } from "./did-auth.ts";
 import type { AdvisorMessage, AttestationChallenge } from "./protocol.ts";
+import { validateFrame } from "./protocol.ts";
 import { CRASH_LOOP_THRESHOLD, ProviderRegistry } from "./registry.ts";
 import type { SessionManager } from "./sessions.ts";
 
@@ -104,6 +106,26 @@ export interface ConnectionConfig {
    *  code-attestation (the pre-APNs behavior). Set exactly when the advisor has
    *  APNs configured (and the registry is constructed with enforcement on). */
   apns?: ApnsConfig | null;
+  /** DID-bound registration (C1). When set, the register handler verifies the
+   *  frame's `auth_jwt` (a `com.atproto.server.getServiceAuth` token with
+   *  `aud = advisorDid`, `lxm = dev.cocore.compute.register`) and requires the
+   *  authenticated DID to EQUAL `provider_did` before calling `registry.upsert`
+   *  — so a client can't register as a provider it doesn't control (which would
+   *  let it swap in its own attestation key and steal that provider's jobs).
+   *  Absent → registration is unauthenticated (legacy behavior). */
+  advisorDid?: string;
+  /** Enforcement flag for {@link advisorDid}. When true (and `advisorDid` is
+   *  set), a register lacking a valid DID-bound JWT is REJECTED (close 1008).
+   *  When false, the JWT is still VERIFIED if present (and a valid one binds
+   *  keys→DID, closing C1 for upgraded providers), but its ABSENCE is tolerated
+   *  — this is the safe staged-rollout mode while the fleet ships the JWT. Ops
+   *  flips `COCORE_ADVISOR_REQUIRE_AUTH=true` once the provider fleet has
+   *  shipped support for minting the register JWT. */
+  requireAuth?: boolean;
+  /** DID-document resolver for service-auth verification. Defaults to the real
+   *  did:plc + did:web resolver inside did-auth.ts; tests inject a stub so JWT
+   *  verification doesn't hit the network. */
+  didResolver?: DidDocumentResolver;
 }
 
 export function handleConnection(
@@ -292,20 +314,82 @@ export function handleConnection(
   };
 
   socket.on("message", (data) => {
-    let msg: AdvisorMessage;
+    let raw: unknown;
     try {
-      msg = JSON.parse(data.toString("utf8")) as AdvisorMessage;
+      raw = JSON.parse(data.toString("utf8")) as unknown;
     } catch (e) {
       console.error(`[ws] malformed JSON peer=${peer}: ${(e as Error).message}`);
       return;
     }
-    void onMessage(msg);
+    // Validate the frame SHAPE before dispatch (C2): a handler dereferences
+    // per-type fields directly, so a malformed frame (e.g. `{"type":"register"}`
+    // or an `attestation_response` without `signature`) would otherwise throw a
+    // TypeError → unhandled rejection → process exit. On a shape mismatch we
+    // log and close cleanly instead of throwing.
+    const check = validateFrame(raw);
+    if (!check.ok) {
+      console.error(`[ws] bad-frame peer=${peer}: ${check.reason}; closing`);
+      return close(1008, "bad-frame");
+    }
+    // Wrap dispatch so a rejected promise (e.g. an async verify that throws)
+    // can't escape as an unhandled rejection and crash the process. A handler
+    // failure closes THIS socket, not the advisor.
+    void onMessage(check.msg).catch((e) => {
+      console.error(`[ws] onMessage error peer=${peer}: ${(e as Error).message}`);
+      close(1011, "internal");
+    });
   });
 
   const onMessage = async (msg: AdvisorMessage): Promise<void> => {
     switch (msg.type) {
       case "register": {
-        registry.upsert(msg, () => close(1000, "replaced"), send, ping);
+        // C1: DID-bound registration. Verify the frame's service-auth JWT and
+        // require the authenticated DID to equal `provider_did` before touching
+        // the registry — otherwise a client could register as any provider and
+        // swap in its own attestation key, stealing that provider's jobs.
+        //
+        // `advisorDid` unset → unauthenticated legacy behavior. Set →
+        //   * a present `auth_jwt` is ALWAYS verified + must bind to
+        //     provider_did (a bad/mismatched token is rejected either way);
+        //   * a MISSING token is rejected only when `requireAuth` is true. In
+        //     staged-rollout mode (requireAuth false) absence is tolerated so
+        //     the fleet can upgrade before enforcement flips on.
+        if (config.advisorDid) {
+          if (msg.auth_jwt) {
+            const auth = await verifyServiceAuthToken(msg.auth_jwt, {
+              audience: config.advisorDid,
+              lxm: LXM_REGISTER,
+              resolver: config.didResolver,
+            });
+            if (!auth.ok) {
+              console.error(
+                `[ws] register auth rejected did=${msg.provider_did} peer=${peer}: ${auth.error} — ${auth.message}`,
+              );
+              return close(1008, "register-auth-failed");
+            }
+            if (auth.did !== msg.provider_did) {
+              console.error(
+                `[ws] register DID mismatch peer=${peer}: jwt iss=${auth.did} != provider_did=${msg.provider_did}; closing`,
+              );
+              return close(1008, "register-did-mismatch");
+            }
+          } else if (config.requireAuth) {
+            console.error(
+              `[ws] register missing auth_jwt did=${msg.provider_did} peer=${peer} (requireAuth on); closing`,
+            );
+            return close(1008, "register-auth-required");
+          }
+        }
+        // M1: refuse the registration if the registry is at capacity (a
+        // register flood can't grow the map unbounded). A re-register of an
+        // already-present machine always succeeds.
+        const upserted = registry.upsert(msg, () => close(1000, "replaced"), send, ping);
+        if (upserted === false) {
+          console.error(
+            `[ws] registry full — refusing register did=${msg.provider_did} peer=${peer}`,
+          );
+          return close(1013, "registry-full");
+        }
         registeredDid = msg.provider_did;
         registeredMachineId = ProviderRegistry.machineIdOf(msg);
         console.error(
@@ -445,7 +529,13 @@ export function handleConnection(
         return;
       }
       case "inference_chunk": {
-        if (!sessions.has(msg.session_id)) {
+        // H6b: only the provider this session was dispatched to may stream into
+        // it. A socket that merely learned the session_id can't inject chunks.
+        if (
+          !registeredDid ||
+          !registeredMachineId ||
+          !sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
+        ) {
           return;
         }
         sessions.write(msg.session_id, {
@@ -461,18 +551,35 @@ export function handleConnection(
         // "Still generating" — reset the session idle timer so a slow-but-
         // alive job (long prefill / slow decode) isn't killed as silent.
         // Not relayed to the requester; doesn't count as a token.
-        if (sessions.has(msg.session_id)) {
+        // H6b: only the assigned provider may keep its own session alive.
+        if (
+          registeredDid &&
+          registeredMachineId &&
+          sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
+        ) {
           sessions.keepalive(msg.session_id);
         }
         return;
       }
       case "inference_complete": {
+        // H6b: only the provider a session was dispatched to may complete it —
+        // otherwise a foreign socket could finish someone else's job with an
+        // attacker `receipt_uri` AND clear its own bad standing via
+        // recordCompletion. Drop the frame from any other socket.
+        if (
+          !registeredDid ||
+          !registeredMachineId ||
+          !sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
+        ) {
+          console.error(
+            `[ws] drop inference_complete from non-owner did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} session=${msg.session_id}`,
+          );
+          return;
+        }
         // A completion proves this machine isn't silently dropping work —
         // record it so the silent-failure detector clears, bad standing is
         // restored, and the dispatch counter has a denominator.
-        if (registeredDid && registeredMachineId) {
-          registry.recordCompletion(registeredDid, registeredMachineId);
-        }
+        registry.recordCompletion(registeredDid, registeredMachineId);
         sessions.complete(msg.session_id, {
           tokensIn: msg.tokens_in,
           tokensOut: msg.tokens_out,
@@ -524,7 +631,17 @@ export function handleConnection(
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     if (recycleTimer) clearTimeout(recycleTimer);
     clearResponseTimer();
-    if (registeredDid && registeredMachineId) registry.remove(registeredDid, registeredMachineId);
+    // H6a: only evict the entry if THIS socket still owns it. When a machine
+    // reconnects, its new socket's `upsert` REPLACES the entry (and closes this
+    // old socket with 1000/"replaced"). That close fires here — but the entry
+    // now belongs to the replacement, so removing it would evict the live
+    // socket. Compare the per-connection `send` closure (stable + unique per
+    // connection, stored on the entry by upsert) to prove ownership; a
+    // late/replaced close then no-ops instead of stranding the machine.
+    if (registeredDid && registeredMachineId) {
+      const entry = registry.get(registeredDid, registeredMachineId);
+      if (entry && entry.send === send) registry.remove(registeredDid, registeredMachineId);
+    }
     console.error(
       `[ws] close peer=${peer} did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} code=${code} reason=${reason}`,
     );

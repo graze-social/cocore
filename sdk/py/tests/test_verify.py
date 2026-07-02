@@ -37,6 +37,29 @@ def test_floats_rejected():
         canonicalize({"x": 1.5})
 
 
+def test_non_ascii_key_rejected():
+    # L6: non-ASCII object keys are rejected for cross-language byte parity
+    # (JS Array.sort orders by UTF-16 code unit, diverging from code-point order).
+    from cocore.canonical import CanonicalError
+
+    with pytest.raises(CanonicalError):
+        canonicalize({"café": 1})
+    # ASCII keys still fine.
+    assert canonicalize({"cafe": 1}) == '{"cafe":1}'
+
+
+def test_integer_range_capped():
+    # L6: integer magnitude is bounded to Rust's i64/u64 range.
+    from cocore.canonical import CanonicalError
+
+    assert canonicalize({"n": 2**64 - 1}) == '{"n":18446744073709551615}'
+    assert canonicalize({"n": -(2**63)}) == '{"n":-9223372036854775808}'
+    with pytest.raises(CanonicalError):
+        canonicalize({"n": 2**64})
+    with pytest.raises(CanonicalError):
+        canonicalize({"n": -(2**63) - 1})
+
+
 @pytest.mark.skipif(not os.path.exists(CONF_FIXTURE), reason="Rust fixture not generated")
 def test_cross_language_confidential_pass():
     with open(CONF_FIXTURE) as fh:

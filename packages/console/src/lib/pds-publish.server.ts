@@ -16,6 +16,8 @@ import type { OAuthSession } from "@atcute/oauth-node-client";
 
 import type { PublishedRecord, RecordTransport } from "@cocore/sdk/publish";
 
+import { bridgeHeaders } from "@/lib/cocore-config.ts";
+
 interface CreateRecordResponse {
   uri: string;
   cid: string;
@@ -65,7 +67,7 @@ export class PdsPublishTransport implements RecordTransport {
     if (this.bridgeUrl) {
       void fetch(`${this.bridgeUrl}/xrpc/dev.cocore.bridge.publish`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: bridgeHeaders(),
         body: JSON.stringify({
           uri: out.uri,
           cid: out.cid,

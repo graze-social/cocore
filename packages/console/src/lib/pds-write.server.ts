@@ -25,7 +25,7 @@ import {
 } from "@/integrations/auth/atproto.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
 import { forwardPdsWrite, isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
 /** Collection NSIDs these endpoints will write to a user's PDS. We allow
  *  the full `dev.cocore.*` namespace (compute.* receipts/jobs/etc. AND
@@ -56,7 +56,7 @@ function mirrorToBridge(args: {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.publish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({
       uri: args.uri,
       cid: args.cid,
@@ -75,7 +75,7 @@ function mirrorDeleteToBridge(uri: string): void {
   if (!bridgeUrl) return;
   void fetch(`${bridgeUrl}/xrpc/dev.cocore.bridge.unpublish`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: bridgeHeaders(),
     body: JSON.stringify({ uri }),
   }).catch(() => {
     // swallowed — AppView eventually catches up via firehose
@@ -120,14 +120,13 @@ function resolveCallerDid(request: Request): { did: Did } | Response {
 async function restoreSessionOr401(did: Did) {
   const session = await runTraced("auth.restoreSession", restoreAtprotoSessionEffect(did));
   if (!session) {
-    // DIAGNOSTIC: include the captured restore-failure reason so the cause is
-    // visible without server log access (refresh invalid_grant vs no stored
-    // session vs DPoP/keyset mismatch). See atproto.server.ts lastRestoreError.
+    // Keep the restore-failure reason (refresh invalid_grant vs no stored
+    // session vs DPoP/keyset mismatch — see atproto.server.ts
+    // lastRestoreError) server-side only; leaking DPoP/session-store
+    // diagnostics into the 401 body hands an attacker internal detail.
     const reason = lastRestoreError(did) ?? "unknown";
-    return jsonError(
-      401,
-      `underlying ATProto session no longer valid; re-authenticate (${reason})`,
-    );
+    console.error(`[pds-write] session restore failed for ${did}: ${reason}`);
+    return jsonError(401, "underlying ATProto session no longer valid; re-authenticate");
   }
   return session;
 }
@@ -454,4 +453,56 @@ export async function pdsDeleteRecord(request: Request): Promise<Response> {
   }
   mirrorDeleteToBridge(uri);
   return jsonOk({ uri });
+}
+
+// ---- getServiceAuth -------------------------------------------------
+//
+// Mint a short-lived atproto service-auth JWT on the caller's PDS via the
+// console's DPoP-bound OAuth session. Bearer-key auth resolves the key → DID,
+// and the token is signed by THAT DID's repo key — so a caller can only mint a
+// token asserting its own identity (no impersonation surface). The Rust agent
+// can't call `com.atproto.server.getServiceAuth` directly (no DPoP), so it
+// posts here; the returned `{ token }` is what it puts in its advisor Register
+// frame (C1: DID-bound registration) and what the console uses for the advisor
+// `/control` call. `aud` is the intended service's DID (the advisor's), `lxm`
+// the method NSID the token authorizes.
+
+interface ServiceAuthRaw {
+  aud?: unknown;
+  lxm?: unknown;
+}
+
+export async function pdsGetServiceAuth(request: Request): Promise<Response> {
+  const caller = resolveCallerDid(request);
+  if (caller instanceof Response) return caller;
+  const { did } = caller;
+
+  let raw: ServiceAuthRaw;
+  try {
+    raw = (await request.json()) as ServiceAuthRaw;
+  } catch {
+    return jsonError(400, "body must be JSON");
+  }
+  if (typeof raw.aud !== "string" || raw.aud.length === 0) return jsonError(400, "aud required");
+  // `lxm` is optional in the lexicon, but we require it: an unscoped token is
+  // usable against any method, and every cocore use mints a method-scoped one.
+  if (typeof raw.lxm !== "string" || raw.lxm.length === 0) return jsonError(400, "lxm required");
+  const aud = raw.aud;
+  const lxm = raw.lxm;
+
+  const session = await restoreSessionOr401(did);
+  if (session instanceof Response) return session;
+  const qs = new URLSearchParams({ aud, lxm }).toString();
+  const r = await session.handle(`/xrpc/com.atproto.server.getServiceAuth?${qs}`, {
+    method: "GET",
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    return jsonError(r.status >= 500 ? 502 : r.status, `pds getServiceAuth: ${body.slice(0, 300)}`);
+  }
+  const out = (await r.json()) as { token?: unknown };
+  if (typeof out.token !== "string" || out.token.length === 0) {
+    return jsonError(502, "pds getServiceAuth returned no token");
+  }
+  return jsonOk({ token: out.token });
 }

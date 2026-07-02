@@ -17,12 +17,22 @@
 
 import { HttpRouter, HttpServerRequest } from "@effect/platform";
 import { Effect } from "effect";
+import { timingSafeEqual } from "node:crypto";
 
 import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { AccountStore } from "../operational/account-store.ts";
 import { hydrateDids } from "../bsky-hydrate.ts";
-import { bearer, err, jsonBody, ok, searchParams } from "../api/http-app.ts";
+import { bearer, err, header, jsonBody, ok, searchParams } from "../api/http-app.ts";
 import { PairError, type PairStore, type ProviderSession } from "./pair-store.ts";
+
+/** Constant-time compare that tolerates length differences (never short-
+ *  circuits on unequal lengths in a timing-observable way). */
+function secretEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 export interface DevicePairContext {
   /** Mints the scoped API key handed to the paired agent. */
@@ -33,6 +43,14 @@ export interface DevicePairContext {
   /** Console origin agents append `/api/pds/*` to (console resolves the
    *  Bearer key and forwards the write here internally). */
   apiBase: string;
+  /** Shared internal secret (M6). A pre-minted `providerSession` in the
+   *  confirm body (apiKey/apiBase chosen by the caller) is honored ONLY when
+   *  the request carries this secret — i.e. the trusted console forwarding a
+   *  key it minted in its own store. Public callers never supply a session:
+   *  the AppView always mints it server-side, so a userCode-observer can't
+   *  point a victim's agent at an attacker key/endpoint. Undefined → the
+   *  pre-minted path is disabled entirely (always mint server-side). */
+  internalSecret?: string;
 }
 
 function isProviderSession(v: unknown): v is ProviderSession {
@@ -130,13 +148,25 @@ export function buildDevicePairRouter(
           });
         }
 
-        // Approve: bind a ProviderSession to the pairing. When the console
-        // forwards confirm it mints the key in its own store (so Bearer
-        // auth on `/api/pds/*` resolves) and passes the session here.
-        // Fall back to minting on the AppView for direct callers / tests.
+        // Approve: bind a ProviderSession to the pairing.
+        //
+        // M6: a caller-supplied `providerSession` (apiKey/apiBase chosen by the
+        // request) is TRUSTED only when the request also carries the internal
+        // secret — i.e. the console forwarding a key it minted in its own store
+        // so Bearer auth on `/api/pds/*` resolves. A PUBLIC caller (anyone who
+        // observed a userCode and holds any DID's service-auth) does NOT get to
+        // choose apiKey/apiBase: we ignore their body session and mint
+        // server-side, so they can't redirect the victim's agent at an attacker
+        // endpoint/key. `did` is always the service-auth-verified DID.
+        const presentedSecret = yield* header("x-cocore-internal-secret");
+        const internalTrusted =
+          typeof ctx.internalSecret === "string" &&
+          ctx.internalSecret.length > 0 &&
+          typeof presentedSecret === "string" &&
+          secretEquals(presentedSecret, ctx.internalSecret);
         const bodySession = body.providerSession;
         let session: ProviderSession;
-        if (isProviderSession(bodySession)) {
+        if (internalTrusted && isProviderSession(bodySession)) {
           session = {
             did,
             handle: bodySession.handle,

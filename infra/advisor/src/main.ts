@@ -18,7 +18,7 @@
 // in-flight requesters retry.
 
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 
 import { HttpRouter } from "@effect/platform";
@@ -26,10 +26,11 @@ import { Config, Effect, Metric, Option } from "effect";
 import { WebSocketServer } from "ws";
 
 import { makeRuntime, record } from "@cocore/o11y";
-import { err, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
+import { bearer, err, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
 
 import { loadApnsConfig } from "./apns.ts";
 import { handleConnection } from "./connection.ts";
+import { type DidDocumentResolver, LXM_CONTROL, verifyServiceAuthToken } from "./did-auth.ts";
 import { jobsRoute } from "./jobs.ts";
 import { KnownGoodSet } from "./known-good.ts";
 import { hydrateLatencyWindow, persistLatencyWindow } from "./latency-store.ts";
@@ -97,6 +98,51 @@ const CONFIG = Effect.runSync(
     railwayVolumeMountPath: Config.string("RAILWAY_VOLUME_MOUNT_PATH").pipe(Config.option),
     latencyPersistIntervalMs: Config.integer("COCORE_ADVISOR_LATENCY_PERSIST_INTERVAL_MS").pipe(
       Config.withDefault(30_000),
+    ),
+    // --- DID-bound auth (C1 / M3) ---
+    // This advisor's DID (e.g. did:web:advisor.cocore.dev). It's the `aud` the
+    // provider mints its register/control service-auth JWTs for. Unset → auth
+    // is off entirely (legacy unauthenticated behavior). Optional so dev/CI can
+    // run without it.
+    advisorDid: Config.string("COCORE_ADVISOR_DID").pipe(Config.option),
+    // Enforcement flag for DID-bound registration + /control. Default false so
+    // the live fleet isn't broken before providers ship the JWT: absence of a
+    // token is tolerated (but a present token is still verified + bound). Ops
+    // flips this to true once the fleet has upgraded.
+    requireAuth: Config.boolean("COCORE_ADVISOR_REQUIRE_AUTH").pipe(Config.withDefault(false)),
+    // --- Resource caps (M1) ---
+    // Max inbound WS frame. Default 256 KiB — our frames are heartbeats +
+    // sealed ciphertext, all well under this; the `ws` default of 100 MiB let a
+    // single frame exhaust memory. `/jobs` (which carries large multimodal
+    // payloads) is a separate HTTP path with its own 32 MiB body cap.
+    wsMaxPayloadBytes: Config.integer("COCORE_ADVISOR_WS_MAX_PAYLOAD").pipe(
+      Config.withDefault(262_144),
+    ),
+    // Total concurrent WS connections; over this, new upgrades are refused so a
+    // connection flood can't exhaust file descriptors / memory.
+    wsMaxConnections: Config.integer("COCORE_ADVISOR_WS_MAX_CONNECTIONS").pipe(
+      Config.withDefault(5_000),
+    ),
+    // Per-remote-IP concurrent WS connections; bounds a single client from
+    // eating the whole connection budget. DISABLED by default (0): the advisor
+    // runs behind Railway's edge, where every provider connection arrives from
+    // one of a few shared proxy IPs — a per-remote-IP cap would then reject the
+    // legitimate fleet the moment it exceeded the cap. Enable it (and set
+    // COCORE_ADVISOR_TRUST_PROXY=1 so it keys on the forwarded client IP, not
+    // the proxy) only in a deployment where remote IPs are per-client. The
+    // total cap + maxPayload are the always-on DoS guards.
+    wsMaxConnectionsPerIp: Config.integer("COCORE_ADVISOR_WS_MAX_CONNECTIONS_PER_IP").pipe(
+      Config.withDefault(0),
+    ),
+    // Trust `X-Forwarded-For` for the client IP behind a proxy (Railway). Only
+    // meaningful when the per-IP cap is enabled; when off, the per-IP key is the
+    // direct socket peer. Default false — trusting XFF from a directly-exposed
+    // listener would let a client spoof its IP to dodge the per-IP cap.
+    wsTrustProxy: Config.boolean("COCORE_ADVISOR_TRUST_PROXY").pipe(Config.withDefault(false)),
+    // Max entries the provider registry will hold; a registration over this is
+    // refused so a register flood can't grow the map unbounded.
+    registryMaxSize: Config.integer("COCORE_ADVISOR_REGISTRY_MAX_SIZE").pipe(
+      Config.withDefault(10_000),
     ),
   }),
 );
@@ -185,6 +231,22 @@ const DATA_DIR =
 /** How often to flush the latency windows to disk. A hard crash loses at most
  *  this much tail — acceptable for a "typical recent latency" headline. */
 const LATENCY_PERSIST_INTERVAL_MS = CONFIG.latencyPersistIntervalMs;
+/** This advisor's DID — the `aud` of the register/control service-auth JWTs.
+ *  Undefined disables DID-bound auth entirely (legacy unauthenticated mode). */
+const ADVISOR_DID = Option.getOrUndefined(CONFIG.advisorDid);
+/** DID-bound auth enforcement (C1 / M3). When true, a register / control call
+ *  lacking a valid DID-bound JWT is rejected; when false (default), a present
+ *  token is still verified + bound but absence is tolerated for staged rollout.
+ *  Only meaningful when {@link ADVISOR_DID} is set. */
+const REQUIRE_AUTH = CONFIG.requireAuth;
+/** M1 resource caps. */
+const WS_MAX_PAYLOAD_BYTES = CONFIG.wsMaxPayloadBytes;
+const WS_MAX_CONNECTIONS = CONFIG.wsMaxConnections;
+/** Per-IP concurrent WS cap; 0 disables it (the safe default behind a shared
+ *  proxy). See the config comment. */
+const WS_MAX_CONNECTIONS_PER_IP = CONFIG.wsMaxConnectionsPerIp;
+const WS_TRUST_PROXY = CONFIG.wsTrustProxy;
+const REGISTRY_MAX_SIZE = CONFIG.registryMaxSize;
 
 async function main(): Promise<void> {
   // One o11y runtime drives the WebSocket side + the periodic gauge/TTFT
@@ -205,10 +267,33 @@ async function main(): Promise<void> {
       "[advisor] APNs code-identity capability OFF (APNS_* unset) — confidential tier unavailable",
     );
   }
+  // DID-bound auth mode (C1 / M3). Three states:
+  //   * no COCORE_ADVISOR_DID → auth OFF (legacy: any client can register).
+  //   * ADVISOR_DID set, REQUIRE_AUTH false → staged rollout: a present JWT is
+  //     verified + bound to provider_did, but absence is tolerated so the fleet
+  //     can upgrade before enforcement.
+  //   * ADVISOR_DID set, REQUIRE_AUTH true → enforced: a register / control
+  //     lacking a valid DID-bound JWT is rejected.
+  // Ops flips COCORE_ADVISOR_REQUIRE_AUTH=true once the provider fleet ships
+  // support for minting the register JWT.
+  if (!ADVISOR_DID) {
+    console.error(
+      "[advisor] DID-bound auth OFF (COCORE_ADVISOR_DID unset) — registration is unauthenticated",
+    );
+  } else if (REQUIRE_AUTH) {
+    console.error(
+      `[advisor] DID-bound auth ENFORCED did=${ADVISOR_DID} — register/control require a valid service-auth JWT`,
+    );
+  } else {
+    console.error(
+      `[advisor] DID-bound auth STAGED did=${ADVISOR_DID} — JWT verified+bound when present, absence tolerated (flip COCORE_ADVISOR_REQUIRE_AUTH=true after the fleet ships the JWT)`,
+    );
+  }
+
   // Known-good cdHash set (WS-COORDINATOR). Empty unless COCORE_KNOWN_GOOD_CDHASHES
   // is set → fail-closed (no machine is confidential-eligible until a blessed-
   // build set is configured). Confidential eligibility is computed per-machine.
-  const registry = new ProviderRegistry(KnownGoodSet.fromEnv());
+  const registry = new ProviderRegistry(KnownGoodSet.fromEnv(), REGISTRY_MAX_SIZE);
   // Rolling time-to-first-token window (received → first chunk relayed),
   // surfaced at GET /ttft. Folds in the worker's model-load/prefill/gen.
   const ttft = new LatencyWindow(TTFT_WINDOW_SAMPLES);
@@ -379,7 +464,13 @@ async function main(): Promise<void> {
         ),
       ).pipe(Effect.withSpan("advisor.verified-providers")),
     ),
-    HttpRouter.post("/control", controlRoute(registry).pipe(Effect.withSpan("advisor.control"))),
+    HttpRouter.post(
+      "/control",
+      controlRoute(registry, {
+        advisorDid: ADVISOR_DID,
+        requireAuth: REQUIRE_AUTH,
+      }).pipe(Effect.withSpan("advisor.control")),
+    ),
     HttpRouter.post(
       "/jobs",
       jobsRoute({
@@ -418,11 +509,67 @@ async function main(): Promise<void> {
     server: http,
     path: "/v1/agent",
     perMessageDeflate: false,
+    // M1: bound a single inbound frame. Our frames (heartbeats + sealed
+    // ciphertext) are well under this; the `ws` default of 100 MiB let one
+    // frame exhaust memory. Large multimodal payloads travel on the separate
+    // HTTP `/jobs` path, which has its own 32 MiB body cap.
+    maxPayload: WS_MAX_PAYLOAD_BYTES,
   });
-  // The `ws` library stays the transport; the connection's setup logic runs
-  // as an Effect on the o11y runtime under an `advisor.ws.connection` span
-  // (analogous to NodeHttpServer driving the HttpRouter above).
-  wss.on("connection", (socket, req) =>
+
+  // M1: connection caps — total (always on) + per-IP (opt-in). Enforced on the
+  // raw `connection` event (an accepted, upgraded socket) rather than the
+  // upgrade handshake so we stay inside the `ws` library's flow: over cap we
+  // immediately close the fresh socket (1013 "try again later") before it can
+  // register or consume more than a transient slot. The counters are
+  // decremented on close.
+  //
+  // The per-IP cap is DISABLED by default (WS_MAX_CONNECTIONS_PER_IP === 0)
+  // because behind Railway's edge every provider shares one of a few proxy IPs
+  // — a per-remote-IP cap would then reject the legitimate fleet. When it IS
+  // enabled, we key on the forwarded client IP only if WS_TRUST_PROXY is set
+  // (the direct peer is the proxy, not the client); otherwise trusting XFF
+  // would let a client spoof its IP to dodge the cap.
+  let openConnections = 0;
+  const perIp = new Map<string, number>();
+  const perIpEnabled = WS_MAX_CONNECTIONS_PER_IP > 0;
+  const clientIpOf = (req: IncomingMessage): string => {
+    if (WS_TRUST_PROXY) {
+      const xff = req.headers["x-forwarded-for"];
+      const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
+      if (first) return first;
+    }
+    return req.socket.remoteAddress ?? "?";
+  };
+
+  wss.on("connection", (socket, req) => {
+    const ip = perIpEnabled ? clientIpOf(req) : (req.socket.remoteAddress ?? "?");
+    const ipCount = perIp.get(ip) ?? 0;
+    const overIp = perIpEnabled && ipCount >= WS_MAX_CONNECTIONS_PER_IP;
+    if (openConnections >= WS_MAX_CONNECTIONS || overIp) {
+      console.error(
+        `[ws] over cap — refusing peer=${ip} (total=${openConnections}/${WS_MAX_CONNECTIONS}${perIpEnabled ? ` perIp=${ipCount}/${WS_MAX_CONNECTIONS_PER_IP}` : ""})`,
+      );
+      try {
+        socket.close(1013, "over-capacity");
+      } catch {
+        // socket already gone
+      }
+      return;
+    }
+    openConnections += 1;
+    if (perIpEnabled) perIp.set(ip, ipCount + 1);
+    socket.once("close", () => {
+      openConnections -= 1;
+      if (perIpEnabled) {
+        const n = (perIp.get(ip) ?? 1) - 1;
+        if (n <= 0) perIp.delete(ip);
+        else perIp.set(ip, n);
+      }
+    });
+
+    // The `ws` library stays the transport; the connection's setup logic runs
+    // as an Effect on the o11y runtime under an `advisor.ws.connection` span
+    // (analogous to NodeHttpServer driving the HttpRouter above).
     record(
       runtime,
       Effect.sync(() =>
@@ -433,10 +580,13 @@ async function main(): Promise<void> {
           keepaliveMaxMissed: WS_KEEPALIVE_MAX_MISSED,
           maxConnectionMs: WS_MAX_CONNECTION_MS,
           apns: apnsConfig,
+          // C1: DID-bound registration. advisorDid unset → auth off.
+          ...(ADVISOR_DID ? { advisorDid: ADVISOR_DID } : {}),
+          requireAuth: REQUIRE_AUTH,
         }),
       ).pipe(Effect.withSpan("advisor.ws.connection")),
-    ),
-  );
+    );
+  });
 
   // --- Janitor: evict machines we haven't heard from ------------
   const sweeper = setInterval(() => {
@@ -515,17 +665,51 @@ async function main(): Promise<void> {
   );
 }
 
+/** Simple fixed-window per-DID rate limiter for /control (M3): even an
+ *  authenticated owner shouldn't be able to spam self-right / re-read nudges in
+ *  a tight loop. `RATE_MAX` calls per `RATE_WINDOW_MS` per DID; over that we
+ *  reply 429. In-memory (like the rest of the advisor); a restart resets it. */
+const CONTROL_RATE_WINDOW_MS = 10_000;
+const CONTROL_RATE_MAX = 20;
+const controlRate = new Map<string, { count: number; windowStart: number }>();
+function controlRateAllows(did: string, now = Date.now()): boolean {
+  const e = controlRate.get(did);
+  if (!e || now - e.windowStart >= CONTROL_RATE_WINDOW_MS) {
+    controlRate.set(did, { count: 1, windowStart: now });
+    return true;
+  }
+  if (e.count >= CONTROL_RATE_MAX) return false;
+  e.count += 1;
+  return true;
+}
+
+interface ControlAuthConfig {
+  /** This advisor's DID (the JWT `aud`). Undefined → auth off (legacy). */
+  advisorDid: string | undefined;
+  /** Reject an unauthenticated call when true; when false, log a warning and
+   *  allow it (staged rollout). Only meaningful when `advisorDid` is set. */
+  requireAuth: boolean;
+  /** Injectable DID resolver for tests; defaults to the real one. */
+  didResolver?: DidDocumentResolver;
+}
+
 /** `POST /control` — relay an unprivileged nudge to an owner's machine(s):
  *    action "re-read-active" (default) — after flipping the `active` switch on
  *      the PDS, so a start/stop takes effect in ~a second instead of at the
  *      next 30s poll.
  *    action "self-right" — the owner clicked "Try to recover" on an unhealthy
  *      machine; ask the agent to run its recovery now.
- *  Either carries NO authority — the agent re-reads / re-checks its own
- *  authoritative state — so this stays an unprivileged relay. Targets a single
- *  machine when `machineId` is given, else every machine under the DID. */
-function controlRoute(registry: ProviderRegistry) {
+ *  Either carries NO authority over the agent — it re-reads / re-checks its own
+ *  authoritative state — but it can still be abused to bounce a victim's engine
+ *  in a loop, so (M3) the caller must present a service-auth JWT
+ *  (`lxm = dev.cocore.compute.control`) whose authenticated DID equals the
+ *  target `did`. Gated behind the same COCORE_ADVISOR_REQUIRE_AUTH flag as
+ *  registration: when off, an unauthenticated call is allowed but logged as a
+ *  warning; when on, it's rejected. Targets a single machine when `machineId`
+ *  is given, else every machine under the DID. */
+function controlRoute(registry: ProviderRegistry, auth: ControlAuthConfig) {
   return Effect.gen(function* () {
+    const token = yield* bearer;
     const parsed = yield* Effect.either(jsonBody);
     if (parsed._tag === "Left") return err(400, { error: "invalid JSON body" });
     const b = parsed.right as { did?: unknown; machineId?: unknown; action?: unknown };
@@ -538,6 +722,37 @@ function controlRoute(registry: ProviderRegistry) {
     if (action !== "re-read-active" && action !== "self-right") {
       return err(400, { error: "action must be 're-read-active' or 'self-right'" });
     }
+
+    // M3: authenticate + scope to the owner. The caller must prove control of
+    // the target DID (service-auth JWT, iss == did) so a stranger can't loop-
+    // bounce someone else's engine.
+    if (auth.advisorDid) {
+      if (token) {
+        const res = yield* Effect.promise(() =>
+          verifyServiceAuthToken(token, {
+            audience: auth.advisorDid as string,
+            lxm: LXM_CONTROL,
+            resolver: auth.didResolver,
+          }),
+        );
+        if (!res.ok) return err(res.status, { error: `${res.error}: ${res.message}` });
+        if (res.did !== did) {
+          return err(403, { error: "authenticated DID does not match target did" });
+        }
+      } else if (auth.requireAuth) {
+        return err(401, { error: "service-auth JWT required" });
+      } else {
+        console.error(
+          `[control] UNAUTHENTICATED call for did=${did} action=${action} allowed (requireAuth off) — flip COCORE_ADVISOR_REQUIRE_AUTH=true to enforce`,
+        );
+      }
+    }
+
+    // Per-DID rate limit (applies regardless of auth mode).
+    if (!controlRateAllows(did)) {
+      return err(429, { error: "rate limit exceeded for did" });
+    }
+
     const targets =
       typeof b.machineId === "string"
         ? [registry.get(did, b.machineId)].filter((e): e is NonNullable<typeof e> => !!e)
@@ -559,6 +774,19 @@ function controlRoute(registry: ProviderRegistry) {
     return ok({ ok: true, delivered });
   });
 }
+
+// C2: last-resort process guards. A single malformed frame (or any other
+// stray async fault) must degrade the one affected connection, not take the
+// whole matchmaker down — log and stay up, mirroring infra/services/main.ts.
+// The per-connection dispatch wrapper (connection.ts) already closes the
+// offending socket; these catch anything that still escapes.
+process.on("unhandledRejection", (reason) => {
+  const e = reason instanceof Error ? reason : new Error(String(reason));
+  console.error(`advisor: unhandledRejection — ${e.message}\n${e.stack ?? ""}`);
+});
+process.on("uncaughtException", (e) => {
+  console.error(`advisor: uncaughtException — ${e.message}\n${e.stack ?? ""}`);
+});
 
 main().catch((e) => {
   console.error("advisor: fatal", e);

@@ -13,8 +13,25 @@ from .appattest import (
 )
 from .canonical import CanonicalError, canonical_bytes, canonicalize
 from .mda import MdaError, MdaResult, verify_chain, verify_chain_against
-from .p256 import verify_attestation_signature, verify_p256, verify_receipt_signature
+from .p256 import (
+    signature_is_high_s,
+    verify_attestation_signature,
+    verify_p256,
+    verify_receipt_signature,
+)
 from .seal import open_from_provider, seal_to_provider
+from .validate import (
+    Finding,
+    PreChargeContext,
+    PreChargeInputs,
+    ValidationReport,
+    finding_by_code,
+    verify_for_charge,
+    verify_for_charge_strict,
+    verify_receipt,
+    verify_receipt_strict,
+    verify_settlement_chain,
+)
 from .verify import VerifyResult, session_key_message, verify_provider_for_seal
 
 __all__ = [
@@ -31,6 +48,7 @@ __all__ = [
     "verify_app_attest_b64",
     "APP_ATTEST_APP_ID",
     "verify_p256",
+    "signature_is_high_s",
     "verify_attestation_signature",
     "verify_receipt_signature",
     "seal_to_provider",
@@ -38,4 +56,14 @@ __all__ = [
     "VerifyResult",
     "verify_provider_for_seal",
     "session_key_message",
+    "Finding",
+    "ValidationReport",
+    "PreChargeContext",
+    "PreChargeInputs",
+    "verify_receipt",
+    "verify_receipt_strict",
+    "verify_settlement_chain",
+    "verify_for_charge",
+    "verify_for_charge_strict",
+    "finding_by_code",
 ]

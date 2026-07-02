@@ -32,6 +32,8 @@
 
 import type { Database as DB, Statement } from "better-sqlite3";
 
+import { computeFee } from "./exchange.ts";
+
 export interface TokenLedgerPolicy {
   /** Tokens granted on first touch. Set to 0 to disable. */
   tokenGrant: number;
@@ -42,6 +44,12 @@ export interface TokenLedgerPolicy {
   /** Basis points of each receipt's token cost routed to the
    *  treasury account. 500 = 5%. The remainder goes to the provider. */
   treasuryFeeBps: number;
+  /** Minimum treasury fee in tokens. Floor on the bps calculation.
+   *  Additive — defaults to 0 (no floor) when omitted, preserving the
+   *  pure-bps behavior. MUST mirror the exchange FeePolicy.minMinor so
+   *  the ledger's recorded fee and the published settlement's fee agree
+   *  (they share `computeFee`). */
+  feeMinMinor?: number;
   /** Waive the treasury fee on self-loop receipts (requester DID
    *  equals provider DID — e.g. a user running a job on their own
    *  machine via the exchange). When true and the receipt is a
@@ -419,10 +427,18 @@ export class TokenLedger {
     //      DID once. No snapshot-and-overwrite for collisions.
     const isSelfLoop = receipt.requesterDid === receipt.providerDid;
     const waiveFee = isSelfLoop && policy.selfLoopFeeWaived;
-    const providerShare = waiveFee
-      ? receipt.tokens
-      : Math.floor((receipt.tokens * (10000 - policy.treasuryFeeBps)) / 10000);
-    const treasuryShare = waiveFee ? 0 : receipt.tokens - providerShare;
+    // M5: derive the treasury fee from the SAME `computeFee` the
+    // settlement path uses, so the ledger movement and the published
+    // settlement's exchangeFee can never diverge. `computeFee` floors to
+    // `feeMinMinor` then clamps to the price, so `treasuryShare` never
+    // exceeds `receipt.tokens` and `providerShare` is never negative.
+    const treasuryShare = waiveFee
+      ? 0
+      : computeFee(receipt.tokens, {
+          bps: policy.treasuryFeeBps,
+          minMinor: policy.feeMinMinor ?? 0,
+        });
+    const providerShare = receipt.tokens - treasuryShare;
 
     // Aggregate signed deltas by DID. In a non-self-loop receipt
     // requester/provider/treasury are three different DIDs (or

@@ -24,6 +24,7 @@ import type {
   DispatchEvent,
   ProviderCredit,
 } from "@/lib/inference-dispatch.server.ts";
+import { safeFetchImage } from "@/lib/safe-image-fetch.server.ts";
 
 /** A remote (http/https) image that still needs fetching before it can go
  *  into the sealed envelope. Produced by the sync `normalizeMessageContent`
@@ -453,19 +454,18 @@ async function resolveImages(messages: ChatMessage[]): Promise<EnvelopeMessage[]
         resolved.push(part);
         continue;
       }
-      // Remote image: fetch + inline.
-      const res = await fetch(part.url);
-      if (!res.ok) throw new Error(`failed to fetch image ${part.url}: ${res.status}`);
-      const mime = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/jpeg";
-      if (!mime.startsWith("image/")) {
-        throw new Error(`image url ${part.url} returned non-image content-type ${mime}`);
-      }
-      const buf = new Uint8Array(await res.arrayBuffer());
-      imageBytes += buf.byteLength;
+      // Remote image: fetch + inline. SSRF-guarded — the URL comes
+      // straight from caller-supplied chat content, so it must not be
+      // allowed to reach the internal network / cloud metadata. The guard
+      // also caps the response to the remaining image budget and yields a
+      // generic error (never leaking upstream status/mime/body).
+      const remainingBudget = MAX_IMAGE_BYTES - imageBytes;
+      const { bytes, mime } = await safeFetchImage(part.url, { maxBytes: remainingBudget });
+      imageBytes += bytes.byteLength;
       if (imageBytes > MAX_IMAGE_BYTES) {
         throw new Error(`images too large (max ${MAX_IMAGE_BYTES} bytes total)`);
       }
-      resolved.push({ type: "image", mime, data: Buffer.from(buf).toString("base64") });
+      resolved.push({ type: "image", mime, data: Buffer.from(bytes).toString("base64") });
     }
     out.push({
       role: m.role,

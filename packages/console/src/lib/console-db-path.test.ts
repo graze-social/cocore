@@ -66,6 +66,13 @@ test("no env vars + non-production NODE_ENV => :memory:", () => {
   assert.equal(r, ":memory:");
 });
 
+test("production + no durable path => throws (fail closed, never :memory:)", () => {
+  // Silently falling back to :memory: in production makes API keys and
+  // OAuth/app sessions ephemeral. Refuse to boot instead.
+  process.env["NODE_ENV"] = "production";
+  assert.throws(() => resolveConsoleDbPath(), /durable database/);
+});
+
 // Note on the mkdir-failure path: a previous version of this file
 // tried to exercise the catch arm by pointing
 // RAILWAY_VOLUME_MOUNT_PATH at /proc/<unwritable>. On linux runners

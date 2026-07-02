@@ -126,6 +126,18 @@ pub struct HealthNotice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Register {
     pub provider_did: String,
+    /// Short-lived atproto service-auth JWT minted by the provider's PDS
+    /// (`com.atproto.server.getServiceAuth`) with `aud` = the advisor's DID and
+    /// `lxm` = `dev.cocore.compute.register`. The advisor verifies its issuer
+    /// equals `provider_did` and its `lxm` matches, binding this registration to
+    /// a DID the machine actually controls — so a machine can't register under
+    /// another DID's identity. `Option` because minting can fail (transient PDS
+    /// / console-proxy error) or an older build may not populate it; the agent
+    /// then registers without it and the advisor's enforcement flag governs
+    /// whether that is rejected. Minted fresh on every (re)connect since the
+    /// token is short-lived. Additive — pre-auth advisors ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_jwt: Option<String>,
     /// Stable per-machine identifier — this machine's
     /// `dev.cocore.compute.provider` record rkey. Lets the advisor hold
     /// several machines under one DID (an owner serving on a laptop AND a

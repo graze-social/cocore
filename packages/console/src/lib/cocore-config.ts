@@ -27,6 +27,22 @@ export interface CocoreConfig {
   internalApiKey: string;
 }
 
+/** Headers for an internal bridge call (`dev.cocore.bridge.*`). These routes
+ *  are operator-gated on the services container (constant-time `authOk` over
+ *  the shared `COCORE_INTERNAL_API_KEY`), so the console — the sole legitimate
+ *  caller — must present the Bearer key. When the key is unset the header is
+ *  omitted and the bridge fails the call closed; the PDS write still wins
+ *  (these calls are best-effort cache hints), so a missing key degrades to
+ *  "cache not mirrored," never a broken write. */
+export function bridgeHeaders(extra?: Record<string, string>): Record<string, string> {
+  const key = cocoreConfig().internalApiKey;
+  return {
+    "content-type": "application/json",
+    ...(key ? { authorization: `Bearer ${key}` } : {}),
+    ...extra,
+  };
+}
+
 export function cocoreConfig(): CocoreConfig {
   return {
     bridgeUrl: process.env["COCORE_BRIDGE_URL"] ?? "http://localhost:8080",
