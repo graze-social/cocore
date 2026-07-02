@@ -33,6 +33,13 @@ import type { Store } from "../store.ts";
 import { clampInt, parseIntOr } from "./query.ts";
 import { err, ok, searchParams } from "./http-app.ts";
 
+// modelActivity JSON-walks the 5000 most-recent receipt bodies on every hit and
+// is unauthenticated — a cheap way to force a full scan in a loop. Memoize the
+// result for a short TTL so a hot page (or an attacker) can't drive repeated
+// full scans. Override with COCORE_MODEL_ACTIVITY_TTL_MS.
+const MODEL_ACTIVITY_TTL_MS = Number(process.env["COCORE_MODEL_ACTIVITY_TTL_MS"] ?? 30_000);
+let modelActivityCache: { at: number; body: unknown } | null = null;
+
 // Lexicon `bytes` fields ship as base64 strings on the wire; decode them for
 // the schema-validation pass in verifyReceipt (the cryptographic verify runs
 // on the original string-bearing JSON so canonical bytes match what was signed).
@@ -110,7 +117,10 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
       "/xrpc/dev.cocore.account.listFriendEdges",
       Effect.gen(function* () {
         const sp = yield* searchParams;
-        const limit = clampInt(sp.get("limit"), 5000, 1, 20000);
+        // Hard cap lowered 20000 -> 1000: an unauthenticated caller could pull
+        // 20k edge rows and serialize them per request as a memory-amplification
+        // lever. 1000 is ample for the friends UI; larger reads should paginate.
+        const limit = clampInt(sp.get("limit"), 1000, 1, 1000);
         const edges = store.listFriendEdges(limit);
         return ok({ edges, total: edges.length });
       }).pipe(Effect.withSpan("appview.listFriendEdges")),
@@ -217,6 +227,11 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
     HttpRouter.get(
       "/xrpc/dev.cocore.compute.modelActivity",
       Effect.sync(() => {
+        // Serve a memoized result within the TTL to bound repeated full scans.
+        const cached = modelActivityCache;
+        if (cached && Date.now() - cached.at < MODEL_ACTIVITY_TTL_MS) {
+          return ok(cached.body);
+        }
         // Aggregate receipt activity per model + per time window (1h/24h/7d/
         // 30d), with per-provider counts, over the 5000 most-recent receipts.
         const now = Date.now();
@@ -282,7 +297,9 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
             stats: s,
           })),
         }));
-        return ok({ generatedAt: new Date().toISOString(), models });
+        const body = { generatedAt: new Date().toISOString(), models };
+        modelActivityCache = { at: Date.now(), body };
+        return ok(body);
       }).pipe(Effect.withSpan("appview.modelActivity")),
     ),
     HttpRouter.get(

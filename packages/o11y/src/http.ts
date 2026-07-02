@@ -27,20 +27,41 @@ export const searchParams = Effect.map(
   (req) => new URL(req.url, "http://localhost").searchParams,
 );
 
-/** Read + JSON-parse the request body. Empty body → `{}`. Fails catchably
- *  (not as a defect) with `Error("body must be JSON")` on malformed JSON. */
+/** Hard cap on a JSON request body. Bounds the in-memory buffer a single POST
+ *  can force before we parse it — without this, an unauthenticated route (e.g.
+ *  the bridge mirror) lets a caller push an arbitrarily large body into memory.
+ *  Override with COCORE_MAX_JSON_BODY_BYTES. */
+const MAX_JSON_BODY_BYTES = Number(process.env["COCORE_MAX_JSON_BODY_BYTES"] ?? 1024 * 1024);
+
+/** Read + JSON-parse the request body. Empty body → `{}`. Rejects a body whose
+ *  declared `content-length` or actual size exceeds {@link MAX_JSON_BODY_BYTES}
+ *  before parsing. Fails catchably (not as a defect) with
+ *  `Error("body must be JSON")` on malformed JSON (or `Error("body too large")`
+ *  on an oversized body). */
 export const jsonBody: Effect.Effect<unknown, Error, HttpServerRequest.HttpServerRequest> =
   HttpServerRequest.HttpServerRequest.pipe(
-    Effect.flatMap((req) => req.text),
-    Effect.flatMap((raw) =>
-      raw.trim().length === 0
+    Effect.flatMap((req) => {
+      const cl = req.headers["content-length"];
+      const declared = typeof cl === "string" ? Number(cl) : Number.NaN;
+      if (Number.isFinite(declared) && declared > MAX_JSON_BODY_BYTES) {
+        return Effect.fail(new Error("body too large"));
+      }
+      return req.text;
+    }),
+    Effect.flatMap((raw) => {
+      if (Buffer.byteLength(raw, "utf8") > MAX_JSON_BODY_BYTES) {
+        return Effect.fail(new Error("body too large"));
+      }
+      return raw.trim().length === 0
         ? Effect.succeed({} as unknown)
         : Effect.try({
             try: () => JSON.parse(raw) as unknown,
             catch: () => new Error("body must be JSON"),
-          }),
+          });
+    }),
+    Effect.catchAll((e) =>
+      Effect.fail(e instanceof Error && e.message === "body too large" ? e : new Error("body must be JSON")),
     ),
-    Effect.catchAll(() => Effect.fail(new Error("body must be JSON"))),
   );
 
 /** A request header value, or undefined. */

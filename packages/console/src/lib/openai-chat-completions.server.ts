@@ -24,6 +24,7 @@ import type {
   DispatchEvent,
   ProviderCredit,
 } from "@/lib/inference-dispatch.server.ts";
+import { safeImageFetch } from "@/lib/safe-fetch.server.ts";
 
 /** A remote (http/https) image that still needs fetching before it can go
  *  into the sealed envelope. Produced by the sync `normalizeMessageContent`
@@ -453,12 +454,14 @@ async function resolveImages(messages: ChatMessage[]): Promise<EnvelopeMessage[]
         resolved.push(part);
         continue;
       }
-      // Remote image: fetch + inline.
-      const res = await fetch(part.url);
-      if (!res.ok) throw new Error(`failed to fetch image ${part.url}: ${res.status}`);
+      // Remote image: SSRF-guarded fetch + inline. `safeImageFetch` validates
+      // the URL (and every redirect hop) against private-range/scheme/port
+      // rules and returns an opaque error on any failure — do NOT echo the URL
+      // or upstream status back to the caller (that was an internal-scan oracle).
+      const res = await safeImageFetch(part.url);
       const mime = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/jpeg";
       if (!mime.startsWith("image/")) {
-        throw new Error(`image url ${part.url} returned non-image content-type ${mime}`);
+        throw new Error("image url returned non-image content");
       }
       const buf = new Uint8Array(await res.arrayBuffer());
       imageBytes += buf.byteLength;
