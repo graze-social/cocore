@@ -28,7 +28,7 @@ import {
   AppviewForwardTransport,
   isAppviewForwardConfigured,
 } from "@/lib/appview-pds-forward.server.ts";
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { cocoreConfig, internalAuthHeaders } from "@/lib/cocore-config.ts";
 import { runTraced } from "@/lib/o11y.server.ts";
 import { PdsPublishTransport } from "@/lib/pds-publish.server.ts";
 import { appviewGetProfileEffect } from "@/integrations/appview/appview.server.ts";
@@ -855,7 +855,11 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
     //    advisors/providers keep treating the payload as text.
     const req = await fetch(`${config.advisorUrl}/jobs`, {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...internalAuthHeaders(),
+      },
       body: JSON.stringify({
         jobUri: submitted.job.ref.uri,
         jobCid: submitted.job.ref.cid,

@@ -17,7 +17,7 @@
 // Both are lost on restart — providers reconnect automatically;
 // in-flight requesters retry.
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { join } from "node:path";
 
@@ -26,7 +26,7 @@ import { Config, Effect, Metric, Option } from "effect";
 import { WebSocketServer } from "ws";
 
 import { makeRuntime, record } from "@cocore/o11y";
-import { err, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
+import { err, header, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
 
 import { loadApnsConfig } from "./apns.ts";
 import { handleConnection } from "./connection.ts";
@@ -98,11 +98,49 @@ const CONFIG = Effect.runSync(
     latencyPersistIntervalMs: Config.integer("COCORE_ADVISOR_LATENCY_PERSIST_INTERVAL_MS").pipe(
       Config.withDefault(30_000),
     ),
+    // Shared internal bearer gating the mutating HTTP routes (/jobs, /control).
+    // These are called only by the console/appview SERVER (which vouches for the
+    // requester via its own session), not by end requesters — so a shared secret
+    // + private network is the right boundary, matching the services bridge.
+    internalApiKey: Config.string("COCORE_INTERNAL_API_KEY").pipe(Config.option),
+    // Backstop bound on total concurrent WS connections (registry + per-conn
+    // state grow with connections; without a cap a flood can exhaust memory).
+    maxConnections: Config.integer("COCORE_ADVISOR_MAX_CONNECTIONS").pipe(
+      Config.withDefault(2000),
+    ),
   }),
 );
 
 const PORT = CONFIG.port;
+const INTERNAL_API_KEY = CONFIG.internalApiKey;
+const MAX_CONNECTIONS = CONFIG.maxConnections;
 const HEARTBEAT_TIMEOUT_MS = CONFIG.heartbeatTimeoutMs;
+
+/** Constant-time bearer check against the shared internal key. Fails closed
+ *  when the key is unset (the mutating routes become unreachable rather than
+ *  open) — the same posture as the services bridge. */
+function authOk(hdr: string | string[] | undefined): boolean {
+  if (Option.isNone(INTERNAL_API_KEY)) return false;
+  const key = INTERNAL_API_KEY.value;
+  if (typeof hdr !== "string") return false;
+  const m = /^Bearer\s+(.+)$/.exec(hdr);
+  if (!m) return false;
+  const presented = m[1] ?? "";
+  if (presented.length !== key.length) return false;
+  return timingSafeEqual(Buffer.from(presented), Buffer.from(key));
+}
+
+/** Wrap a route Effect so it first requires a valid internal bearer. The
+ *  `header` read adds the HttpServerRequest requirement (already present on the
+ *  wrapped routes), so the composed type stays a valid HttpRouter handler. */
+function requireInternalAuth<A, E, R>(route: Effect.Effect<A, E, R>) {
+  return Effect.gen(function* () {
+    if (!authOk(yield* header("authorization"))) {
+      return err(401, { error: "unauthorized" });
+    }
+    return yield* route;
+  });
+}
 const SWEEP_INTERVAL_MS = CONFIG.sweepIntervalMs;
 const RECHALLENGE_INTERVAL_MS = CONFIG.rechallengeIntervalMs;
 /** How long the advisor waits for the provider to answer a
@@ -379,22 +417,27 @@ async function main(): Promise<void> {
         ),
       ).pipe(Effect.withSpan("advisor.verified-providers")),
     ),
-    HttpRouter.post("/control", controlRoute(registry).pipe(Effect.withSpan("advisor.control"))),
+    HttpRouter.post(
+      "/control",
+      requireInternalAuth(controlRoute(registry)).pipe(Effect.withSpan("advisor.control")),
+    ),
     HttpRouter.post(
       "/jobs",
-      jobsRoute({
-        registry,
-        sessions,
-        generateId: () => randomUUID(),
-        attestationMaxAgeMs: ATTESTATION_MAX_AGE_MS,
-        preflightTimeoutMs: PREFLIGHT_TIMEOUT_MS,
-        onDispatched: (ms) => {
-          ack.record(ms);
-          // Mirror the ack sample into a histogram for OTLP export (the /ack
-          // route keeps serving the rolling in-memory window).
-          record(runtime, Metric.update(ackMs, ms));
-        },
-      }),
+      requireInternalAuth(
+        jobsRoute({
+          registry,
+          sessions,
+          generateId: () => randomUUID(),
+          attestationMaxAgeMs: ATTESTATION_MAX_AGE_MS,
+          preflightTimeoutMs: PREFLIGHT_TIMEOUT_MS,
+          onDispatched: (ms) => {
+            ack.record(ms);
+            // Mirror the ack sample into a histogram for OTLP export (the /ack
+            // route keeps serving the rolling in-memory window).
+            record(runtime, Metric.update(ackMs, ms));
+          },
+        }),
+      ),
     ),
   );
 
@@ -422,8 +465,19 @@ async function main(): Promise<void> {
   // The `ws` library stays the transport; the connection's setup logic runs
   // as an Effect on the o11y runtime under an `advisor.ws.connection` span
   // (analogous to NodeHttpServer driving the HttpRouter above).
-  wss.on("connection", (socket, req) =>
-    record(
+  wss.on("connection", (socket, req) => {
+    // Backstop against a connection flood: once we're over the cap, refuse new
+    // sockets (1013 = "try again later") instead of letting registry / per-conn
+    // state grow unbounded. wss.clients already includes this socket.
+    if (wss.clients.size > MAX_CONNECTIONS) {
+      try {
+        socket.close(1013, "advisor at capacity");
+      } catch {
+        /* already closing */
+      }
+      return;
+    }
+    return record(
       runtime,
       Effect.sync(() =>
         handleConnection(socket, req, registry, sessions, {
@@ -435,8 +489,8 @@ async function main(): Promise<void> {
           apns: apnsConfig,
         }),
       ).pipe(Effect.withSpan("advisor.ws.connection")),
-    ),
-  );
+    );
+  });
 
   // --- Janitor: evict machines we haven't heard from ------------
   const sweeper = setInterval(() => {

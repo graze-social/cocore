@@ -693,9 +693,14 @@ export async function* runDispatch(
     // 4. POST advisor /jobs, pinned to this candidate. `inputFormat` tells the
     //    provider how to read the opened bytes (raw prompt vs messages-v1
     //    envelope); omitted for the text path.
+    const advisorKey = process.env["COCORE_INTERNAL_API_KEY"];
     const req = await fetch(`${deps.advisorUrl}/jobs`, {
       method: "POST",
-      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...(advisorKey ? { authorization: `Bearer ${advisorKey}` } : {}),
+      },
       body: JSON.stringify({
         jobUri: submitted.job.ref.uri,
         jobCid: submitted.job.ref.cid,

@@ -37,6 +37,11 @@ import type { SessionManager } from "./sessions.ts";
 // re-challenge refreshes it. A cdHash change (new build) invalidates the cache
 // — that machine must re-prove. TTL caps how long a proof is honored unrefreshed.
 const CODE_ATTEST_TTL_MS = 11 * 60_000;
+// Hard cap on cache entries. This map is keyed by attacker-influenceable
+// (did, machineId) and was previously only ever written, never swept — a
+// registration flood could grow it without bound. `rememberCodeAttest` prunes
+// expired entries and evicts oldest-first once the cap is reached.
+const CODE_ATTEST_MAX_ENTRIES = 10_000;
 const codeAttestCache = new Map<string, { cdHash: string; at: number }>();
 const codeAttestKey = (did: string, machineId: string): string => `${did} ${machineId}`;
 function cachedCodeAttestFresh(
@@ -56,6 +61,18 @@ function rememberCodeAttest(
   now: number,
 ): void {
   if (!cdHash) return;
+  // Bound the map before inserting: drop expired entries, then evict
+  // oldest-first (Map preserves insertion order) until under the cap.
+  if (codeAttestCache.size >= CODE_ATTEST_MAX_ENTRIES) {
+    for (const [k, v] of codeAttestCache) {
+      if (now - v.at >= CODE_ATTEST_TTL_MS) codeAttestCache.delete(k);
+    }
+    while (codeAttestCache.size >= CODE_ATTEST_MAX_ENTRIES) {
+      const oldest = codeAttestCache.keys().next().value;
+      if (oldest === undefined) break;
+      codeAttestCache.delete(oldest);
+    }
+  }
   codeAttestCache.set(codeAttestKey(did, machineId), { cdHash, at: now });
 }
 

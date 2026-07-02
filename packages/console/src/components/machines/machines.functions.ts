@@ -26,7 +26,7 @@ import {
   appviewGetReceiptsEffect,
   appviewListProvidersEffect,
 } from "@/integrations/appview/appview.server.ts";
-import { cocoreConfig } from "@/lib/cocore-config.ts";
+import { cocoreConfig, internalAuthHeaders } from "@/lib/cocore-config.ts";
 import { resolveActorsForDids } from "@/lib/friends.server.ts";
 import { fetchAttestationPubkeys } from "@/lib/machine-attribution.server.ts";
 import {
@@ -366,7 +366,7 @@ async function nudgeAdvisorControl(did: string): Promise<void> {
   try {
     await fetch(`${cocoreConfig().advisorUrl}/control`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...internalAuthHeaders() },
       body: JSON.stringify({ did }),
       signal: AbortSignal.timeout(5_000),
     });
@@ -385,7 +385,7 @@ async function requestSelfRight(did: string, machineId: string): Promise<{ deliv
   try {
     const resp = await fetch(`${cocoreConfig().advisorUrl}/control`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...internalAuthHeaders() },
       body: JSON.stringify({ did, machineId, action: "self-right" }),
       signal: AbortSignal.timeout(5_000),
     });

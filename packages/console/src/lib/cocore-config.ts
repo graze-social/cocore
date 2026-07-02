@@ -37,6 +37,14 @@ export function bridgeHeaders(): Record<string, string> {
   };
 }
 
+/** The `Authorization` header for the advisor's internal routes (/jobs,
+ *  /control), or `{}` when no key is configured. Spread into a fetch's headers
+ *  alongside content-type/accept. */
+export function internalAuthHeaders(): Record<string, string> {
+  const key = process.env["COCORE_INTERNAL_API_KEY"] ?? "";
+  return key ? { authorization: `Bearer ${key}` } : {};
+}
+
 export function cocoreConfig(): CocoreConfig {
   return {
     bridgeUrl: process.env["COCORE_BRIDGE_URL"] ?? "http://localhost:8080",

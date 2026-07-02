@@ -208,8 +208,9 @@ function parseJobBody(input: unknown, generateId: () => string): ParsedJob | Par
   };
 }
 
-/** Hard cap on a request body. `/jobs` is public (it's how requesters
- *  dispatch), so an unbounded read is a trivial memory-exhaustion DoS. A
+/** Hard cap on a request body. `/jobs` is gated by the internal bearer (called
+ *  by the console/appview server, not end requesters), but an unbounded read is
+ *  still a memory-exhaustion DoS from a key holder or a misconfig. A
  *  text prompt + metadata is well under 1 MiB, but a multimodal
  *  (messages-v1) request inlines base64 images inside the sealed envelope,
  *  which is then sent as a JSON number array (~4-7 bytes on the wire per
