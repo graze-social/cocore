@@ -472,8 +472,14 @@ fn ring_dump(ring: &Arc<Mutex<VecDeque<String>>>) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the env-mutating tests below — `std::env::set_var` is
+    /// process-global, so they'd race each other under cargo's parallel
+    /// runner. Same pattern as the subprocess engine's ENV_LOCK.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn from_env_is_none_without_server_bin() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Snapshot + clear so the test is independent of the ambient env.
         let prev = std::env::var("COCORE_LLAMA_SERVER_BIN").ok();
         std::env::remove_var("COCORE_LLAMA_SERVER_BIN");
@@ -485,6 +491,7 @@ mod tests {
 
     #[test]
     fn from_env_parses_when_bin_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_bin = std::env::var("COCORE_LLAMA_SERVER_BIN").ok();
         let prev_ngl = std::env::var("COCORE_LLAMA_NGL").ok();
         std::env::set_var("COCORE_LLAMA_SERVER_BIN", "/usr/bin/llama-server");
@@ -505,6 +512,7 @@ mod tests {
 
     #[test]
     fn ngl_defaults_to_all_layers() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev_bin = std::env::var("COCORE_LLAMA_SERVER_BIN").ok();
         let prev_ngl = std::env::var("COCORE_LLAMA_NGL").ok();
         std::env::set_var("COCORE_LLAMA_SERVER_BIN", "/usr/bin/llama-server");
@@ -586,5 +594,143 @@ mod tests {
         let engine = LlamaCppEngine::new("test/model-GGUF", cfg);
         let err = engine.start().unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ── managed-lifecycle tests against a fake llama-server ──────────
+    //
+    // The real llama-server needs a GPU build + GGUF weights, so these spawn
+    // a stand-in that honors the same contract the engine relies on: parse
+    // `--port` from argv, bind it on loopback, answer `GET /v1/models` (the
+    // readiness probe) and `POST /v1/chat/completions` (inference). That
+    // exercises the actual spawn → stall-poll → probe → serve → SIGTERM
+    // machinery end-to-end — the same fake-endpoint approach the subprocess
+    // and openai engine tests use, with a process boundary in the middle.
+
+    /// Write an executable stand-in server into `dir` and return a config
+    /// pointing at it.
+    #[cfg(unix)]
+    fn fake_server_config(dir: &tempfile::TempDir, script: &str) -> LlamaServerConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("fake-llama-server");
+        std::fs::write(&path, script).expect("write fake server");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+        LlamaServerConfig {
+            server_bin: path,
+            n_gpu_layers: 0,
+            enable_tool_calls: false,
+            extra_args: vec![],
+        }
+    }
+
+    /// A minimal OpenAI-shaped HTTP server (stdlib python3 — present on the
+    /// Linux and macOS CI runners) that serves until killed, like a healthy
+    /// llama-server.
+    #[cfg(unix)]
+    const SERVE_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def _send(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        self._send(b'{"object":"list","data":[]}')
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._send(json.dumps({
+            "choices": [{"message": {"content": "fake reply"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }).encode())
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+"#;
+
+    #[cfg(unix)]
+    fn gguf_request() -> GenerateRequest {
+        GenerateRequest {
+            model: "test/model-GGUF".into(),
+            messages: vec![],
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            guided_json: None,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    /// The full happy lifecycle: spawn → readiness probe → idempotent
+    /// re-start → inference through the child → SIGTERM teardown (twice —
+    /// terminate must be idempotent, since Drop also runs it).
+    #[cfg(unix)]
+    #[test]
+    fn start_reaches_ready_serves_and_terminates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = LlamaCppEngine::new("test/model-GGUF", fake_server_config(&dir, SERVE_SCRIPT));
+
+        engine.start().expect("fake llama-server must come up");
+        assert!(engine.ready(), "child alive after start");
+        engine
+            .start()
+            .expect("second start on a running engine is an idempotent no-op");
+
+        let resp = engine
+            .generate_once(&gguf_request())
+            .expect("inference through the spawned child");
+        assert_eq!(resp.text, "fake reply");
+        assert_eq!((resp.tokens_in, resp.tokens_out), (3, 2));
+
+        engine.terminate();
+        assert!(!engine.ready(), "child reaped after terminate");
+        engine.terminate(); // idempotent — Drop will run it again anyway
+    }
+
+    /// The health-watchdog contract: `ready()` must flip false when the
+    /// server dies (or the dead model stays advertised), and `restart()`
+    /// must reap + respawn on a fresh port and serve again.
+    #[cfg(unix)]
+    #[test]
+    fn ready_flips_false_when_server_dies_and_restart_respawns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = LlamaCppEngine::new("test/model-GGUF", fake_server_config(&dir, SERVE_SCRIPT));
+        engine.start().expect("first start");
+        assert!(engine.ready());
+
+        // Kill the child out from under the engine, as an OOM-kill would.
+        if let Some(child) = lock(&engine.child).as_mut() {
+            child.kill().expect("kill fake server");
+            let _ = child.wait();
+        }
+        assert!(!engine.ready(), "death must be observable via ready()");
+
+        engine.restart().expect("respawn");
+        assert!(engine.ready(), "respawned child serves again");
+        let resp = engine.generate_once(&gguf_request()).expect("inference after restart");
+        assert_eq!(resp.text, "fake reply");
+        engine.terminate();
+    }
+
+    /// A child that exits during startup must fail `start()` with its
+    /// captured output in the error — the ring buffer is the operator's only
+    /// signal — and never hang until the stall timeout.
+    #[cfg(unix)]
+    #[test]
+    fn startup_failure_surfaces_child_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = "#!/usr/bin/env bash\necho 'boom: fake llama-server refusing to start' >&2\nexit 3\n";
+        let engine = LlamaCppEngine::new("test/model-GGUF", fake_server_config(&dir, script));
+        let err = engine.start().unwrap_err().to_string();
+        assert!(
+            err.contains("exited during startup"),
+            "exit classified: {err}"
+        );
+        assert!(err.contains("boom"), "ring buffer output surfaced: {err}");
+        assert!(!engine.ready());
     }
 }
