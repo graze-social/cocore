@@ -734,6 +734,8 @@ mod tests {
             anti_debug: true,
             core_dumps_disabled: true,
             env_scrubbed: true,
+            kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
 

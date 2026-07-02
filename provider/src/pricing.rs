@@ -475,6 +475,9 @@ static UNIFORM_RATE: ModelRate = ModelRate {
     min_ram_gb: 0,
     description: "uniform off-catalog fallback rate",
     recommended: false,
+    // Off-catalog ids have no vetted parser pairing; tool-call support is
+    // decided by the startup canary, never by this field.
+    tool_call_parser: None,
 };
 
 /// The uniform exchange rate every cocore model is priced at today:
