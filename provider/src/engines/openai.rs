@@ -272,17 +272,33 @@ fn read_sse_stream(
     };
 
     let mut handler = |v: &serde_json::Value| {
+        // Reasoning channel: backends that surface thinking on a dedicated
+        // field (llama-server with --reasoning-format, vLLM reasoning
+        // parsers) rather than inline <think> tags. Mirrors the subprocess
+        // engine's process_sse_buffer.
+        if let Some(reasoning) = v
+            .pointer("/choices/0/delta/reasoning_content")
+            .or_else(|| v.pointer("/choices/0/delta/reasoning"))
+            .and_then(|c| c.as_str())
+        {
+            if !reasoning.is_empty() {
+                on_delta(DeltaChannel::Reasoning, reasoning)?;
+            }
+        }
+        if let Some(tc) = v
+            .pointer("/choices/0/delta/tool_calls")
+            .filter(|t| !t.is_null())
+        {
+            if let Ok(tc_str) = serde_json::to_string(tc) {
+                on_delta(DeltaChannel::ToolCall, &tc_str)?;
+            }
+        }
         if let Some(content) = v
             .pointer("/choices/0/delta/content")
             .and_then(|c| c.as_str())
         {
             if !content.is_empty() {
                 splitter.push(content, on_delta)?;
-            }
-        }
-        if let Some(tc) = v.pointer("/choices/0/delta/tool_calls") {
-            if let Ok(tc_str) = serde_json::to_string(tc) {
-                on_delta(DeltaChannel::ToolCall, &tc_str)?;
             }
         }
         if let Some(u) = v.get("usage") {
@@ -561,5 +577,206 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[1]["type"], "image_url");
+    }
+
+    /// Drive `read_sse_stream` over an in-memory body and collect the
+    /// channel-tagged deltas + token counts. Mirrors the subprocess test
+    /// module's `drain` helper so channel-routing tests read the same way
+    /// in both engines.
+    fn drain(body: &str, model: &str) -> (Vec<(DeltaChannel, String)>, (u64, u64)) {
+        let mut out: Vec<(DeltaChannel, String)> = Vec::new();
+        let mut cursor = std::io::Cursor::new(body.as_bytes().to_vec());
+        let tokens = read_sse_stream(
+            &mut cursor,
+            &mut |ch, s| {
+                out.push((ch, s.to_string()));
+                Ok(())
+            },
+            model,
+        )
+        .expect("in-memory SSE stream");
+        (out, tokens)
+    }
+
+    fn channel_text(out: &[(DeltaChannel, String)], want: DeltaChannel) -> String {
+        out.iter()
+            .filter(|(c, _)| *c == want)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn extracts_reasoning_content_field_onto_reasoning_channel() {
+        // llama-server with --reasoning-format (and vLLM reasoning parsers)
+        // surface thinking on a dedicated delta field rather than inline
+        // <think> tags; it must land on the Reasoning channel, not Content.
+        // Mirrors the subprocess engine's test of the same name.
+        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                    data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\
+                    data: [DONE]\n";
+        let (out, tokens) = drain(body, "test-model");
+        assert_eq!(channel_text(&out, DeltaChannel::Reasoning), "hmm");
+        assert_eq!(channel_text(&out, DeltaChannel::Content), "hi");
+        assert_eq!(tokens, (4, 2));
+    }
+
+    #[test]
+    fn splits_inline_think_tags_in_content_field() {
+        // A model with no reasoning_content field but inline <think> in its
+        // content stream is still separated by the ThinkTagSplitter.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>why</think>because\"}}]}\n\
+                    data: [DONE]\n";
+        let (out, _) = drain(body, "test-model");
+        assert_eq!(channel_text(&out, DeltaChannel::Reasoning), "why");
+        assert_eq!(channel_text(&out, DeltaChannel::Content), "because");
+    }
+
+    #[test]
+    fn prefill_think_model_starts_stream_in_reasoning() {
+        // A dedicated thinking model prefills the opening <think> in its chat
+        // template, so the stream carries only the closing tag. The splitter
+        // must start inside reasoning for such model ids.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"pondering</think>done\"}}]}\n\
+                    data: [DONE]\n";
+        let (out, _) = drain(body, "qwen3-thinking-2507");
+        assert_eq!(channel_text(&out, DeltaChannel::Reasoning), "pondering");
+        assert_eq!(channel_text(&out, DeltaChannel::Content), "done");
+    }
+
+    #[test]
+    fn separates_tool_calls_from_content_and_skips_null() {
+        // Structured tool_calls fragments ride the ToolCall channel as JSON;
+        // an explicit `"tool_calls": null` (some backends emit it on the
+        // terminal chunk) must not be forwarded as the literal string "null".
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"\",\"tool_calls\":null}}]}\n\
+                    data: [DONE]\n";
+        let (out, _) = drain(body, "test-model");
+        assert_eq!(channel_text(&out, DeltaChannel::Content), "Let me check");
+        let tool_calls: Vec<&str> = out
+            .iter()
+            .filter(|(c, _)| *c == DeltaChannel::ToolCall)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "null tool_calls must not be forwarded");
+        let parsed: serde_json::Value = serde_json::from_str(tool_calls[0]).expect("json");
+        assert_eq!(parsed[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn body_includes_tools_tool_choice_and_response_format() {
+        let engine = OpenAiEngine::new("m", "http://127.0.0.1:1", None).unwrap();
+        let mut request = req();
+        request.guided_json = Some(serde_json::json!({"name": "s", "schema": {}}));
+        request.tools = Some(serde_json::json!([{"type": "function"}]));
+        request.tool_choice = Some(serde_json::json!("auto"));
+        let b = engine.body(&request, true);
+        assert_eq!(b["response_format"]["type"], "json_schema");
+        assert!(b["tools"].is_array());
+        assert_eq!(b["tool_choice"], "auto");
+        // Streaming bodies ask for the terminal usage chunk so token counts
+        // are exact rather than estimated.
+        assert_eq!(b["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn body_omits_optional_fields_when_absent() {
+        // Optional knobs must be absent, not null — some backends reject
+        // explicit nulls, and the non-streaming body must not carry
+        // stream_options.
+        let engine = OpenAiEngine::new("m", "http://127.0.0.1:1", None).unwrap();
+        let b = engine.body(&req(), false);
+        for key in [
+            "response_format",
+            "tools",
+            "tool_choice",
+            "temperature",
+            "top_p",
+            "stream_options",
+        ] {
+            assert!(b.get(key).is_none(), "{key} should be omitted");
+        }
+        assert_eq!(b["stream"], false);
+    }
+
+    /// One-shot fake endpoint that answers every request with `response`
+    /// (a full raw HTTP response). For canary/error-path tests where the
+    /// richer `spawn_fake_endpoint` routing is noise.
+    fn spawn_static_endpoint(response: String) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match conn.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => raw.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let _ = conn.write_all(response.as_bytes());
+            }
+        });
+        (port, handle)
+    }
+
+    fn json_response(json: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+            json.len()
+        )
+    }
+
+    #[test]
+    fn probe_tool_calls_true_when_endpoint_returns_structured_call() {
+        // The canary gates tool-call advertising: a backend that returns a
+        // real tool_calls array naming the canary function passes.
+        let json = "{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"report_status\",\"arguments\":\"{\\\"status\\\":\\\"ok\\\"}\"}}]}}]}";
+        let (port, server) = spawn_static_endpoint(json_response(json));
+        let engine =
+            OpenAiEngine::new("test-model", &format!("http://127.0.0.1:{port}"), None).unwrap();
+        assert!(engine.probe_tool_calls().unwrap());
+        drop(server);
+    }
+
+    #[test]
+    fn probe_tool_calls_false_when_endpoint_answers_with_text() {
+        // A backend that ignores the forced tool_choice and answers in prose
+        // must NOT be advertised as tool-capable — Ok(false), not an error.
+        let json = "{\"choices\":[{\"message\":{\"content\":\"status is ok!\"}}]}";
+        let (port, server) = spawn_static_endpoint(json_response(json));
+        let engine =
+            OpenAiEngine::new("test-model", &format!("http://127.0.0.1:{port}"), None).unwrap();
+        assert!(!engine.probe_tool_calls().unwrap());
+        drop(server);
+    }
+
+    #[test]
+    fn error_status_elides_response_body() {
+        // Endpoints echo the request (prompt included) back in error bodies;
+        // the error we surface must carry the status but never those bytes.
+        let body = "{\"error\":{\"message\":\"SECRET-PROMPT-ECHO\"}}";
+        let resp = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (port, server) = spawn_static_endpoint(resp);
+        let engine =
+            OpenAiEngine::new("test-model", &format!("http://127.0.0.1:{port}"), None).unwrap();
+        let err = engine.generate_once(&req()).unwrap_err().to_string();
+        drop(server);
+        assert!(err.contains("500"), "status surfaced: {err}");
+        assert!(
+            !err.contains("SECRET-PROMPT-ECHO"),
+            "body must be elided: {err}"
+        );
     }
 }
