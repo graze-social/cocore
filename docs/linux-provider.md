@@ -283,9 +283,14 @@ independently verifiable on the provider's PDS
 ```bash
 cd provider
 cargo fmt --check          # clean
-cargo clippy --all-features --all-targets   # 0 errors; 2 pre-existing upstream warnings (untouched by this branch)
-cargo test                 # 269 passed, 0 failed  (rebased on v0.9.39 main)
+cargo clippy --all-features --all-targets   # 0 warnings, 0 errors
+cargo test -- --test-threads=1   # 269 passed, 0 failed  (1 live-only ignored; rebased on v0.9.39 main)
 ```
+
+> Run the suite single-threaded. Three pre-existing upstream `advisor::tests`
+> share the `ALLOW_INSECURE_ADVISOR` env var and race under default
+> parallelism; they are deterministic with `--test-threads=1`. Not introduced
+> by this branch.
 
 Test coverage follows the upstream conventions (descriptive-sentence
 names, doc comments explaining *why*, hand-rolled fakes, `ENV_LOCK` for
