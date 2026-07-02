@@ -19,7 +19,7 @@ an annotation:
 
 | Area | Status |
 |---|---|
-| Build + full test suite on Linux | ✅ 243 tests, clippy clean, rustfmt clean (default features) |
+| Build + full test suite on Linux | ✅ 259 tests, clippy clean, rustfmt clean (default features) |
 | Real machine telemetry (`/proc`, `/sys`, `/etc/os-release`, DMI, NVIDIA GPU count) | ✅ |
 | Managed inference: agent spawns/supervises/restarts `llama-server` per model, GGUF auto-download from HF | ✅ |
 | Unmanaged escape hatch: proxy to any OpenAI-compatible endpoint | ✅ |
@@ -250,8 +250,21 @@ unverified measurement never elevates trust (tested).
 cd provider
 cargo fmt --check          # clean
 cargo clippy --all-features --all-targets   # 0 errors; 2 pre-existing upstream warnings (untouched by this branch)
-cargo test                 # 243 passed, 0 failed
+cargo test                 # 259 passed, 0 failed
 ```
+
+Test coverage follows the upstream conventions (descriptive-sentence
+names, doc comments explaining *why*, hand-rolled fakes, `ENV_LOCK` for
+env-mutating tests, extracted pure helpers). Highlights beyond unit
+parsing: the **managed llama-server lifecycle** is exercised end-to-end
+against a fake `llama-server` (a python3 stand-in honoring the real
+contract — parse `--port`, serve `/v1/models` + `/v1/chat/completions`)
+with a real process boundary: spawn → readiness → idempotent re-start →
+inference → SIGTERM teardown, the OOM-kill/`restart()` respawn contract,
+and startup-failure ring-buffer capture. The OpenAI engine's channel
+routing (reasoning_content field, inline `<think>`, prefill-think models,
+tool_calls/null), body shape (present + omitted-not-null), the tool-call
+canary (positive/negative), and prompt-safe error elision are all pinned.
 
 TPM vectors are regenerable: swtpm via the tss-esapi recipe (start
 `swtpm socket --tpm2 … --daemon`, TCTI `swtpm:host=127.0.0.1,port=2321`);
@@ -275,3 +288,4 @@ Foundation → engine → ops → attestation, in commit order:
 | `9b6a6ae` `7d91419` | kernelLockdown populated + wired as the Linux SIP gate; tpmQuote data path + trustLevel wiring (fail-closed) |
 | `1141b14` `8622b94` | TPM quote verifier + real swtpm and real AMD-fTPM test vectors |
 | `9331d00` | rustfmt sweep |
+| `1a4d5c0` `6deeb0e` `8987bc5` | test hardening: reasoning_content routing fix + full engine channel/body/canary coverage, managed-lifecycle tests against a fake llama-server, lockdown-parse/wire-shape/AK negatives |
