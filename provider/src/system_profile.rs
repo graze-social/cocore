@@ -1,29 +1,16 @@
 //! Real machine telemetry for the `dev.cocore.compute.provider` record.
 //!
-//! Pre-v0.3.1 cmd_serve published hardcoded stubs (`chip = "Apple M-stub"`,
-//! `ramGB = 64`). Matchmakers need real values to route inference work
-//! to capable hardware, so this module collects what we can without
-//! root from a Mac:
+//! Matchmakers route inference work by hardware, so `serve` publishes real
+//! values (chip + RAM are the load-bearing ones). Collection is
+//! platform-specific:
 //!
-//!   * `chip` — from `sysctl machdep.cpu.brand_string`
-//!   * `ramGB` — from `sysctl hw.memsize`
-//!   * `cpuCores` / `pCores` / `eCores` — from `sysctl hw.ncpu` and
-//!     the perf-level splits
-//!   * `gpuCores` — parsed from `system_profiler -json SPDisplaysDataType`
-//!   * `memoryBandwidthGBs` — looked up from a chip-name table
-//!     (Apple doesn't expose this via sysctl)
-//!   * `modelIdentifier` — from `sysctl hw.model`
-//!   * `os` — from `sw_vers -productVersion` (prefixed with `macOS `)
-//!   * `machineLabel` — `COCORE_MACHINE_LABEL` (owner-chosen, set in the
-//!     tray during setup) if present, else `hostname`, with a fallback
+//!   * **macOS / Apple Silicon** — `sysctl`, `system_profiler`, `sw_vers`.
+//!   * **Linux** — `/proc/meminfo`, `/proc/cpuinfo`, `/etc/os-release`,
+//!     `std::thread::available_parallelism`.
 //!
-//! Every individual probe is independently fallible. A failure on any
-//! one returns None for that field rather than failing the whole
-//! collect — partial data is better than no data, and the fields
-//! that matter most for matchmaking (chip + ram) are also the most
-//! reliable to read.
-
-use std::process::Command;
+//! Every individual probe is independently fallible; a failure on any one
+//! leaves that field at its `None` / fallback value rather than failing the
+//! whole collect — partial data beats no data.
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,9 +27,32 @@ pub struct SystemProfile {
     pub os: Option<String>,
 }
 
-/// Probe the host for a `SystemProfile`. Best-effort: any individual
-/// probe failure leaves that field at its `None` / fallback value.
+/// Owner-chosen display name (`COCORE_MACHINE_LABEL`, set during setup) wins
+/// over the system hostname, so a provider isn't forced to expose their
+/// `.local` host name. Falls back to the hostname, then a generic label.
+fn machine_label(fallback: &str) -> String {
+    std::env::var("COCORE_MACHINE_LABEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(hostname)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn hostname() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// ─────────────────────────── macOS ───────────────────────────
+
+#[cfg(target_os = "macos")]
 pub fn collect() -> SystemProfile {
+    use std::process::Command;
+
     let chip = sysctl("machdep.cpu.brand_string").unwrap_or_else(|| "unknown".to_string());
     let ram_gb = sysctl("hw.memsize")
         .and_then(|s| s.parse::<u64>().ok())
@@ -55,18 +65,9 @@ pub fn collect() -> SystemProfile {
     let memory_bandwidth_gbs = bandwidth_for_chip(&chip);
     let model_identifier = sysctl("hw.model");
     let os = sw_vers_product_version().map(|v| format!("macOS {v}"));
-    // Owner-chosen display name (set in the tray during setup) wins over the
-    // system hostname, so a provider isn't forced to expose their `.local`
-    // host name. Falls back to the hostname, then a generic label.
-    let machine_label = std::env::var("COCORE_MACHINE_LABEL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(hostname)
-        .unwrap_or_else(|| "macOS host".to_string());
 
     SystemProfile {
-        machine_label,
+        machine_label: machine_label("macOS host"),
         chip,
         ram_gb,
         cpu_cores,
@@ -79,8 +80,13 @@ pub fn collect() -> SystemProfile {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn sysctl(key: &str) -> Option<String> {
-    let out = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
+    let out = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg(key)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -92,15 +98,14 @@ fn sysctl(key: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn sysctl_u32(key: &str) -> Option<u32> {
     sysctl(key).and_then(|s| s.parse::<u32>().ok())
 }
 
+#[cfg(target_os = "macos")]
 fn parse_gpu_cores() -> Option<u32> {
-    // `system_profiler -json SPDisplaysDataType` returns an array of
-    // GPU entries. Apple Silicon integrated GPUs carry an
-    // `sppci_cores` field; we take the first one we find.
-    let out = Command::new("system_profiler")
+    let out = std::process::Command::new("system_profiler")
         .arg("-json")
         .arg("SPDisplaysDataType")
         .output()
@@ -120,19 +125,12 @@ fn parse_gpu_cores() -> Option<u32> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn sw_vers_product_version() -> Option<String> {
-    let out = Command::new("sw_vers")
+    let out = std::process::Command::new("sw_vers")
         .arg("-productVersion")
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn hostname() -> Option<String> {
-    let out = Command::new("hostname").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -143,6 +141,7 @@ fn hostname() -> Option<String> {
 /// publishes these specs but doesn't expose them via sysctl.
 /// Conservative values from public spec sheets — order matters
 /// (Pro/Max/Ultra checked before bare M\d).
+#[cfg(target_os = "macos")]
 fn bandwidth_for_chip(chip: &str) -> Option<u32> {
     let lower = chip.to_lowercase();
     // M4 family
@@ -197,14 +196,126 @@ fn bandwidth_for_chip(chip: &str) -> Option<u32> {
     None
 }
 
+// ─────────────────────────── Linux ───────────────────────────
+
+#[cfg(target_os = "linux")]
+pub fn collect() -> SystemProfile {
+    let chip = linux::cpu_model().unwrap_or_else(|| "unknown".to_string());
+    let ram_gb = linux::total_ram_gb();
+    let cpu_cores = std::thread::available_parallelism()
+        .ok()
+        .map(|n| n.get() as u32);
+    let gpu_cores = linux::nvidia_gpu_count();
+    let model_identifier = linux::product_name();
+    let os = linux::os_pretty_name().map(|v| format!("Linux {v}"));
+
+    SystemProfile {
+        machine_label: machine_label("Linux host"),
+        chip,
+        ram_gb,
+        cpu_cores,
+        p_cores: None,
+        e_cores: None,
+        gpu_cores,
+        memory_bandwidth_gbs: None,
+        model_identifier,
+        os,
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::fs;
+
+    /// First `model name` line from `/proc/cpuinfo`.
+    pub fn cpu_model() -> Option<String> {
+        let info = fs::read_to_string("/proc/cpuinfo").ok()?;
+        for line in info.lines() {
+            if let Some(rest) = line.strip_prefix("model name") {
+                let val = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// `MemTotal` from `/proc/meminfo`, rounded to whole GB.
+    pub fn total_ram_gb() -> u32 {
+        let Ok(info) = fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        for line in info.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb_str: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return (kb / (1024 * 1024)) as u32;
+                }
+            }
+        }
+        0
+    }
+
+    /// Count of NVIDIA GPUs visible via `/proc/driver/nvidia/gpus/`.
+    /// Returns `None` when the nvidia driver isn't loaded (the directory
+    /// won't exist), not `Some(0)`, matching the macOS semantics of
+    /// "couldn't read the data."
+    pub fn nvidia_gpu_count() -> Option<u32> {
+        let entries = fs::read_dir("/proc/driver/nvidia/gpus/").ok()?;
+        let count = entries.filter(|e| e.is_ok()).count();
+        if count > 0 {
+            Some(count as u32)
+        } else {
+            None
+        }
+    }
+
+    /// `PRETTY_NAME` from `/etc/os-release`.
+    pub fn os_pretty_name() -> Option<String> {
+        let content = fs::read_to_string("/etc/os-release").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                return Some(rest.trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    /// DMI product name (e.g. `"PowerEdge R750"`, `"ThinkPad T14s"`).
+    pub fn product_name() -> Option<String> {
+        fs::read_to_string("/sys/class/dmi/id/product_name")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+// ───────────────────── fallback (other OSes) ─────────────────
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn collect() -> SystemProfile {
+    SystemProfile {
+        machine_label: machine_label("unknown host"),
+        chip: "unknown".to_string(),
+        ram_gb: 0,
+        cpu_cores: None,
+        p_cores: None,
+        e_cores: None,
+        gpu_cores: None,
+        memory_bandwidth_gbs: None,
+        model_identifier: None,
+        os: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bandwidth_table_picks_specific_before_base() {
-        // Pro/Max/Ultra need to be checked before bare M\d to avoid
-        // misclassifying e.g. "Apple M3 Pro" as "M3 base".
         assert_eq!(bandwidth_for_chip("Apple M3 Max"), Some(400));
         assert_eq!(bandwidth_for_chip("Apple M3 Pro"), Some(150));
         assert_eq!(bandwidth_for_chip("Apple M3"), Some(100));
@@ -215,6 +326,7 @@ mod tests {
         assert_eq!(bandwidth_for_chip("Apple M2 Ultra"), Some(800));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn bandwidth_returns_none_for_unknown_chip() {
         assert_eq!(bandwidth_for_chip("Intel Core i9"), None);
@@ -223,18 +335,36 @@ mod tests {
     }
 
     #[test]
-    fn collect_returns_plausible_data_on_macos() {
-        // This test runs against the actual host — we don't assert
-        // specific values, only that the probe doesn't panic and the
-        // most-critical fields (chip + ram) are populated when
-        // running on a real Mac. CI runs on Linux where most of
-        // these probes return None / fallback strings, so we only
-        // assert the struct shape there.
+    fn collect_returns_plausible_data() {
         let p = collect();
-        // chip is always at least "unknown" on non-mac CI runners
         assert!(!p.chip.is_empty());
-        // ram_gb is 0 on Linux runners (no `hw.memsize` sysctl key);
-        // bound the assertion accordingly.
-        assert!(p.ram_gb < 4096); // sanity: nobody has >4 TB
+        assert!(p.ram_gb < 4096);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ram_is_nonzero() {
+        assert!(
+            linux::total_ram_gb() > 0,
+            "/proc/meminfo should be readable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cpu_model_is_populated() {
+        assert!(
+            linux::cpu_model().is_some(),
+            "/proc/cpuinfo should have a model name"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_os_pretty_name_is_populated() {
+        assert!(
+            linux::os_pretty_name().is_some(),
+            "/etc/os-release should have PRETTY_NAME"
+        );
     }
 }

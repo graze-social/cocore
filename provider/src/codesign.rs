@@ -157,7 +157,62 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux binary self-measurement: SHA-256 of `/proc/self/exe` as the cd_hash
+/// analogue. This is weaker than macOS csops(2) — the kernel doesn't enforce
+/// signature policy, and an attacker with root can replace the binary — but it
+/// gives the attestation path a content-addressed measurement of what's running.
+///
+/// Posture flags remain conservative:
+/// - `hardened_runtime` and `library_validation` stay false (no kernel enforcement).
+/// - `get_task_allow` reflects kernel lockdown mode: `false` only when lockdown
+///   is `confidentiality` (ptrace, kprobes, /dev/mem all denied).
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::CodeSignInfo;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::io::Read;
+
+    pub fn read_self() -> CodeSignInfo {
+        let mut info = CodeSignInfo::default();
+
+        if let Some(hash) = sha256_proc_self_exe() {
+            info.cd_hash = Some(hash);
+        }
+
+        info.get_task_allow = !kernel_lockdown_confidentiality();
+
+        info
+    }
+
+    fn sha256_proc_self_exe() -> Option<String> {
+        let mut f = fs::File::open("/proc/self/exe").ok()?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = f.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Some(hex::encode(hasher.finalize()))
+    }
+
+    /// Kernel lockdown `confidentiality` mode denies ptrace attach, kprobes,
+    /// /dev/mem, and module loading — the closest Linux analogue to macOS
+    /// hardened runtime + library validation. We only report `true` at the
+    /// strictest level; `integrity` (which still allows ptrace) is not enough.
+    fn kernel_lockdown_confidentiality() -> bool {
+        let Ok(content) = fs::read_to_string("/sys/kernel/security/lockdown") else {
+            return false;
+        };
+        // Format: "none [integrity] confidentiality" — the active mode is in brackets.
+        content.contains("[confidentiality]")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::CodeSignInfo;
     pub fn read_self() -> CodeSignInfo {
@@ -185,9 +240,15 @@ mod tests {
             assert!(!info.hardened_runtime);
             assert!(!info.library_validation);
         }
-        // cd_hash, when present, is 40 lowercase hex chars (20 bytes).
+        // cd_hash, when present, is lowercase hex:
+        //   macOS: 40 chars (20-byte cdhash from csops)
+        //   Linux: 64 chars (32-byte SHA-256 of /proc/self/exe)
         if let Some(h) = &info.cd_hash {
-            assert_eq!(h.len(), 40);
+            assert!(
+                h.len() == 40 || h.len() == 64,
+                "unexpected hash length {}",
+                h.len()
+            );
             assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
         }
     }

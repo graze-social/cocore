@@ -45,3 +45,6 @@ pub mod schedule;
 pub mod secure_enclave;
 pub mod security;
 pub mod system_profile;
+/// TPM 2.0 quote verification — the Linux `hardware-attested` path. Pure-Rust
+/// verifier (the `tss-esapi` acquisition is behind the `tpm` feature).
+pub mod tpm;

@@ -448,12 +448,36 @@ fn launchagent_status() -> Check {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn launchagent_status() -> Check {
+    // Linux parity for the macOS LaunchAgent check: inspect the systemd user
+    // unit. `ok` only when it's active; when it isn't installed we report a
+    // non-fatal note (the operator may run the agent another way) rather than
+    // a free green tick.
+    match crate::service::active_state() {
+        Some((active, state)) => Check {
+            name: "serve service",
+            ok: active,
+            note: format!("{}: {state}", crate::service::UNIT),
+        },
+        None => Check {
+            name: "serve service",
+            ok: true,
+            note: format!(
+                "{} not installed (running the agent another way is fine; \
+                 re-run the installer to manage it via systemd)",
+                crate::service::UNIT
+            ),
+        },
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn launchagent_status() -> Check {
     Check {
-        name: "LaunchAgent",
+        name: "serve service",
         ok: true,
-        note: "not applicable on this OS (the LaunchAgent is macOS-only; manage your serve daemon with systemd / nssm / etc.)".to_string(),
+        note: "not applicable on this OS (manage your serve daemon with your platform's service manager)".to_string(),
     }
 }
 
@@ -485,7 +509,20 @@ fn apply_fixes() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn apply_fixes() {
+    // Linux parity for the macOS kickstart fix: restart the systemd user unit.
+    if crate::service::restart_if_installed() {
+        println!("  - Restarted {}. It will re-read session.json and republish its provider record on next serve init.", crate::service::UNIT);
+    } else {
+        println!(
+            "  - {} not installed; nothing to restart. Re-run the installer if you want it managed via systemd.",
+            crate::service::UNIT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn apply_fixes() {
     println!("  - no fixes to apply on this OS.");
 }

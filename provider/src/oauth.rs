@@ -140,8 +140,9 @@ pub async fn poll_pair(console_url: &str, device_id: &str) -> Result<Session, Oa
     }
 }
 
-/// Persist a session to the macOS keychain. On non-macOS, falls back to
-/// `~/.cocore/session.json` with mode 0600.
+/// Persist a session to `~/.cocore/session.json` with mode 0600 (owner-only),
+/// on every platform. (The 0600 hardening is applied under `#[cfg(unix)]`,
+/// which covers both macOS and Linux.)
 pub fn store_session(session: &Session) -> anyhow::Result<()> {
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("no home directory"))?

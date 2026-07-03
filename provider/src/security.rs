@@ -33,14 +33,44 @@ pub struct HardeningPosture {
 
 /// Snapshot the hardening posture for attestation. Honest: every flag is
 /// `false` until `apply_all` has run to completion, and `anti_debug` is only
-/// claimed on macOS where PT_DENY_ATTACH actually denies `task_for_pid`.
+/// claimed when the OS actually denies attach:
+///
+/// - **macOS**: `PT_DENY_ATTACH` denies `task_for_pid` — always claimed.
+/// - **Linux**: only when Yama LSM `ptrace_scope >= 2` (no attach except
+///   for root with `CAP_SYS_PTRACE`). `PR_SET_DUMPABLE(0)` alone is not
+///   enough — it only blocks non-ancestor tracers and is easily re-enabled.
 pub fn posture() -> HardeningPosture {
     let on = HARDENED.load(Ordering::SeqCst);
     HardeningPosture {
-        anti_debug: on && cfg!(target_os = "macos"),
+        anti_debug: on && anti_debug_effective(),
         core_dumps_disabled: on,
         env_scrubbed: on,
     }
+}
+
+fn anti_debug_effective() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return yama_ptrace_scope_ge2();
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Yama LSM ptrace_scope >=2 means only processes with CAP_SYS_PTRACE can
+/// attach — PR_SET_DUMPABLE(0) on top of that gives us a genuinely defended
+/// process. We do not claim anti_debug at scope 0/1 because an unprivileged
+/// user could still attach there.
+#[cfg(target_os = "linux")]
+fn yama_ptrace_scope_ge2() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|v| v >= 2)
 }
 
 /// Apply every available hardening control. Returns the first error

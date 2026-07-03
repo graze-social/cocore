@@ -17,6 +17,10 @@ use tokio::sync::RwLock;
 
 mod doctor;
 mod models_cli;
+/// Linux systemd user-service control (parity with the macOS launchctl/plist
+/// surface). Linux-only; the macOS arms use launchctl directly.
+#[cfg(target_os = "linux")]
+mod service;
 mod update;
 
 #[derive(Parser)]
@@ -207,6 +211,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     init_tracing(&cli.log);
+
+    // Install a process-default rustls CryptoProvider before any TLS
+    // handshake (the advisor WebSocket, the OpenAI engine, PDS/console
+    // HTTPS). With both aws-lc-rs and ring compiled in (from
+    // tokio-tungstenite and reqwest), rustls 0.23 can't auto-select and
+    // panics. We pick aws-lc-rs (the rustls default). Idempotent: a
+    // second call returns Err which we ignore.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     match cli.cmd {
         Cmd::Agent(AgentCmd::Pair { console }) => cmd_pair(&console).await,
@@ -718,13 +730,27 @@ fn kickstart_launchagent_if_installed() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn kickstart_launchagent_if_installed() {
-    // No LaunchAgent on Linux / Windows; the agent is run as a
-    // foreground process or via systemd / nssm and the operator is
-    // expected to manage that lifecycle themselves. Pairing under
-    // those setups still writes session.json correctly; the daemon
-    // either picks it up at next start or needs a manual restart.
+    // Linux parity for the macOS kickstart: restart the systemd user unit so
+    // the freshly paired session.json is picked up immediately, instead of
+    // waiting for a manual restart. No-op hint when the unit isn't installed
+    // (the operator runs the agent some other way).
+    if service::restart_if_installed() {
+        println!("Restarted cocore-provider.service — your machine should appear on /machines within ~10s.");
+    } else {
+        println!(
+            "Note: no {} found. If the daemon is running another way, restart it to pick up the pairing.",
+            service::UNIT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kickstart_launchagent_if_installed() {
+    // No managed service integration on other platforms; the operator runs
+    // the agent themselves. Pairing still writes session.json correctly; the
+    // daemon picks it up at next start or needs a manual restart.
 }
 
 // Owner-intent field preservation is no longer a hand-rolled allowlist
@@ -2133,7 +2159,7 @@ async fn build_and_publish_attestation(
     // verify Apple-rooted AND bind to our signing key.
     let (trust_level, tier) = match &built {
         Ok(rec) => (
-            if !rec.mdaCertChain.is_empty() || rec.appAttest.is_some() {
+            if !rec.mdaCertChain.is_empty() || rec.appAttest.is_some() || rec.tpmQuote.is_some() {
                 TrustLevel::HardwareAttested
             } else {
                 TrustLevel::SelfAttested
@@ -2610,6 +2636,156 @@ fn build_engines(
         // (inference runs in-process), so a native failure is the fault to
         // surface here. On best-effort machines `native_fault` is `None`.
         return (registry, native_fault, vec![]);
+    }
+
+    // Managed llama-server engine path (PRIMARY Linux inference). When
+    // COCORE_LLAMA_SERVER_BIN is set, the agent spawns and supervises one
+    // llama-server child per configured model — downloads the GGUF from
+    // HuggingFace, health-checks, restarts on death, reaps on exit — exactly
+    // as the macOS path manages vllm-mlx. The operator just names models.
+    if let Some(llama_config) =
+        cocore_provider::engines::llama_server::LlamaServerConfig::from_env()
+    {
+        let configured: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Same per-model scheduling guard as the subprocess path: load only
+        // the models whose time window is open now. (The RAM-floor / budget
+        // guards below are keyed on the macOS MLX catalog `pricing::RATES`, so
+        // they're inert for GGUF ids — off-catalog ids have no known floor —
+        // and are intentionally skipped here rather than applied as no-ops.)
+        let schedules = cocore_provider::schedule::ModelSchedules::from_env();
+        let configured: Vec<String> = if schedules.is_empty() {
+            configured
+        } else {
+            let active = schedules.active_now(&configured);
+            tracing::info!(active = ?active, "per-model schedule: loading the models whose window is open now");
+            active
+        };
+
+        let mut failed: Vec<String> = vec![];
+        let mut bin_missing = false;
+        let mut last_err: Option<String> = None;
+        let mut tool_call_models: Vec<String> = vec![];
+
+        for model in &configured {
+            match start_llama_engine_with_recovery(model, &llama_config) {
+                Ok(engine) => {
+                    tracing::info!(model = %model, "inference subprocess engine ready");
+                    if engine.verified_tool_calls() {
+                        tool_call_models.push(model.clone());
+                    }
+                    registry.register(model.clone(), std::sync::Arc::new(engine));
+                }
+                Err(LlamaStartFailure::BinMissing) => {
+                    bin_missing = true;
+                    tracing::warn!(model = %model, reason = "llama-server-missing", "inference engine load failed");
+                    failed.push(model.clone());
+                }
+                Err(LlamaStartFailure::Failed(err)) => {
+                    last_err = Some(err);
+                    tracing::warn!(model = %model, "inference engine load failed");
+                    failed.push(model.clone());
+                }
+            }
+        }
+
+        if failed.is_empty() {
+            return (registry, None, tool_call_models);
+        }
+
+        let fault = if bin_missing {
+            EngineFault {
+                code: "llama-server-missing".to_string(),
+                message: format!(
+                    "The llama-server binary at {} was not found, so the configured \
+                     model(s) [{}] could not load. The machine is online but only serving \
+                     the no-op `stub` engine, so it won't be matched to real inference jobs. \
+                     Fix: install llama.cpp (build `llama-server` with your GPU backend — \
+                     CUDA, ROCm, or Vulkan) and set COCORE_LLAMA_SERVER_BIN to its path, \
+                     then start serving again.",
+                    llama_config.server_bin.display(),
+                    failed.join(", "),
+                ),
+                models: failed,
+                at: chrono::Utc::now(),
+            }
+        } else {
+            EngineFault {
+                code: "model-load-failed".to_string(),
+                message: format!(
+                    "The llama-server engine for [{}] did not come online after {} attempts. \
+                     The machine is online but only serving the no-op `stub` engine, so it \
+                     won't be matched to real inference jobs. Most common causes: the model \
+                     id isn't a valid GGUF HuggingFace repo (llama.cpp loads GGUF — e.g. \
+                     `bartowski/Qwen2.5-7B-Instruct-GGUF` — not MLX or stock safetensors), \
+                     the GGUF download failed, or the machine ran out of GPU/host memory \
+                     loading it. Fix: use a GGUF model id, ensure the machine can reach \
+                     Hugging Face, then start serving again. Last error: {}",
+                    failed.join(", "),
+                    LLAMA_START_MAX_ATTEMPTS,
+                    last_err.as_deref().unwrap_or("(none captured)"),
+                ),
+                models: failed,
+                at: chrono::Utc::now(),
+            }
+        };
+        return (registry, Some(fault), tool_call_models);
+    }
+
+    // OpenAI-compatible HTTP engine path (escape hatch for remote / externally
+    // managed endpoints — vLLM clusters, a llama-server you run yourself, a
+    // hosted API). Unlike the managed path above, cocore does NOT spawn or
+    // supervise the endpoint; it's a pure client. When COCORE_OPENAI_BASE_URL
+    // is set, all models in COCORE_INFERENCE_MODELS are proxied to it.
+    if let Ok(base_url) = std::env::var("COCORE_OPENAI_BASE_URL") {
+        let api_key = std::env::var("COCORE_OPENAI_API_KEY").ok();
+        let configured: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut failed: Vec<String> = vec![];
+        for model in &configured {
+            match cocore_provider::engines::openai::OpenAiEngine::new(
+                model.clone(),
+                &base_url,
+                api_key.clone(),
+            ) {
+                Ok(engine) => {
+                    tracing::info!(model = %model, base_url = %base_url, "registered OpenAI-compatible HTTP engine");
+                    registry.register(model.clone(), std::sync::Arc::new(engine));
+                }
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "failed to create OpenAI HTTP engine");
+                    failed.push(model.clone());
+                }
+            }
+        }
+        let fault = if failed.is_empty() {
+            None
+        } else {
+            Some(EngineFault {
+                code: "openai-engine-failed".to_string(),
+                message: format!(
+                    "The OpenAI-compatible HTTP engine for [{}] against {} could not be \
+                     created. The machine is online but only serving the no-op `stub` \
+                     engine for those models.",
+                    failed.join(", "),
+                    base_url,
+                ),
+                models: failed,
+                at: chrono::Utc::now(),
+            })
+        };
+        // Tool calling: we can't probe the OpenAI endpoint's tool-call
+        // capability at build time without a model load, so we report
+        // all configured models as tool-capable and let runtime errors
+        // surface if the endpoint doesn't support them.
+        return (registry, fault, configured);
     }
 
     // Resolve the venv interpreter once. The install script writes it
@@ -3113,6 +3289,79 @@ fn start_engine_with_recovery(
     }
 }
 
+/// How a single model's llama-server load ultimately failed, after recovery.
+/// Parallel to [`EngineStartFailure`] but for the managed llama.cpp path.
+enum LlamaStartFailure {
+    /// The `llama-server` binary never appeared across all attempts (the
+    /// analogue of [`EngineStartFailure::VenvMissing`] — actionable: install
+    /// llama.cpp / fix `COCORE_LLAMA_SERVER_BIN`).
+    BinMissing,
+    /// The server was spawned but never became ready. Carries the last
+    /// attempt's content-safe error string for local logging.
+    Failed(String),
+}
+
+/// Max attempts to bring one model's llama-server online before giving up.
+/// Mirrors [`ENGINE_START_MAX_ATTEMPTS`]: each attempt's `start()` allows a
+/// full cold GGUF download (its own multi-minute readiness ceiling), so 3
+/// attempts covers an installer still placing the binary and a first cold
+/// download hiccup.
+const LLAMA_START_MAX_ATTEMPTS: u32 = 3;
+
+/// Bring one model's llama-server online with bounded recovery, mirroring
+/// [`start_engine_with_recovery`]. Re-checks the binary each attempt (an
+/// installer may still be placing it) and retries `start()` with the same
+/// scaled backoff.
+fn start_llama_engine_with_recovery(
+    model: &str,
+    config: &cocore_provider::engines::llama_server::LlamaServerConfig,
+) -> std::result::Result<cocore_provider::engines::llama_server::LlamaCppEngine, LlamaStartFailure>
+{
+    use cocore_provider::engines::llama_server::LlamaCppEngine;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=LLAMA_START_MAX_ATTEMPTS {
+        if !config.server_bin.exists() {
+            last_err = Some(format!(
+                "llama-server binary missing at {}",
+                config.server_bin.display()
+            ));
+            tracing::warn!(
+                model = %model,
+                attempt,
+                server_bin = %config.server_bin.display(),
+                "llama-server binary missing; the installer may still be placing it — will retry after backoff"
+            );
+        } else {
+            let engine = LlamaCppEngine::new(model, config.clone());
+            match engine.start() {
+                Ok(()) => return Ok(engine),
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    tracing::warn!(model = %model, attempt, error = %err, "llama-server failed to start; will retry");
+                    last_err = Some(err);
+                }
+            }
+        }
+        if attempt < LLAMA_START_MAX_ATTEMPTS {
+            let backoff = ENGINE_START_BACKOFF * attempt;
+            tracing::info!(
+                model = %model,
+                attempt,
+                backoff_s = backoff.as_secs(),
+                "retrying llama-server engine load after backoff"
+            );
+            std::thread::sleep(backoff);
+        }
+    }
+    if !config.server_bin.exists() {
+        Err(LlamaStartFailure::BinMissing)
+    } else {
+        Err(LlamaStartFailure::Failed(
+            last_err.unwrap_or_else(|| "unknown error".to_string()),
+        ))
+    }
+}
+
 fn cmd_whoami() -> Result<()> {
     match oauth::load_session()? {
         Some(s) => {
@@ -3417,7 +3666,6 @@ mod active_gate_tests {
 
 #[cfg(test)]
 mod offline_marker_tests {
-    use super::*;
     use cocore_provider::pds::{ProviderRecord, TrustLevel};
 
     /// A provider record as the AGENT builds it in-memory: the

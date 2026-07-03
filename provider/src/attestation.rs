@@ -26,6 +26,20 @@ pub struct AppAttestEvidence {
     pub keyId: String,
 }
 
+/// TPM 2.0 quote evidence as it rides in the record — the Linux path to
+/// `hardware-attested`, mirroring [`AppAttestEvidence`]/`mdaCertChain` on
+/// macOS. Field names match the lexicon's `tpmQuote` object; `quoted` and
+/// `signature` are base64, `akCertChain` is base64 DER leaf-first. Acquired
+/// from the TPM (see the future `tpm_loader`); embedded by [`build`] ONLY if
+/// it verifies vendor-rooted AND binds to the signing key.
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Serialize)]
+pub struct TpmQuoteEvidence {
+    pub quoted: String,
+    pub signature: String,
+    pub akCertChain: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttestationInputs {
     pub provider_did: String,
@@ -66,6 +80,16 @@ pub struct AttestationInputs {
     pub anti_debug: bool,
     pub core_dumps_disabled: bool,
     pub env_scrubbed: bool,
+    /// Linux kernel lockdown LSM mode (`"none"`/`"integrity"`/`"confidentiality"`)
+    /// — the Linux analogue of `sip_enabled` for the confidential OS-integrity
+    /// gate. `None` on macOS (where `sip_enabled` governs) and on kernels
+    /// without the lockdown LSM.
+    pub kernel_lockdown: Option<String>,
+    /// Optional TPM 2.0 quote evidence (Linux path to hardware-attested),
+    /// acquired from the TPM. Embedded only if it verifies vendor-rooted AND
+    /// binds to this signer — mirroring the MDA-chain / App-Attest discipline.
+    /// `None` until the TPM acquisition path (tss-esapi) lands.
+    pub tpm_quote: Option<TpmQuoteEvidence>,
 }
 
 // Field names match the lexicon's camelCase wire shape so serde produces
@@ -89,6 +113,10 @@ pub struct AttestationRecord {
     pub mdaCertChain: Vec<String>, // base64
     #[serde(skip_serializing_if = "Option::is_none")]
     pub appAttest: Option<AppAttestEvidence>,
+    /// TPM 2.0 quote evidence (Linux hardware-attested path). Embedded only
+    /// when verified + bound; absent (skipped) otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpmQuote: Option<TpmQuoteEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cdHash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +132,10 @@ pub struct AttestationRecord {
     pub antiDebug: bool,
     pub coreDumpsDisabled: bool,
     pub envScrubbed: bool,
+    /// Linux kernel lockdown mode; the Linux analogue of `sipEnabled`. Absent
+    /// (skipped) on macOS and on kernels without the lockdown LSM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernelLockdown: Option<String>,
     /// Provider's self-asserted confidentiality tier. ADVISORY — verifiers
     /// recompute from evidence; never trusted.
     pub tier: String,
@@ -155,9 +187,61 @@ fn detect_secure_boot() -> bool {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux Secure Boot detection via EFI runtime variables. The kernel exposes
+/// the `SecureBoot-*` variable at this path when booted in UEFI mode and
+/// Secure Boot is active. The last byte of the 5-byte value (4-byte attribute
+/// header + 1-byte data) is 0x01 when enabled. Returns false if the file
+/// doesn't exist (legacy BIOS boot, no efivarfs) — honest floor.
+#[cfg(target_os = "linux")]
+fn detect_secure_boot() -> bool {
+    use std::io::Read;
+    let path = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 5];
+    if f.read_exact(&mut buf).is_ok() {
+        buf[4] == 1
+    } else {
+        false
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn detect_secure_boot() -> bool {
     false
+}
+
+/// Linux kernel lockdown LSM mode from `/sys/kernel/security/lockdown`.
+/// Returns the active mode lowercased, or `None` when the file is absent
+/// (kernel built without the lockdown LSM) or unreadable. This is the Linux
+/// analogue of macOS SIP for the confidential OS-integrity gate.
+#[cfg(target_os = "linux")]
+fn detect_kernel_lockdown() -> Option<String> {
+    parse_lockdown_mode(&std::fs::read_to_string("/sys/kernel/security/lockdown").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_kernel_lockdown() -> Option<String> {
+    None
+}
+
+/// Parse the ACTIVE mode out of a lockdown-file body: the file reads e.g.
+/// `none [integrity] confidentiality` and the active mode is the bracketed
+/// one. `None` for malformed/empty content — treated as "no lockdown" (the
+/// honest floor). Only read on Linux, but kept un-gated so its unit tests
+/// build (and run) on every platform — like `pick_confidential_native_model`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_lockdown_mode(content: &str) -> Option<String> {
+    let start = content.find('[')?;
+    let rest = &content[start + 1..];
+    let end = rest.find(']')?;
+    let mode = rest[..end].trim().to_ascii_lowercase();
+    if mode.is_empty() {
+        None
+    } else {
+        Some(mode)
+    }
 }
 
 pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> AttestationInputs {
@@ -179,9 +263,11 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
         serial_number: "stub-serial".into(),
         os_version,
         binary_path,
-        // SIP is verified ON before we ever get here: `security::apply_all`
-        // runs `csrutil status` at startup and refuses to serve if it's off.
-        sip_enabled: true,
+        // macOS: SIP is verified ON before we get here (security::apply_all
+        // runs csrutil status and refuses to serve if off).
+        // Linux: no SIP — report false; the OS-integrity gate is carried by
+        // `kernel_lockdown` below instead (the Linux analogue).
+        sip_enabled: cfg!(target_os = "macos"),
         // Apple Silicon Secure Boot policy, measured live (Full Security only).
         // Reduced/Permissive and any read failure report false (the honest
         // floor) so we never over-claim the confidential posture.
@@ -204,6 +290,12 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
         anti_debug: hp.anti_debug,
         core_dumps_disabled: hp.core_dumps_disabled,
         env_scrubbed: hp.env_scrubbed,
+        // Linux kernel lockdown mode (the SIP analogue); `None` on macOS and on
+        // kernels without the lockdown LSM.
+        kernel_lockdown: detect_kernel_lockdown(),
+        // No TPM acquisition path yet (tss-esapi, needs hardware); the data
+        // path + fail-closed embed discipline are in place for when it lands.
+        tpm_quote: None,
     }
 }
 
@@ -222,7 +314,42 @@ fn sysctl_string(name: &str) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux equivalents for the sysctl keys used by `build_stub_inputs`.
+/// Reads from /proc and /sys instead. Unrecognized keys return None.
+#[cfg(target_os = "linux")]
+fn sysctl_string(name: &str) -> Option<String> {
+    use std::fs;
+    match name {
+        "machdep.cpu.brand_string" => {
+            let info = fs::read_to_string("/proc/cpuinfo").ok()?;
+            for line in info.lines() {
+                if let Some(rest) = line.strip_prefix("model name") {
+                    let val = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+            None
+        }
+        "hw.model" => fs::read_to_string("/sys/class/dmi/id/product_name")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        "kern.osproductversion" => {
+            let content = fs::read_to_string("/etc/os-release").ok()?;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                    return Some(rest.trim_matches('"').to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sysctl_string(_name: &str) -> Option<String> {
     None
 }
@@ -305,6 +432,36 @@ pub fn build(
         }
     };
 
+    // TPM 2.0 quote — the Linux path to hardware-attested. Same discipline as
+    // the MDA chain / App Attest: embed it ONLY if it verifies (AK cert chain
+    // to a TPM-manufacturer root, quote signature valid) AND binds to this
+    // signing key (quote qualifyingData == sha256(publicKey)).
+    //
+    // FAIL-CLOSED: the vendor-root quote verifier (mirroring `mda::verify_chain`)
+    // and the TPM acquisition (tss-esapi) are a feature-gated increment that
+    // needs a real TPM to validate against. Until it lands, any quote present is
+    // DROPPED — so a TPM quote can never yet earn `hardware-attested`. This is
+    // the codebase's unsafe-by-default rule: an unverified measurement must
+    // never silently elevate trust.
+    let tpm_quote: Option<TpmQuoteEvidence> = match &inputs.tpm_quote {
+        None => None,
+        Some(_ev) => {
+            // The quote-signature + key-binding core is implemented and tested
+            // against real TPM output (`crate::tpm::verify_quote`). Embedding
+            // still needs the AK-cert→vendor-root chain walk to source a TRUSTED
+            // AK pubkey — `crate::tpm::verify_ak_chain` over `tpm::vendor_roots()`,
+            // which is empty until the maintainers curate the TPM-manufacturer
+            // root set. With no trusted roots the chain can't anchor, so we drop
+            // (fail-closed) and stay self-attested — an unverified measurement
+            // must never elevate trust.
+            tracing::warn!(
+                "TPM quote present but no trusted TPM-vendor roots are configured; \
+                 dropping it (fail-closed) and staying self-attested"
+            );
+            None
+        }
+    };
+
     // Producer's HONEST self-asserted tier. `attested-confidential` is the
     // CONFIDENTIALITY axis — "the prompt is handled only inside this measured,
     // signed binary, and the operator can't read it." It is ORTHOGONAL to
@@ -319,6 +476,12 @@ pub fn build(
     // best-effort. Verifiers recompute this from evidence (known-good set +
     // session key + code-attestation) and never trust the field — but the
     // producer must not over-claim.
+    // OS-integrity gate: macOS SIP, or — on Linux, which has no SIP — kernel
+    // lockdown in "confidentiality" mode (its analogue: denies ptrace of other
+    // tasks, kprobes, /dev/mem, BPF kernel reads, unsigned modules). See the
+    // `kernelLockdown` lexicon field. A verifier applies the same substitution.
+    let os_integrity_locked =
+        inputs.sip_enabled || inputs.kernel_lockdown.as_deref() == Some("confidentiality");
     let confidential_capable = inputs.in_process_backend
         && !inputs.get_task_allow
         && inputs.hardened_runtime
@@ -326,7 +489,7 @@ pub fn build(
         && inputs.anti_debug
         && inputs.core_dumps_disabled
         && inputs.env_scrubbed
-        && inputs.sip_enabled
+        && os_integrity_locked
         && inputs.secure_boot_enabled
         && inputs.cd_hash.is_some();
     let tier = if confidential_capable {
@@ -392,6 +555,19 @@ pub fn build(
                 json!({ "object": ev.object, "keyId": ev.keyId }),
             );
         }
+        if let Some(kl) = &inputs.kernel_lockdown {
+            map.insert("kernelLockdown".into(), Value::String(kl.clone()));
+        }
+        if let Some(q) = &tpm_quote {
+            map.insert(
+                "tpmQuote".into(),
+                json!({
+                    "quoted": q.quoted,
+                    "signature": q.signature,
+                    "akCertChain": q.akCertChain,
+                }),
+            );
+        }
     }
     let canonical = to_canonical_bytes(&unsigned)?;
     let sig = signer
@@ -413,6 +589,7 @@ pub fn build(
         rdmaDisabled: inputs.rdma_disabled,
         mdaCertChain: mda_chain_b64,
         appAttest: app_attest,
+        tpmQuote: tpm_quote,
         cdHash: inputs.cd_hash,
         teamId: inputs.team_id,
         hardenedRuntime: inputs.hardened_runtime,
@@ -424,6 +601,7 @@ pub fn build(
         antiDebug: inputs.anti_debug,
         coreDumpsDisabled: inputs.core_dumps_disabled,
         envScrubbed: inputs.env_scrubbed,
+        kernelLockdown: inputs.kernel_lockdown,
         tier,
         selfSignature: B64.encode(&sig),
         // Store the exact seconds-precision strings that were signed (NOT the
@@ -494,6 +672,8 @@ mod tests {
             anti_debug: true,
             core_dumps_disabled: true,
             env_scrubbed: true,
+            kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
         assert!(!rec.selfSignature.is_empty());
@@ -554,6 +734,8 @@ mod tests {
             anti_debug: true,
             core_dumps_disabled: true,
             env_scrubbed: true,
+            kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
 
@@ -618,6 +800,8 @@ mod tests {
             anti_debug: true,
             core_dumps_disabled: true,
             env_scrubbed: true,
+            kernel_lockdown: None,
+            tpm_quote: None,
         };
         let rec = build(inputs, &*signer).unwrap();
         assert!(
@@ -669,6 +853,8 @@ mod tests {
             anti_debug: true,
             core_dumps_disabled: true,
             env_scrubbed: true,
+            kernel_lockdown: None,
+            tpm_quote: None,
         };
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         inputs.app_attest = Some(AppAttestEvidence {
@@ -679,6 +865,142 @@ mod tests {
         assert!(
             rec.appAttest.is_none(),
             "unverifiable App Attest evidence must be dropped, not embedded"
+        );
+    }
+
+    /// A full confidential posture with SIP OFF but kernel lockdown in
+    /// `confidentiality` mode (the Linux shape) — the lockdown analogue must
+    /// satisfy the OS-integrity gate, so the tier is `attested-confidential`.
+    /// (The other confidential conditions are set true to isolate the gate
+    /// under test — a real llama-server Linux box still can't reach this, since
+    /// it has no in-process backend / hardened runtime.)
+    #[test]
+    fn kernel_lockdown_confidentiality_satisfies_os_integrity_gate() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let inputs = confidential_inputs_with_lockdown(false, Some("confidentiality"));
+        let rec = build(inputs, &*signer).unwrap();
+        assert_eq!(rec.tier, "attested-confidential");
+        assert_eq!(rec.kernelLockdown.as_deref(), Some("confidentiality"));
+        assert!(!rec.sipEnabled);
+    }
+
+    /// Kernel lockdown `integrity` is NOT strict enough (it still allows ptrace
+    /// of other tasks), so with SIP off the OS-integrity gate fails and the tier
+    /// falls back to `best-effort`.
+    #[test]
+    fn kernel_lockdown_integrity_is_not_enough_for_confidential() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let inputs = confidential_inputs_with_lockdown(false, Some("integrity"));
+        let rec = build(inputs, &*signer).unwrap();
+        assert_eq!(rec.tier, "best-effort");
+    }
+
+    /// Build inputs that satisfy every confidential condition EXCEPT the
+    /// OS-integrity gate, which is left to the `sip` / `lockdown` args so a test
+    /// can isolate it.
+    fn confidential_inputs_with_lockdown(sip: bool, lockdown: Option<&str>) -> AttestationInputs {
+        AttestationInputs {
+            provider_did: "did:plc:test".into(),
+            encryption_pub_key_b64: "abc".into(),
+            chip_name: "x86_64".into(),
+            hardware_model: "PowerEdge".into(),
+            serial_number: "LOCK-TEST".into(),
+            os_version: "Linux".into(),
+            binary_path: std::path::PathBuf::from("/nonexistent"),
+            sip_enabled: sip,
+            secure_boot_enabled: true,
+            secure_enclave_available: false,
+            authenticated_root_enabled: false,
+            rdma_disabled: true,
+            mda_cert_chain: vec![],
+            app_attest: None,
+            cd_hash: Some("ab".repeat(32)),
+            team_id: None,
+            hardened_runtime: true,
+            library_validation: true,
+            get_task_allow: false,
+            metallib_hash: None,
+            engine_lib_hash: None,
+            in_process_backend: true,
+            anti_debug: true,
+            core_dumps_disabled: true,
+            env_scrubbed: true,
+            kernel_lockdown: lockdown.map(|s| s.to_string()),
+            tpm_quote: None,
+        }
+    }
+
+    #[test]
+    fn parse_lockdown_mode_picks_the_bracketed_mode() {
+        // The kernel marks the ACTIVE mode with brackets; position varies.
+        assert_eq!(
+            parse_lockdown_mode("none [integrity] confidentiality\n").as_deref(),
+            Some("integrity")
+        );
+        assert_eq!(
+            parse_lockdown_mode("[none] integrity confidentiality").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            parse_lockdown_mode("none integrity [confidentiality]").as_deref(),
+            Some("confidentiality")
+        );
+    }
+
+    #[test]
+    fn parse_lockdown_mode_rejects_malformed_content() {
+        // Malformed content must read as "no lockdown" (the honest floor),
+        // never as some mode.
+        assert_eq!(parse_lockdown_mode(""), None);
+        assert_eq!(parse_lockdown_mode("none integrity confidentiality"), None);
+        assert_eq!(parse_lockdown_mode("[]"), None);
+        assert_eq!(parse_lockdown_mode("[ ]"), None);
+        assert_eq!(parse_lockdown_mode("garbage ["), None);
+    }
+
+    /// Wire-shape guard for the additive Linux fields: absent evidence must be
+    /// OMITTED from the serialized record, not emitted as `null` — verifiers
+    /// reconstruct the canonical bytes, and a spurious `"kernelLockdown": null`
+    /// on every macOS record would change them. Present evidence serializes
+    /// under the lexicon's camelCase name.
+    #[test]
+    fn optional_linux_evidence_is_omitted_when_absent() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+
+        let mut inputs = confidential_inputs_with_lockdown(true, None);
+        inputs.tpm_quote = None;
+        let rec = build(inputs, &*signer).unwrap();
+        let v = serde_json::to_value(&rec).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("kernelLockdown"), "None must be omitted");
+        assert!(!obj.contains_key("tpmQuote"), "None must be omitted");
+
+        let inputs = confidential_inputs_with_lockdown(false, Some("integrity"));
+        let rec = build(inputs, &*signer).unwrap();
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["kernelLockdown"], "integrity");
+    }
+
+    /// Fail-closed: a TPM quote present on the inputs MUST be dropped (not
+    /// embedded) until the vendor-root quote verifier lands, so it can never
+    /// yet earn hardware-attested. Mirrors the unverifiable-MDA/App-Attest drop.
+    #[test]
+    fn tpm_quote_is_dropped_until_verifier_lands() {
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let mut inputs = confidential_inputs_with_lockdown(false, Some("confidentiality"));
+        inputs.tpm_quote = Some(TpmQuoteEvidence {
+            quoted: "AAAA".into(),
+            signature: "BBBB".into(),
+            akCertChain: vec!["CCCC".into()],
+        });
+        let rec = build(inputs, &*signer).unwrap();
+        assert!(
+            rec.tpmQuote.is_none(),
+            "an unverified TPM quote must be dropped (fail-closed), not embedded"
         );
     }
 }

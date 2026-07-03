@@ -266,12 +266,45 @@ async fn commit(models: &[String], verb: &str, await_models: &[String]) -> Resul
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         let _ = (verb, await_models, joined);
-        // On Linux there's no LaunchAgent to edit/bounce, but the PDS write
-        // above IS the action: a serving agent reconciles `desiredModels` on its
-        // ~30s poll (and restarts to reload). So this is no longer a hard error.
+        // Linux parity for the macOS plist-edit + bounce. Unlike macOS, there
+        // is NO local model list to edit: the PDS `desiredModels` write above
+        // is the source of truth, and the serve loop reconciles it into
+        // COCORE_INFERENCE_MODELS at startup (inference_models_action). So the
+        // action is the PDS write + an immediate service restart to apply it
+        // now rather than waiting for the advisor's ~30s reconcile.
+        if pds_wrote {
+            let restarted = crate::service::restart_if_installed();
+            if restarted {
+                println!(
+                    "Wrote your model selection ({} model(s)) to your account and restarted {}. \
+                     Watch `journalctl --user -u {} -f` for the engine-load + register sequence.",
+                    models.len(),
+                    crate::service::UNIT,
+                    crate::service::UNIT,
+                );
+            } else {
+                println!(
+                    "Wrote your model selection ({} model(s)) to your account. A running agent will \
+                     reconcile within ~30s; no {} found to restart immediately (restart your serve \
+                     daemon to apply now).",
+                    models.len(),
+                    crate::service::UNIT,
+                );
+            }
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Couldn't sync the model selection — this machine has no provider record yet \
+                 (has it served at least once?)."
+            )
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (verb, await_models, joined);
         if pds_wrote {
             println!(
                 "Wrote your model selection ({} model(s)) to your account. A running agent will \
@@ -282,8 +315,7 @@ async fn commit(models: &[String], verb: &str, await_models: &[String]) -> Resul
         } else {
             anyhow::bail!(
                 "Couldn't sync the model selection — this machine has no provider record yet \
-                 (has it served at least once?). On Linux, also set COCORE_INFERENCE_MODELS in \
-                 your service-manager env file and restart the unit."
+                 (has it served at least once?)."
             )
         }
     }

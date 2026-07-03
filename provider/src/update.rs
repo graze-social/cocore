@@ -320,9 +320,23 @@ fn bounce_launchagent_if_installed() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn bounce_launchagent_if_installed() {
-    println!("Note: not on macOS; restart your serve daemon manually to pick up the new binary.");
+    // Linux parity for the macOS bounce: restart the systemd user unit so the
+    // freshly replaced binary is the one running.
+    if crate::service::restart_if_installed() {
+        println!("Restarted {} on the new binary.", crate::service::UNIT);
+    } else {
+        println!(
+            "Note: no {} found; restart your serve daemon manually to pick up the new binary.",
+            crate::service::UNIT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn bounce_launchagent_if_installed() {
+    println!("Note: restart your serve daemon manually to pick up the new binary.");
 }
 
 #[cfg(test)]
