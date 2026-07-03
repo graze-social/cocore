@@ -206,6 +206,35 @@ export interface SafeFetchedImage {
   mime: string;
 }
 
+/** Build a `lookup` override for node's http(s).request that always resolves to
+ *  `pinnedAddress`, honoring BOTH callback contracts node uses:
+ *   - `{ all: true }` — node's Happy Eyeballs / `autoSelectFamily` (default-on
+ *     since node 20) calls lookup this way and expects an ARRAY of
+ *     `{ address, family }`. Returning a bare string here makes node read
+ *     `.address` off a string → `undefined` → "Invalid IP address: undefined",
+ *     which breaks EVERY legitimate fetch (regression fixed here).
+ *   - single-address — the legacy form expects `cb(null, address, family)`.
+ *  Either way the socket connects to the vetted IP; SNI/Host/cert stay bound to
+ *  the URL's hostname so TLS still validates against the real host. */
+export function makePinnedLookup(pinnedAddress: string) {
+  const family = isIP(pinnedAddress) || 4;
+  return (
+    _hostname: string,
+    options: unknown,
+    callback: (err: Error | null, address: unknown, family?: number) => void,
+  ): void => {
+    const wantsAll =
+      typeof options === "object" &&
+      options !== null &&
+      (options as { all?: boolean }).all === true;
+    if (wantsAll) {
+      callback(null, [{ address: pinnedAddress, family }]);
+    } else {
+      callback(null, pinnedAddress, family);
+    }
+  };
+}
+
 export interface SafeFetchOptions {
   maxBytes: number;
   timeoutMs?: number;
@@ -280,7 +309,6 @@ function pinnedImageFetch(
   timeoutMs: number,
 ): Promise<SafeFetchedImage> {
   const request = url.protocol === "https:" ? httpsRequest : httpRequest;
-  const family = isIP(pinnedAddress) || 4;
   return new Promise<SafeFetchedImage>((resolve, reject) => {
     const fail = (why: string): void => {
       console.error(`[safe-image-fetch] ${why} for ${url.hostname}`);
@@ -293,9 +321,9 @@ function pinnedImageFetch(
         headers: { accept: "image/*" },
         timeout: timeoutMs,
         // Force the connection to the vetted IP; SNI/Host/cert remain the
-        // hostname so TLS still validates against the real host.
-        lookup: (_host, _opts, cb) =>
-          (cb as (e: Error | null, a: string, f: number) => void)(null, pinnedAddress, family),
+        // hostname so TLS still validates against the real host. Handles node's
+        // Happy-Eyeballs `{ all: true }` array contract — see makePinnedLookup.
+        lookup: makePinnedLookup(pinnedAddress) as never,
       },
       (res) => {
         const status = res.statusCode ?? 0;
