@@ -742,6 +742,54 @@ fn kickstart_launchagent_if_installed() {
 // owner-intent fields AND any unknown/future field are preserved by default, so
 // a new owner setting can't be silently clobbered by an agent write.
 
+/// `~/.cocore/provider-rkey.json` — the rkey of the provider record this
+/// machine last successfully published, scoped to the identity that
+/// published it. The rkey doubles as the advisor's `machine_id` (the join
+/// key the console uses to overlay live standing), so a boot where the
+/// publish fails — most commonly a dead PDS session that 401s every write —
+/// must still register under the SAME stable id instead of falling back to
+/// an anonymous pubkey slot the console can't join. The cache is only
+/// honored when both the DID and the attestation pubkey match the current
+/// identity: a re-pair under a different account or a re-keyed enclave
+/// invalidates it rather than resurrecting a foreign rkey.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedProviderRkey {
+    did: String,
+    attestation_pub_key: String,
+    rkey: String,
+}
+
+fn provider_rkey_cache_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cocore").join("provider-rkey.json"))
+}
+
+/// Best-effort: never blocks or fails the serve path.
+fn cache_provider_rkey(did: &str, attestation_pub_key: &str, rkey: &str) {
+    let Some(path) = provider_rkey_cache_path() else {
+        return;
+    };
+    let entry = CachedProviderRkey {
+        did: did.to_string(),
+        attestation_pub_key: attestation_pub_key.to_string(),
+        rkey: rkey.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn cached_provider_rkey(did: &str, attestation_pub_key: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(provider_rkey_cache_path()?).ok()?;
+    parse_cached_provider_rkey(&raw, did, attestation_pub_key)
+}
+
+/// Honor the cache only for the exact identity that wrote it; anything
+/// else (foreign DID, re-keyed enclave, corrupt file) reads as no cache.
+fn parse_cached_provider_rkey(raw: &str, did: &str, attestation_pub_key: &str) -> Option<String> {
+    let entry: CachedProviderRkey = serde_json::from_str(raw).ok()?;
+    (entry.did == did && entry.attestation_pub_key == attestation_pub_key).then_some(entry.rkey)
+}
+
 /// Find this machine's existing provider record (if any) on the
 /// user's PDS by matching `attestationPubKey`, delete any other
 /// records that share the same key (they're stale duplicates), and
@@ -1837,11 +1885,30 @@ async fn cmd_serve(
                 deleted,
                 "published provider record (dedup-and-upsert)"
             );
-            published.uri.rsplit('/').next().map(|s| s.to_string())
+            let rkey = published.uri.rsplit('/').next().map(|s| s.to_string());
+            if let Some(r) = &rkey {
+                cache_provider_rkey(&session.did, &attestation_pub_key, r);
+            }
+            rkey
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to publish provider record; machine will not appear on the console");
-            None
+            // Fall back to the rkey cached on the last successful publish so
+            // the advisor Register still carries our stable `machine_id` —
+            // otherwise the console can't join live standing onto the record
+            // and shows a healthy, connected machine as "not reachable".
+            let cached = cached_provider_rkey(&session.did, &attestation_pub_key);
+            match &cached {
+                Some(r) => tracing::warn!(
+                    error = %e,
+                    rkey = %r,
+                    "failed to publish provider record; registering with the cached rkey (record may be stale on the console)"
+                ),
+                None => tracing::warn!(
+                    error = %e,
+                    "failed to publish provider record; machine will not appear on the console"
+                ),
+            }
+            cached
         }
     };
 
@@ -3653,6 +3720,57 @@ mod active_gate_tests {
         let mut paused = false;
         assert_eq!(active_gate_decision(None, &mut paused), ActiveGate::Serve);
         assert!(!paused);
+    }
+}
+
+#[cfg(test)]
+mod provider_rkey_cache_tests {
+    use super::parse_cached_provider_rkey;
+
+    const RAW: &str =
+        r#"{"did":"did:plc:alice","attestation_pub_key":"BKey==","rkey":"3mov7tbvvns2m"}"#;
+
+    #[test]
+    fn matching_identity_returns_the_cached_rkey() {
+        assert_eq!(
+            parse_cached_provider_rkey(RAW, "did:plc:alice", "BKey=="),
+            Some("3mov7tbvvns2m".to_string())
+        );
+    }
+
+    #[test]
+    fn a_foreign_did_never_resurrects_the_rkey() {
+        // Re-paired under a different account: the old record isn't ours to
+        // impersonate on the advisor.
+        assert_eq!(
+            parse_cached_provider_rkey(RAW, "did:plc:bob", "BKey=="),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rekeyed_enclave_invalidates_the_cache() {
+        assert_eq!(
+            parse_cached_provider_rkey(RAW, "did:plc:alice", "BOtherKey=="),
+            None
+        );
+    }
+
+    #[test]
+    fn garbage_or_legacy_content_reads_as_no_cache() {
+        assert_eq!(
+            parse_cached_provider_rkey("not json", "did:plc:alice", "BKey=="),
+            None
+        );
+        assert_eq!(
+            parse_cached_provider_rkey("", "did:plc:alice", "BKey=="),
+            None
+        );
+        // A bare rkey from a hypothetical older format is ignored, not trusted.
+        assert_eq!(
+            parse_cached_provider_rkey("\"3mov7tbvvns2m\"", "did:plc:alice", "BKey=="),
+            None
+        );
     }
 }
 

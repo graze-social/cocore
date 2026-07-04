@@ -477,6 +477,65 @@ test("advisorUnreachable: serving on PDS but absent from the advisor ⇒ unreach
   assert.equal(machineNetworkStanding(m!), "not-reachable");
 });
 
+test("applyAdvisorStanding joins by attestation pubkey when the advisor has no rkey (dead-session agent)", () => {
+  // An agent whose PDS session died can't publish at boot, so it registers
+  // with no machine_id and the advisor keys it by its attestation pubkey.
+  // The machine is LIVE on the network — the pubkey fallback must find it.
+  const pubkey = "BFakeUncompressedP256PointBase64==";
+  const machines = [{ ...machineStub("rkey-mini"), attestationPubKey: pubkey }];
+  const [m] = applyAdvisorStanding(machines, {
+    reachable: true,
+    byMachineId: new Map([
+      [
+        pubkey,
+        {
+          unhealthy: false,
+          unhealthyReason: null,
+          silentFailure: false,
+          verifiedTier: "attested-confidential" as const,
+        },
+      ],
+    ]),
+  });
+  assert.equal(m!.standingKnown, true);
+  assert.equal(m!.advisorConnected, true);
+  assert.equal(m!.verifiedTier, "attested-confidential");
+  assert.equal(advisorUnreachable(m!), false);
+  assert.equal(machineNetworkStanding(m!), "on-network");
+});
+
+test("applyAdvisorStanding prefers the rkey join over the pubkey fallback", () => {
+  // Same machine present under BOTH keys (e.g. a race across reconnects):
+  // the rkey entry is the agent's own claim of identity — it wins.
+  const pubkey = "BFakeUncompressedP256PointBase64==";
+  const entry = (reason: string) => ({
+    unhealthy: true,
+    unhealthyReason: reason,
+    silentFailure: false,
+    verifiedTier: "best-effort" as const,
+  });
+  const machines = [{ ...machineStub("rkey-mini"), attestationPubKey: pubkey }];
+  const [m] = applyAdvisorStanding(machines, {
+    reachable: true,
+    byMachineId: new Map([
+      ["rkey-mini", entry("via-rkey")],
+      [pubkey, entry("via-pubkey")],
+    ]),
+  });
+  assert.equal(m!.unhealthyReason, "via-rkey");
+});
+
+test("providerRowsToMachines carries the record's attestationPubKey onto the machine", () => {
+  const withKey = providerRowsToMachines(
+    [providerRow({ attestationPubKey: "BSomeKey==" })],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(withKey.attestationPubKey, "BSomeKey==");
+  const withoutKey = providerRowsToMachines([providerRow({})], ZERO_STATS, new Map())[0]!;
+  assert.equal(withoutKey.attestationPubKey, undefined);
+});
+
 test("advisorUnreachable: a live advisor connection outranks a stale fault", () => {
   const machines = [
     {

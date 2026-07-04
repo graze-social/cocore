@@ -60,6 +60,7 @@ type ProviderRecordBody = {
   region?: string;
   proBono?: { mode?: string; dids?: string[] };
   toolCalls?: boolean;
+  attestationPubKey?: string;
 };
 
 type ReceiptRecordBody = {
@@ -114,6 +115,10 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
     region: typeof o.region === "string" ? o.region : undefined,
     proBono: parseProBono(o.proBono),
     toolCalls: typeof o.toolCalls === "boolean" ? o.toolCalls : undefined,
+    attestationPubKey:
+      typeof o.attestationPubKey === "string" && o.attestationPubKey.length > 0
+        ? o.attestationPubKey
+        : undefined,
   };
 }
 
@@ -585,10 +590,14 @@ export async function fetchAdvisorStanding(did: string): Promise<AdvisorStanding
 }
 
 /** Overlay live advisor standing onto machines built from PDS records. The
- *  join is by machineId == provider-record rkey == {@link Machine.id}. When
- *  the advisor was unreachable, `standingKnown` is false on every machine and
- *  no unhealthy/connected claim is made (correctness over a fabricated
- *  green). */
+ *  join is by machineId == provider-record rkey == {@link Machine.id}, with a
+ *  fallback on the record's `attestationPubKey`: an agent that couldn't
+ *  publish its provider record at boot (dead PDS session) registers without
+ *  a `machine_id`, and the advisor then keys it by its attestation pubkey —
+ *  the machine is live on the network, so it must not read "not reachable".
+ *  When the advisor was unreachable, `standingKnown` is false on every
+ *  machine and no unhealthy/connected claim is made (correctness over a
+ *  fabricated green). */
 export function applyAdvisorStanding(
   machines: Machine[],
   standing: AdvisorStandingResult,
@@ -597,7 +606,9 @@ export function applyAdvisorStanding(
     if (!standing.reachable) {
       return { ...m, standingKnown: false };
     }
-    const s = standing.byMachineId.get(m.id);
+    const s =
+      standing.byMachineId.get(m.id) ??
+      (m.attestationPubKey ? standing.byMachineId.get(m.attestationPubKey) : undefined);
     return {
       ...m,
       standingKnown: true,
@@ -701,6 +712,7 @@ export function providerRowsToMachines(
 
     const base: Machine = {
       id: row.rkey,
+      attestationPubKey: body.attestationPubKey,
       alias: body.machineLabel?.trim() || row.rkey,
       state: machineStateFromProvider(body, recentlyActive),
       gpu: chip,

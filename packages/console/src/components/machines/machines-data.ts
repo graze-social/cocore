@@ -39,6 +39,14 @@ export function machineStatusText(m: {
 
 export interface Machine {
   id: string;
+  /** The machine's Secure-Enclave attestation pubkey from its provider
+   *  record. This is the machine's identity that does NOT depend on a
+   *  successful boot-time PDS publish: when the agent couldn't publish
+   *  (dead session → no rkey to echo), it registers with the advisor
+   *  without a `machine_id` and the advisor keys it by this pubkey
+   *  instead. The advisor-standing join falls back to it so such a
+   *  machine still reads as connected. */
+  attestationPubKey?: string;
   alias: string;
   state: MachineState;
   gpu: string;
