@@ -204,6 +204,28 @@
               }
             }
           },
+          "advisorFault": {
+            "type": "object",
+            "description": "Present when the agent cannot establish its WebSocket connection to its advisor (matchmaker) after repeated consecutive attempts. The machine may be perfectly healthy locally — engine loaded, records published, `serving: true` — yet completely absent from the network: no advisor registry entry, no jobs routed, and without this field the failure is invisible remotely (the record looks like a healthy idle machine, so operators misdiagnose it as an onboarding problem). Consumers SHOULD surface this as 'serving locally but cannot reach the network' with remediation guidance (VPN / firewall / WebSocket filtering). Known codes: `dns-failure`, `tls-failure`, `connect-timeout`, `connect-refused`, `upgrade-blocked` (plain HTTPS to the advisor works but the WebSocket upgrade cannot be established — a middlebox on the network is filtering WebSockets), `http-<status>` (the upgrade handshake got a non-101 HTTP answer), `closed-<code>` (the socket was closed with the given WebSocket close code), and `network-unreachable`; new codes may be added, and consumers MUST treat an unknown code as a generic advisor-unreachable fault. The agent publishes this through its record-write path over plain HTTPS — which is exactly the transport that still works in the failure this diagnoses — and clears the field on its next successful advisor registration, so presence reflects the current state, not a stale failure. Additive / optional — pre-2026-07 readers ignore it.",
+            "required": ["code", "message", "observedAt"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "maxLength": 64,
+                "description": "Machine-readable fault class; see the field description for known values. Unknown codes MUST be treated as a generic advisor-unreachable fault."
+              },
+              "message": {
+                "type": "string",
+                "maxLength": 600,
+                "description": "Human-readable, content-safe summary with remediation guidance. Carries only the classified error kind — never raw error text, URLs, or credentials."
+              },
+              "observedAt": {
+                "type": "string",
+                "format": "datetime",
+                "description": "When the agent recorded the fault (RFC3339, UTC)."
+              }
+            }
+          },
           "toolCalls": {
             "type": "boolean",
             "description": "The owner's opt-in to serving tool/function calls on this machine. Owner-written INTENT, set from a management UI (the console's per-machine settings), exactly like `desiredModels`/`desiredTier`/`proBono`/`shareLocation`: the agent reconciles toward it but NEVER authors it, so it must PRESERVE whatever it finds on every re-publish. When `true`, the agent starts each eligible engine with vLLM automatic tool-choice enabled and verifies real tool-call behavior with a forced-tool startup canary before advertising support (per-model, via the advisor `Register.toolCallModels`); a model that fails the canary is served exactly as before, just without tool calls. Eligibility is RESTRICTED to the curated 'top models' the provider knows a tool-call parser pairing for — models outside that set never attempt tool calling even when this is on, so turning it on can only ADD capability, never break existing serving. Absent ≡ off: no engine advertises tool calls and the machine behaves exactly as it does today. Optional / additive; pre-2026-07 agents ignore it.\nNote: an operator may still force the raw vLLM passthrough on any model via the `COCORE_ENABLE_TOOL_CALLS` env var; this field is the curated, UI-driven path that does not require a known global parser."
