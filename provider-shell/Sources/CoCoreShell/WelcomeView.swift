@@ -57,6 +57,11 @@ struct WelcomeView: View {
     @State private var signingIn = false
     @State private var startingServe = false
     @State private var venvInstalled = VenvBootstrapper.isInstalled
+    /// The agent's provisioning marker, re-read by the 3s poll. While the
+    /// process is up but still downloading/loading models (or registering
+    /// with the network), the serve step must NOT claim "Serving" — that
+    /// false "you're earning" was exactly the first-run complaint.
+    @State private var provision: MenuBarController.ProvisionStatus?
     /// Latch so the runtime install auto-fires at most once per window —
     /// a failure the user is retrying shouldn't re-trigger from the poll.
     @State private var autoKickedRuntime = false
@@ -94,7 +99,13 @@ struct WelcomeView: View {
     private var hasModels: Bool { !models.models.isEmpty }
     private var runtimeReady: Bool { venvInstalled }
     private var serving: Bool { state.serving }
-    private var allDone: Bool { signedIn && hasModels && runtimeReady && serving }
+    /// The agent process is up but still preparing — downloading/loading
+    /// model weights ("provisioning") or registering with the network
+    /// ("starting"). Distinct from `serving` so step 4 stays honest.
+    private var preparing: Bool {
+        serving && (provision?.phase == "provisioning" || provision?.phase == "starting")
+    }
+    private var allDone: Bool { signedIn && hasModels && runtimeReady && serving && !preparing }
     /// Real models can't run until the runtime exists, so block "Start
     /// serving" while a real model is selected and the runtime isn't
     /// ready yet (a stub-only setup — no models — can serve immediately).
@@ -342,19 +353,42 @@ struct WelcomeView: View {
     // MARK: step 4 — start serving
 
     private var stepServe: some View {
-        step(4, done: serving, active: canServe && !serving, title: "Start serving",
-             desc: serving
-                ? "Serving — answering requests and earning credits."
-                : (signedIn && hasModels && !runtimeReady)
-                    ? "Ready to serve as soon as the runtime finishes installing."
-                    : "Connect to the network and begin earning credits.") {
+        step(4, done: serving && !preparing, active: (canServe && !serving) || preparing,
+             title: "Start serving",
+             desc: servingStepDesc) {
             if !serving {
                 Button(startingServe ? "Starting…" : "Start serving") { startServing() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .disabled(!canServe || startingServe)
+            } else if preparing {
+                // The long wait is the download — show it live so the step
+                // reads as progress, not a hang (and never a premature ✓).
+                ProgressView()
+                    .controlSize(.small)
             }
         }
+    }
+
+    /// Step 4's description, honest about the gap between "the agent process
+    /// is running" and "this machine is serving": a fresh model pick means a
+    /// multi-GB weight download before the first job can arrive.
+    private var servingStepDesc: String {
+        if serving, let p = provision, p.phase == "provisioning" {
+            if p.loading { return "Loading models into memory — almost there…" }
+            return p.bytesDownloaded > 0
+                ? "Downloading models… \(MenuBarController.humanBytes(p.bytesDownloaded)) so far. "
+                    + "Serving starts automatically when the download finishes."
+                : "Downloading models… Serving starts automatically when the download finishes."
+        }
+        if serving, provision?.phase == "starting" {
+            return "Almost ready — connecting to the network…"
+        }
+        if serving { return "Serving — answering requests and earning credits." }
+        if signedIn && hasModels && !runtimeReady {
+            return "Ready to serve as soon as the runtime finishes installing."
+        }
+        return "Connect to the network and begin earning credits."
     }
 
     // MARK: footer
@@ -419,6 +453,7 @@ struct WelcomeView: View {
         await models.refresh()
         venvInstalled = VenvBootstrapper.isInstalled
         state.serving = supervisor.isServing()
+        provision = MenuBarController.provisionStatus()
         if signedIn, hasModels, !venvInstalled, !venv.isRunning, !autoKickedRuntime {
             autoKickedRuntime = true
             runBootstrap()

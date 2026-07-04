@@ -2,6 +2,37 @@ import type { VerifiedTier } from "@/lib/verified-standing.server.ts";
 
 export type MachineState = "running" | "idle" | "paused" | "offline" | "provisioning";
 
+/** Owner-facing label for a machine state chip. `provisioning` is agent
+ *  jargon — the owner-facing story is "it's preparing: downloading model
+ *  weights before it can serve", so the chip says "preparing" and the
+ *  accompanying status line spells out the download. */
+export function machineStateLabel(state: MachineState): string {
+  return state === "provisioning" ? "preparing" : state;
+}
+
+/** One-line status description for a machine, shared by the fleet table and
+ *  the narrow-screen cards so the copy can't drift between the two. */
+export function machineStatusText(m: {
+  state: MachineState;
+  faultReason?: string;
+  pausedReason?: string;
+  offlineReason?: string;
+}): string {
+  if (m.faultReason) return "Engine not loaded — only serving stub";
+  switch (m.state) {
+    case "provisioning":
+      return "Preparing — downloading models before it can serve…";
+    case "idle":
+      return "Eligible for matching when active";
+    case "paused":
+      return m.pausedReason ?? "Paused";
+    case "running":
+      return "Served a job in the last 5 min";
+    default:
+      return m.offlineReason ?? "Offline";
+  }
+}
+
 export interface Machine {
   id: string;
   alias: string;

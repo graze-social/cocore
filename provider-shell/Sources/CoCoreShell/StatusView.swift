@@ -69,6 +69,20 @@ struct StatusRows: View {
         }
         Section("Serving") {
             LabeledContent("State", value: servingText)
+            // While downloading, name the models so a multi-GB wait is
+            // explained ("which models?" is the first question), and set the
+            // expectation that serving starts on its own afterwards.
+            if let p = MenuBarController.provisionStatus(), p.phase == "provisioning",
+                !p.models.isEmpty
+            {
+                Text(
+                    "Fetching \(p.models.joined(separator: ", ")) — often several GB. "
+                        + "Serving starts automatically when it finishes."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
             // The full provisioning-failure reason lives here (not the menu,
             // where a long single line can't wrap and balloons the window).
             if let p = MenuBarController.provisionStatus(), p.phase == "failed",
@@ -228,11 +242,16 @@ struct StatusRows: View {
         // it isn't serving yet, so don't claim "Serving".
         if let p = MenuBarController.provisionStatus() {
             if p.phase == "provisioning" {
+                if p.loading { return "Loading models into memory…" }
                 return p.bytesDownloaded > 0
-                    ? "Provisioning… (\(MenuBarController.humanBytes(p.bytesDownloaded)) downloaded)"
-                    : "Provisioning…"
+                    ? "Downloading models… (\(MenuBarController.humanBytes(p.bytesDownloaded)) so far)"
+                    : "Downloading models…"
             }
-            if p.phase == "failed" { return "Provisioning failed" }
+            // Engines are up; the machine is registering with the network.
+            // Gated on state.serving so a stopped agent's leftover marker
+            // can't pin "connecting" over an honest "Not serving".
+            if p.phase == "starting", state.serving { return "Connecting to the network…" }
+            if p.phase == "failed" { return "Model setup failed" }
         }
         return state.serving ? "Serving" : "Not serving"
     }

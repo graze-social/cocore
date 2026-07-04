@@ -94,7 +94,12 @@ import {
 } from "@/components/machines/machines.functions.ts";
 import { formatTokens, formatTokensCompact } from "@/lib/token-display.ts";
 
-import { type Machine, type MachineState } from "./machines-data.ts";
+import {
+  type Machine,
+  type MachineState,
+  machineStateLabel,
+  machineStatusText,
+} from "./machines-data.ts";
 import { Page } from "@/design-system/page/index.tsx";
 import { Text } from "@/design-system/typography/text.tsx";
 import { ResizableTableContainer, Collection } from "react-aria-components";
@@ -2408,7 +2413,7 @@ export function MachinesDashboard() {
                                   )}
                                 />
 
-                                {m.faultReason ? "fault" : m.state}
+                                {m.faultReason ? "fault" : machineStateLabel(m.state)}
                               </Flex>
                             </TableCell>
                           );
@@ -2425,20 +2430,12 @@ export function MachinesDashboard() {
                         if (column.id === "job") {
                           return (
                             <TableCell>
-                              {m.faultReason ? (
-                                <LabelText variant="secondary" style={styles.faultText}>
-                                  Engine not loaded — only serving stub
-                                </LabelText>
-                              ) : (
-                                <LabelText variant="secondary">
-                                  {m.state === "provisioning" &&
-                                    "Starting up — loading the engine…"}
-                                  {m.state === "idle" && "Eligible for matching when active"}
-                                  {m.state === "paused" && (m.pausedReason ?? "Paused")}
-                                  {m.state === "running" && "Served a job in the last 5 min"}
-                                  {m.state === "offline" && (m.offlineReason ?? "Offline")}
-                                </LabelText>
-                              )}
+                              <LabelText
+                                variant="secondary"
+                                style={m.faultReason ? styles.faultText : undefined}
+                              >
+                                {machineStatusText(m)}
+                              </LabelText>
                             </TableCell>
                           );
                         }
@@ -2567,17 +2564,7 @@ function FleetMachineCard({
   onOpenDetail: () => void;
 }) {
   const tokensEarned24h = formatTokens(m.earnings24h);
-  const statusText = m.faultReason
-    ? "Engine not loaded — only serving stub"
-    : m.state === "provisioning"
-      ? "Starting up — loading the engine…"
-      : m.state === "idle"
-        ? "Eligible for matching when active"
-        : m.state === "paused"
-          ? (m.pausedReason ?? "Paused")
-          : m.state === "running"
-            ? "Served a job in the last 5 min"
-            : (m.offlineReason ?? "Offline");
+  const statusText = machineStatusText(m);
   return (
     <div {...stylex.props(styles.fleetCard)}>
       <div {...stylex.props(styles.fleetCardHead)}>
@@ -2603,7 +2590,7 @@ function FleetMachineCard({
               Boolean(m.faultReason) && styles.statusFault,
             )}
           />
-          {m.faultReason ? "fault" : m.state}
+          {m.faultReason ? "fault" : machineStateLabel(m.state)}
         </span>
       </div>
 

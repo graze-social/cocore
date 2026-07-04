@@ -53,7 +53,7 @@ import type { MachineWorkItem } from "@/components/machines/machines.server.ts";
 import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
 import { formatTokens } from "@/lib/token-display.ts";
 
-import type { Machine } from "./machines-data.ts";
+import { type Machine, machineStateLabel } from "./machines-data.ts";
 
 const styles = stylex.create({
   root: {
@@ -429,7 +429,9 @@ export function MachineDetail({ rkey }: { rkey: string }) {
                 styles[m.faultReason ? "statusFault" : STATUS_STYLE[m.state]],
               )}
             />
-            <LabelText variant="secondary">{m.faultReason ? "fault" : m.state}</LabelText>
+            <LabelText variant="secondary">
+              {m.faultReason ? "fault" : machineStateLabel(m.state)}
+            </LabelText>
           </span>
           <RegionFlag region={m.region} />
           <ProBonoBadge mode={m.proBonoMode} />
@@ -464,6 +466,21 @@ export function MachineDetail({ rkey }: { rkey: string }) {
               </SmallBody>
             ) : null}
           </Flex>
+        </Alert>
+      ) : null}
+
+      {/* The agent publishes its record with `provisioning: true` the moment
+          serving starts, then spends the next stretch downloading model
+          weights (often several GB) before it can register with the network.
+          Say so explicitly — a machine that "shows up but isn't under its
+          model" on the models page looks broken without this. */}
+      {!m.faultReason && m.state === "provisioning" ? (
+        <Alert variant="info" title="Preparing — downloading models">
+          <SmallBody>
+            This machine is downloading its model weights (often several GB) and will start serving
+            automatically when the download finishes. It appears under its models on the models page
+            only once it's serving — typically a few minutes on a fast connection.
+          </SmallBody>
         </Alert>
       ) : null}
 

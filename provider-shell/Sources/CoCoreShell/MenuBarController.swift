@@ -215,10 +215,14 @@ final class MenuBarController {
         // alive (state.serving == true), but it isn't actually serving yet.
         // The provisioning marker is the truth here — show it instead of
         // "serving and earning" so the app doesn't claim earnings prematurely.
+        // "starting" is the tail of the same window: engines are loaded but
+        // the machine hasn't registered with the network yet (gated on
+        // state.serving so a stopped agent's leftover marker can't show it).
         let provision = Self.provisionStatus()
         let provisioning = provision?.phase == "provisioning"
+        let connecting = state.serving && provision?.phase == "starting"
         let effectiveServing =
-            state.serving && !scheduledIdle && !remotelyPaused && !provisioning
+            state.serving && !scheduledIdle && !remotelyPaused && !provisioning && !connecting
 
         menu.addItem(.separator())
         // At-a-glance state + the one metric worth a glance. Everything
@@ -229,13 +233,19 @@ final class MenuBarController {
         if remotelyPaused {
             atAGlance = "⏸ Stopped from the console"
         } else if provisioning {
-            let bytes = provision?.bytesDownloaded ?? 0
-            atAGlance =
-                bytes > 0
-                ? "⏳ Provisioning… downloading model (\(Self.humanBytes(bytes)))"
-                : "⏳ Provisioning a model… (not earning yet)"
+            if provision?.loading == true {
+                atAGlance = "⏳ Loading models into memory… (not serving yet)"
+            } else {
+                let bytes = provision?.bytesDownloaded ?? 0
+                atAGlance =
+                    bytes > 0
+                    ? "⏳ Downloading models… (\(Self.humanBytes(bytes)) so far)"
+                    : "⏳ Downloading models… (not earning yet)"
+            }
+        } else if connecting {
+            atAGlance = "⏳ Almost ready — connecting to the network…"
         } else if provision?.phase == "failed" {
-            atAGlance = "⚠ Provisioning failed — not serving"
+            atAGlance = "⚠ Model setup failed — not serving"
         } else if scheduledIdle {
             atAGlance = "✓ Set up — idle until \(PreferencesView.hourLabel(sched.start)) (scheduled)"
         } else if effectiveServing {
@@ -281,6 +291,12 @@ final class MenuBarController {
             menu.addItem(action(title: "Resume serving", #selector(startServing)))
         } else if scheduledIdle {
             menu.addItem(disabled("○ Idle — serves \(PreferencesView.hourLabel(sched.start))–\(PreferencesView.hourLabel(sched.end))"))
+        } else if state.serving && (provisioning || connecting) {
+            // The agent process is up but not serving yet (downloading /
+            // loading / registering). Don't offer "Start serving" — it's
+            // already started; the honest action is pausing the preparation.
+            menu.addItem(disabled("◐ Preparing — not serving yet"))
+            menu.addItem(action(title: "Pause serving", #selector(stopServing)))
         } else {
             menu.addItem(disabled(effectiveServing ? "● Serving" : "○ Not serving"))
             if effectiveServing {
@@ -1183,7 +1199,9 @@ final class MenuBarController {
     /// machine is stopped). A marker older than 1h is ignored so a crashed
     /// agent can't pin "Provisioning…" on forever.
     struct ProvisionStatus {
-        let phase: String  // "provisioning" | "failed"
+        // "provisioning" (downloading/loading weights) | "starting" (engines
+        // up, registering with the network) | "failed"
+        let phase: String
         let models: [String]
         let bytesDownloaded: UInt64
         /// True while provisioning when nothing is actively downloading — the

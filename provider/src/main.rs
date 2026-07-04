@@ -1528,7 +1528,19 @@ async fn cmd_serve(
             false,
             Some(f),
         ),
-        None => clear_provision_status(),
+        // Engines are up, but this machine can't take jobs until it registers
+        // with the advisor (attestation + record publish + WS connect are still
+        // ahead). Mark that window "starting" instead of clearing — the tray
+        // shows "connecting to the network" rather than a premature "Serving".
+        // `AdvisorClient::run` removes the marker on its first successful
+        // registration (see `advisor::clear_starting_provision_marker`).
+        None => write_provision_status(
+            "starting",
+            &provisioning_models,
+            model_download_bytes(&provisioning_models),
+            false,
+            None,
+        ),
     }
 
     // Advertise the LIVE set, not every registered engine: `live_models()`

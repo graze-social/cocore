@@ -227,6 +227,11 @@ impl AdvisorClient {
         // stale "bad standing" marker from a previous serve so the tray's
         // red ping doesn't linger after the machine has recovered.
         clear_bad_standing();
+        // Registration is the moment this machine can actually take jobs, so
+        // it's what closes the boot-time "starting" window the serve path
+        // marked after engines loaded (see main's provision-status marker).
+        // Only now does the tray flip from "connecting…" to "Serving".
+        clear_starting_provision_marker();
 
         let ctx = ServeContext {
             signer,
@@ -1489,6 +1494,26 @@ fn clear_bad_standing() {
     };
     if std::fs::remove_file(&path).is_ok() {
         tracing::info!("cleared bad-standing marker");
+    }
+}
+
+/// Remove `~/.cocore/provision-status.json` iff it's in the "starting"
+/// phase — the boot-time marker the serve path leaves after engines load so
+/// the tray shows "connecting to the network" until this first successful
+/// advisor registration. Phase-guarded so a "failed" marker (engine fault,
+/// machine registers stub-only) keeps surfacing its fault in the tray, and
+/// best-effort like the bad-standing marker above.
+fn clear_starting_provision_marker() {
+    let Some(path) = dirs::home_dir().map(|h| h.join(".cocore").join("provision-status.json"))
+    else {
+        return;
+    };
+    let is_starting = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v.get("phase").and_then(|p| p.as_str()) == Some("starting"));
+    if is_starting && std::fs::remove_file(&path).is_ok() {
+        tracing::info!("registered — cleared the boot-time provisioning marker");
     }
 }
 
