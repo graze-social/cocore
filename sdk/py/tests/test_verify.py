@@ -77,6 +77,10 @@ def test_cross_language_confidential_pass():
         # Offline fixture: the live APNs code-identity leg is asserted separately
         # (see the 0.9.23 secure default), so opt out of it here.
         require_code_attested=False,
+        # MDA-freshness fixture predates the App Attest residency gate (ADR-0003),
+        # which now caps MDA-only at hardware-attested. This test is cross-language
+        # signing parity, not residency policy, so opt out of the residency gate.
+        require_hardware_bound_key=False,
         known_good_cdhashes=[f["knownGoodCdHash"]],
         known_good_metallib_hashes=[f["knownGoodMetallibHash"]],
         known_good_engine_lib_hashes=[f["knownGoodEngineLibHash"]],
@@ -97,6 +101,8 @@ def test_cross_language_confidential_pass():
         att["mdaCertChain"],
         require_confidential=True,
         require_code_attested=False,
+        # MDA-freshness fixture — opt out of the ADR-0003 residency gate (see above).
+        require_hardware_bound_key=False,
         known_good_cdhashes=[f["knownGoodCdHash"]],
         known_good_metallib_hashes=[f["knownGoodMetallibHash"]],
         os_floor=f["osFloor"],
@@ -168,6 +174,23 @@ def test_require_code_attested_gate():
     # Explicit opt-out (non-APNs advisor) no longer blocks.
     off = verify_provider_for_seal(att, None, require_code_attested=False)
     assert "code-not-attested" not in codes(off)
+
+
+def test_require_hardware_bound_key_gate():
+    """Key-residency gate (ADR-0003, parity with verify-provider.ts). Without a
+    bound App Attest object the signing key isn't proven Secure-Enclave-resident,
+    so `key-not-hardware-bound` is emitted by default and suppressed on opt-out."""
+    att = {"publicKey": "AA=="}
+
+    def codes(r):
+        return [fd["code"] for fd in r.findings]
+
+    # Opt-in (a future confidential-compute backend) → blocks.
+    required = verify_provider_for_seal(att, None, require_hardware_bound_key=True)
+    assert "key-not-hardware-bound" in codes(required)
+    # ADR-0004 default: App Attest is retired for the Mac tier, so the gate is off.
+    default_off = verify_provider_for_seal(att, None)
+    assert "key-not-hardware-bound" not in codes(default_off)
 
 
 def test_freshness_binds_key_option_b():

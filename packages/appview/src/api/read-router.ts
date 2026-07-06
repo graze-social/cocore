@@ -16,6 +16,11 @@ import { Effect } from "effect";
 
 import { MdaError, verifyChain } from "@cocore/sdk/mda";
 import { verifyAppAttestB64, APP_ATTEST_APP_ID } from "@cocore/sdk/appattest";
+import {
+  DEFAULT_TRUSTED_BROKERAGE,
+  makeBrokerageKeyResolver,
+  verifyBrokerageCountersignature,
+} from "@cocore/sdk/brokerage";
 import { freshnessBindsKey } from "@cocore/sdk/verify-provider";
 import { verifyAttestationSignature, verifyReceiptSignature } from "@cocore/sdk/p256";
 import { ids, lexicons } from "@cocore/sdk/lex";
@@ -58,7 +63,32 @@ function decodeBytesFields(body: Record<string, unknown>): Record<string, unknow
 const MODEL_ACTIVITY_TTL_MS = 5_000;
 let modelActivityCache: { at: number; body: unknown } | null = null;
 
-export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, never> {
+// ADR-0004: the brokerage authorities this AppView trusts when reporting a
+// receipt's confidential validity. `COCORE_TRUSTED_BROKERAGES` is a comma/space
+// list of DIDs; defaults to cocore's reference brokerage. A confidential receipt
+// is only reported `confidential: true` when a brokerage in this set countersigned
+// the dispatch — a self-published receipt without a trusted witness is not.
+const TRUSTED_BROKERAGES: string[] = (process.env["COCORE_TRUSTED_BROKERAGES"] ?? "")
+  .split(/[\s,]+/)
+  .map((s) => s.trim())
+  .filter(Boolean);
+const BROKERAGE_TRUST_SET =
+  TRUSTED_BROKERAGES.length > 0 ? TRUSTED_BROKERAGES : [DEFAULT_TRUSTED_BROKERAGE];
+const resolveBrokerageKey = makeBrokerageKeyResolver();
+
+export function buildReadRouter(
+  store: Store,
+  opts: {
+    /** ADR-0004: brokerage authority DIDs to trust for confidential validity.
+     *  Defaults to `COCORE_TRUSTED_BROKERAGES` / cocore's reference brokerage. */
+    brokerageTrustSet?: string[];
+    /** Resolver from a brokerage DID to its P-256 key. Defaults to the
+     *  did:web/did:plc resolver; injectable for tests. */
+    resolveBrokerageKey?: (did: string) => Promise<string | null>;
+  } = {},
+): HttpRouter.HttpRouter<never, never> {
+  const brokerageTrustSet = opts.brokerageTrustSet ?? BROKERAGE_TRUST_SET;
+  const resolveBrokerageKeyFn = opts.resolveBrokerageKey ?? resolveBrokerageKey;
   return HttpRouter.empty.pipe(
     HttpRouter.get(
       "/xrpc/dev.cocore.compute.listProviders",
@@ -329,6 +359,7 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
           verifyReceiptSignature(
             receipt as unknown as Record<string, unknown> & { enclaveSignature: string },
             att.publicKey,
+            (att as { sigScheme?: string }).sigScheme,
           ),
         );
         const findings = [...structural.findings];
@@ -457,6 +488,32 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
             findings.push({ severity: "error", code, message: (e as Error).message });
           }
         }
+        // ADR-0004: confidential validity. A receipt is `attested-confidential`
+        // only when a TRUSTED brokerage countersigned the dispatch to the
+        // attested machine — a self-published receipt (astra's case) is not, no
+        // matter what its `tier` field claims. A countersignature that's PRESENT
+        // but invalid/untrusted is a finding; its absence just means best-effort.
+        const brokerage = yield* Effect.promise(() =>
+          verifyBrokerageCountersignature(
+            receipt as unknown as Parameters<typeof verifyBrokerageCountersignature>[0],
+            {
+              trustedAuthorities: brokerageTrustSet,
+              resolveAuthorityKeyB64: resolveBrokerageKeyFn,
+            },
+          ),
+        );
+        const confidential = brokerage.ok;
+        if (
+          (receipt as { brokerageCountersignature?: unknown }).brokerageCountersignature &&
+          !brokerage.ok
+        ) {
+          findings.push({
+            severity: "error",
+            code: "brokerage-countersignature-invalid",
+            message: `brokerage countersignature did not verify: ${brokerage.reason ?? "unknown"}`,
+          });
+        }
+
         return ok({
           ok:
             structural.ok &&
@@ -465,8 +522,14 @@ export function buildReadRouter(store: Store): HttpRouter.HttpRouter<never, neve
             attSelfSigOk &&
             !findings.some((f) => f.code.startsWith("mda-")) &&
             !findings.some((f) => f.code.startsWith("appattest-")) &&
+            !findings.some((f) => f.code.startsWith("brokerage-")) &&
             !findings.some((f) => f.code === "lexicon-invalid"),
           trustLevel,
+          // ADR-0004: whether a trusted brokerage witnessed this dispatch. The
+          // `attested-confidential` tier requires this true; hardware-attested +
+          // best-effort do not.
+          confidential,
+          brokerageAuthority: brokerage.ok ? brokerage.authority : undefined,
           findings,
         });
       }).pipe(Effect.withSpan("appview.verifyReceipt")),

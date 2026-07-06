@@ -75,6 +75,10 @@ test.skipIf(!existsSync(CONF_FIXTURE))(
         // Offline fixture (no live advisor): opt out of the APNs code-identity
         // leg, which is asserted separately (see the 0.9.23 secure default).
         requireCodeAttested: false,
+        // MDA-freshness fixture predates the App Attest residency gate (ADR-0003),
+        // which now caps MDA-only at hardware-attested. This test exercises the
+        // seal mechanics, not residency policy, so opt out of the residency gate.
+        requireHardwareBoundKey: false,
         now: () => new Date(),
       },
     );

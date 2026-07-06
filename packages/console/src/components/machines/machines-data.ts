@@ -100,6 +100,12 @@ export interface Machine {
    *  backed; see verified-standing.server.ts), overlaid from live advisor
    *  standing. Drives the fleet trust badge. Absent until standing is known. */
   verifiedTier?: VerifiedTier;
+  /** When the machine was capped BELOW the tier it opted into (e.g. confidential
+   *  downgraded to hardware-attested because its signing key isn't proven
+   *  Secure-Enclave-bound, or best-effort because its registration wasn't
+   *  DID-authenticated), a short operator-facing nudge explaining why + how to
+   *  regain it. Undefined when the machine is at its ceiling. */
+  verifiedTierReason?: string;
   /** The advisor's VERIFIED confidential standing — the machine passed every
    *  earned leg (known-good cdHash + challenge-verified SIP + code-identity).
    *  This is the honest "operator cannot read your prompt" signal, stricter

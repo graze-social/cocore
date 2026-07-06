@@ -167,6 +167,19 @@ export interface InferenceRequest {
    *  a provider-specific object). Forwarded from the `/jobs` body; the
    *  advisor never inspects it. */
   tool_choice?: unknown;
+  /** ADR-0004: the brokerage's session-bound countersignature for this
+   *  dispatch, signed at routing time over {authority, job, requester, machine,
+   *  attestation, nonce}. The provider copies it onto the receipt as
+   *  `brokerageCountersignature` (lexicon camelCase) so a confidential requester
+   *  can verify the job was routed by a trusted authority to the attested
+   *  machine. Present only when the advisor has a brokerage authority key
+   *  configured AND the job carries the fields needed to bind it. Additive. */
+  brokerage_countersignature?: {
+    authority: string;
+    machine_id: string;
+    nonce: string;
+    sig: string;
+  };
 }
 
 interface InferenceChunk {

@@ -102,6 +102,31 @@ describe("ProviderRegistry confidential eligibility (WS-COORDINATOR)", () => {
     expect(e2?.cdHashKnownGood).toBe(true);
     expect(e2?.confidentialEligible).toBe(true);
   });
+
+  // C1 soft cutover (ADR-0003): a registration that couldn't prove control of
+  // its DID is dropped from confidential routing even with every measured leg.
+  it("a registration marked un-DID-authenticated is never confidential-eligible", () => {
+    const r = new ProviderRegistry(new KnownGoodSet([GOOD_CD]));
+    r.upsert(confReg, noop, noopSend, noopPing, 1000);
+    r.markCodeAttested(DID, MID);
+    r.recordChallengeSip(DID, MID, true);
+    // Defaults to authenticated (no signal) → eligible.
+    expect(r.get(DID, MID)?.registrationAuthenticated).toBe(true);
+    expect(r.get(DID, MID)?.confidentialEligible).toBe(true);
+    // Marking it unauthenticated drops eligibility in lockstep…
+    expect(r.setRegistrationAuthenticated(DID, MID, false)).toBe(true);
+    expect(r.get(DID, MID)?.confidentialEligible).toBe(false);
+    expect(r.listConfidential()).toEqual([]);
+    // …and restoring it (e.g. a re-register that carried a valid JWT) re-grants.
+    r.setRegistrationAuthenticated(DID, MID, true);
+    expect(r.get(DID, MID)?.confidentialEligible).toBe(true);
+  });
+
+  it("a fresh register defaults registrationAuthenticated true (no signal)", () => {
+    const r = new ProviderRegistry(new KnownGoodSet([GOOD_CD]));
+    r.upsert(confReg, noop, noopSend, noopPing, 1000);
+    expect(r.get(DID, MID)?.registrationAuthenticated).toBe(true);
+  });
 });
 
 describe("ProviderRegistry", () => {

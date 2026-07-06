@@ -33,7 +33,14 @@
 
 import { canonicalBytes } from "./canonical.ts";
 import { type MdaResult, verifyChain, verifyChainAgainst } from "./mda.ts";
-import { verifyAppAttestB64, APP_ATTEST_APP_ID } from "./appattest.ts";
+import {
+  APP_ATTEST_APP_ID,
+  AppAttestError,
+  type AppAttestResult,
+  attestedKeyMatchesSigningKey,
+  verifyAppAttest,
+  verifyAppAttestAssertion,
+} from "./appattest.ts";
 import { verifyAttestationSignature, verifyP256, SignatureVerifyError } from "./p256.ts";
 import type { AttestationRecord, Tier } from "./types.ts";
 import type { Finding, Severity, ValidationReport } from "./validate.ts";
@@ -108,6 +115,23 @@ export interface VerifyProviderOptions {
    *  confidential result then rests on the self-reported cdHash + MDA chain,
    *  which a forked binary on the operator's own attested device can satisfy). */
   requireCodeAttested?: boolean;
+  /** Require the signing key to be provably Secure-Enclave-resident (a bound
+   *  App Attest object) for the confidential tier. **Default true** (the
+   *  2026-07-05 key-residency fix). An MDA chain bound via freshness-code proves
+   *  a genuine Apple device once vouched for this PUBLIC key — it does NOT prove
+   *  the PRIVATE key is non-exportable, so a software signing key with a real
+   *  MDA chain is portable to any host (the exploit: a genuine M4's MDA chain +
+   *  an exportable `identity.pem` key replayed on a Linux/AMD box to serve
+   *  "confidential" traffic). Only App Attest — a key generated inside the
+   *  Secure Enclave and certified by Apple as such — closes the copy path.
+   *
+   *  This gate is confidential-only: a machine proven genuine-Apple via an MDA
+   *  chain but NOT App-Attest-bound is capped at `hardware-attested`, never
+   *  dropped to `best-effort` (it stays a genuine-hardware provider, just not a
+   *  confidential one). Set to `false` ONLY as a temporary transition relaxation
+   *  while the provider fleet ships App Attest, explicitly re-accepting the
+   *  portable-key risk. */
+  requireHardwareBoundKey?: boolean;
   /** Clock seam for tests. */
   now?: () => Date;
   /** ADVANCED / TEST ONLY. Verify the MDA chain against this DER trust anchor
@@ -175,6 +199,15 @@ export async function verifyProviderForSeal(
   // require it by default. A caller targeting a non-APNs advisor must opt out
   // explicitly (requireCodeAttested: false) and thereby accept the weaker proof.
   const requireCodeAttested = opts.requireCodeAttested ?? true;
+  // Key residency. ADR-0004 RETIRES this gate for the Mac tier: App Attest —
+  // the only thing that could prove key residency — does not function on macOS
+  // (ADR-0003 update), so no Mac provider can ever satisfy it. Confidential
+  // residency now rests on the BROKERAGE COUNTERSIGNATURE checked at
+  // receipt-validation time (see brokerage.ts): a trusted authority witnessed
+  // the dispatch to the attested machine. Default is therefore FALSE. The gate
+  // is kept (opt-in) for a future confidential-compute backend where remote key
+  // attestation IS possible.
+  const requireHardwareBoundKey = opts.requireHardwareBoundKey ?? false;
   const now = opts.now ? opts.now() : new Date();
   const knownGood = new Set<string>(
     [...(opts.knownGoodCdHashes ?? [])].map((h) => h.toLowerCase()),
@@ -194,6 +227,30 @@ export async function verifyProviderForSeal(
     blockers.push({ code, message });
   };
 
+  // A signature "by the attestation identity" (selfSignature, session key)
+  // dispatches on `sigScheme` (ADR-0003): raw ECDSA-P256 by default, or an App
+  // Attest ASSERTION over `message` when the identity is the SE App Attest key.
+  // The assertion path is the one that proves the private key is non-exportable
+  // — it can only be produced on the device holding the key. Resolves false on
+  // any verify/shape error (never throws a SignatureVerifyError out).
+  const sigScheme = (attestation as { sigScheme?: string }).sigScheme;
+  const verifyIdentitySig = async (sigB64: string, message: Uint8Array): Promise<boolean> => {
+    try {
+      if (sigScheme === "appattest-assertion") {
+        return await verifyAppAttestAssertion(
+          attestation.publicKey,
+          sigB64,
+          message,
+          APP_ATTEST_APP_ID,
+        );
+      }
+      return await verifyP256(attestation.publicKey, sigB64, message);
+    } catch (e) {
+      if (e instanceof SignatureVerifyError) return false;
+      throw e;
+    }
+  };
+
   // --- 0. The attestation must be self-signed by its own publicKey. ---
   // This authenticates every posture field below (cdHash, getTaskAllow,
   // encryptionPubKey, …). Without it those are unsigned claims: the MDA
@@ -202,14 +259,28 @@ export async function verifyProviderForSeal(
   // first; a forged/tampered attestation fails here before anything else.
   {
     let selfOk = false;
-    try {
-      selfOk = await verifyAttestationSignature(
-        attestation as unknown as { selfSignature?: string } & Record<string, unknown>,
-        attestation.publicKey,
-      );
-    } catch (e) {
-      if (!(e instanceof SignatureVerifyError)) throw e;
-      selfOk = false;
+    if (sigScheme === "appattest-assertion") {
+      // Assertion scheme: selfSignature is an App Attest assertion over the
+      // canonical record body (sans selfSignature/$type) as clientDataHash.
+      const sig = attestation.selfSignature;
+      if (sig) {
+        const {
+          selfSignature: _s,
+          $type: _t,
+          ...body
+        } = attestation as unknown as Record<string, unknown>;
+        selfOk = await verifyIdentitySig(sig, canonicalBytes(body));
+      }
+    } else {
+      try {
+        selfOk = await verifyAttestationSignature(
+          attestation as unknown as { selfSignature?: string } & Record<string, unknown>,
+          attestation.publicKey,
+        );
+      } catch (e) {
+        if (!(e instanceof SignatureVerifyError)) throw e;
+        selfOk = false;
+      }
     }
     if (!selfOk) {
       block(
@@ -230,15 +301,37 @@ export async function verifyProviderForSeal(
   // fall back to the MDA chain exactly as before.
   let mda: MdaResult | undefined;
   const aa = attestation.appAttest;
-  const appAttestBinds =
-    !!aa &&
-    !!aa.object &&
-    !!aa.keyId &&
-    verifyAppAttestB64(aa.object, aa.keyId, attestation.publicKey, APP_ATTEST_APP_ID, {
-      trustAnchorDer: opts.appAttestTrustAnchorDer,
-      allowDevelopment: opts.allowDevelopmentAppAttest,
-      now,
-    });
+  // Verify the App Attest object once and keep the rich result: we need both
+  // whether it BINDS (genuine SE key vouched for this signing key → satisfies
+  // hardware-attested) and whether the attested key IS the signing key (→ the
+  // residency predicate for confidential; see below).
+  let aaResult: AppAttestResult | undefined;
+  if (aa?.object && aa?.keyId) {
+    try {
+      aaResult = verifyAppAttest(
+        base64ToBytes(aa.object),
+        base64ToBytes(aa.keyId),
+        base64ToBytes(attestation.publicKey),
+        APP_ATTEST_APP_ID,
+        {
+          trustAnchorDer: opts.appAttestTrustAnchorDer,
+          allowDevelopment: opts.allowDevelopmentAppAttest,
+          now,
+        },
+      );
+    } catch (e) {
+      if (!(e instanceof AppAttestError)) throw e;
+      // an AppAttestError just means "doesn't bind" → aaResult stays undefined
+    }
+  }
+  const appAttestBinds = aaResult?.valid === true && aaResult.bindsSigningKey === true;
+  // Residency: the attested SE key must EQUAL the signing key, not merely commit
+  // to it via clientData (a genuine SE key can attest a pointer to a separate
+  // software signing key — still portable). Only equality proves the signing
+  // private key itself is non-exportable.
+  const keyIsHardwareResident =
+    appAttestBinds &&
+    attestedKeyMatchesSigningKey(aaResult!.attestedPubkeyUncompressed, attestation.publicKey);
 
   if (appAttestBinds) {
     // Hardware-attested via App Attest; no MDA chain required.
@@ -292,6 +385,41 @@ export async function verifyProviderForSeal(
         }
       }
     }
+  }
+
+  // --- 2b. Key residency: the signing key must be provably non-exportable. ---
+  // The MDA-chain path (even bound via freshness code) only proves a genuine
+  // Apple device once vouched for this PUBLIC key — it says NOTHING about whether
+  // the PRIVATE key can leave the machine. Since the agent's signing key can be
+  // an exportable software key (`identity.pem`), an operator with one genuine
+  // Apple device can mint a bound MDA chain for a software key and run that whole
+  // identity — key, chain, blessed cdHash — on any non-Apple host (the 2026-07-05
+  // "Strix in a trenchcoat" spoof).
+  //
+  // Requiring a bound App Attest object is the FIRST rung: it forces a genuine
+  // Apple Secure Enclave key to attest a commitment to this signing key. NOTE
+  // (ADR-0003): a bound App Attest object alone is necessary but NOT sufficient —
+  // App Attest binds via `clientDataHash = sha256(publicKey)` and checks
+  // `keyId == sha256(ATTESTED key)`, never that the attested SE key IS the
+  // signing key. So a pointer-bound object is still portable (mint it once on a
+  // real device against a software signing key). The SUFFICIENT fix is
+  // assertion-based signing where the App Attest key IS the identity
+  // (`keyId == sha256(publicKey)` + receipt/attestation signatures are App Attest
+  // assertions, not raw ECDSA) — the provider re-architecture ADR-0003 sequences
+  // behind this same gate. Confidential-only: a genuine-Apple MDA machine that
+  // isn't App-Attest-bound is capped at hardware-attested (this is NOT a hardware
+  // blocker), never dropped to best-effort.
+  if (requireHardwareBoundKey && !keyIsHardwareResident) {
+    block(
+      "key-not-hardware-bound",
+      appAttestBinds
+        ? "App Attest object is present but its attested Secure-Enclave key is NOT the signing " +
+            "key (keyId != sha256(publicKey)) — it only points at the signing key via clientData, " +
+            "so the signing private key is still exportable/portable to another host"
+        : "signing key is not proven Secure-Enclave-resident: no bound App Attest object whose " +
+            "attested key is the signing key (an MDA-freshness binding attests the device that " +
+            "vouched for the public key, not that the private key is non-exportable)",
+    );
   }
 
   // --- 3. Measured cdHash is in the known-good set. ---
@@ -406,13 +534,8 @@ export async function verifyProviderForSeal(
         "session key is not bound to the supplied attestation CID",
       );
     }
-    let sigOk = false;
-    try {
-      sigOk = await verifyP256(attestation.publicKey, sk.signature, sessionKeyMessage(sk));
-    } catch (e) {
-      if (!(e instanceof SignatureVerifyError)) throw e;
-      sigOk = false;
-    }
+    // Same identity, same sigScheme dispatch as selfSignature.
+    const sigOk = await verifyIdentitySig(sk.signature, sessionKeyMessage(sk));
     if (!sigOk) {
       block(
         "session-signature-invalid",

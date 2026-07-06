@@ -29,6 +29,7 @@ import { makeRuntime, record } from "@cocore/o11y";
 import { bearer, err, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
 
 import { loadApnsConfig } from "./apns.ts";
+import { brokerageDidDocument, loadBrokerageAuthority } from "./brokerage.ts";
 import { handleConnection } from "./connection.ts";
 import { type DidDocumentResolver, LXM_CONTROL, verifyServiceAuthToken } from "./did-auth.ts";
 import { jobsRoute } from "./jobs.ts";
@@ -267,6 +268,20 @@ async function main(): Promise<void> {
       "[advisor] APNs code-identity capability OFF (APNS_* unset) — confidential tier unavailable",
     );
   }
+  // ADR-0004: the brokerage authority. When configured, the advisor countersigns
+  // each dispatch; requesters that trust this authority DID accept the resulting
+  // receipts as confidential. The public key is logged so ops can publish it in
+  // the authority's DID document (what the SDK verifier resolves).
+  const brokerage = loadBrokerageAuthority();
+  if (brokerage) {
+    console.error(
+      `[advisor] brokerage authority ON did=${brokerage.did} publicKey=${brokerage.publicKeyB64} (publish this key in the DID doc)`,
+    );
+  } else {
+    console.error(
+      "[advisor] brokerage authority OFF (COCORE_BROKERAGE_SIGNING_KEY_PEM unset) — receipts carry no countersignature",
+    );
+  }
   // DID-bound auth mode (C1 / M3). Three states:
   //   * no COCORE_ADVISOR_DID → auth OFF (legacy: any client can register).
   //   * ADVISOR_DID set, REQUIRE_AUTH false → staged rollout: a present JWT is
@@ -363,6 +378,17 @@ async function main(): Promise<void> {
       ).pipe(Effect.withSpan("advisor.healthz")),
     ),
     HttpRouter.get(
+      // ADR-0004: serve this brokerage's DID document so a did:web verifier
+      // resolves the P-256 key its countersignatures are checked against. 404
+      // until a brokerage authority is configured.
+      "/.well-known/did.json",
+      Effect.sync(() =>
+        brokerage
+          ? ok(brokerageDidDocument(brokerage.did, brokerage.publicKeyB64))
+          : err(404, { error: "no brokerage authority configured" }),
+      ).pipe(Effect.withSpan("advisor.did-document")),
+    ),
+    HttpRouter.get(
       "/ttft",
       // Time-to-first-token over the last ~100 jobs (received → first chunk
       // relayed). Distinct from a receipt's completedAt − startedAt (total
@@ -433,6 +459,10 @@ async function main(): Promise<void> {
               challengeVerifiedSip: p.challengeVerifiedSip,
               codeAttested: p.codeAttested,
             },
+            // C1: whether this registration proved control of its DID. `false`
+            // means the console recompute caps it at best-effort (soft cutover
+            // — it still serves, just not at an attested tier).
+            registrationAuthenticated: p.registrationAuthenticated,
             // Tool calling: verified by the provider's startup canary. The
             // per-model subset lets clients avoid treating one verified model
             // as capability for every model on the machine.
@@ -485,6 +515,9 @@ async function main(): Promise<void> {
           // route keeps serving the rolling in-memory window).
           record(runtime, Metric.update(ackMs, ms));
         },
+        // ADR-0004: countersign dispatches so receipts can prove a trusted
+        // brokerage routed the job to the attested machine.
+        brokerage,
       }),
     ),
   );

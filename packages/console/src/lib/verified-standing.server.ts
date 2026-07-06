@@ -55,6 +55,26 @@ interface AdvisorRow {
   attestedAt?: string | null;
   confidentialEligible?: boolean;
   codeAttested?: boolean;
+  /** C1: did the machine present a valid DID-bound service-auth JWT at
+   *  register? `false` means the advisor admitted it (soft cutover — it still
+   *  serves best-effort) but could not confirm it controls `did`, so we can't
+   *  trust it's the genuine owner of the attestation we'd fetch. `undefined` =
+   *  a pre-signal advisor; treated as authenticated so an advisor upgrade
+   *  doesn't mass-downgrade a healthy fleet. Only an explicit `false`
+   *  downgrades. */
+  registrationAuthenticated?: boolean;
+}
+
+/** Phase gate for the App Attest key-residency requirement on the confidential
+ *  tier. Default OFF (Phase 1 — deploy the code dormant while the provider fleet
+ *  ships App Attest). Ops flips `COCORE_CONFIDENTIAL_REQUIRE_APP_ATTEST=true`
+ *  for Phase 2: a machine whose signing key isn't proven Secure-Enclave-bound
+ *  then DOWNGRADES from confidential to hardware-attested (it keeps serving —
+ *  nothing disconnects), and confidential requesters fail closed rather than
+ *  route to a portable-key machine. The flip only affects machines that haven't
+ *  upgraded, never healthy App-Attest ones — the soft cutover. */
+function confidentialRequiresAppAttest(): boolean {
+  return process.env["COCORE_CONFIDENTIAL_REQUIRE_APP_ATTEST"] === "true";
 }
 
 // Codes the SDK verifier emits when the OFFLINE hardware-attestation proof
@@ -69,8 +89,17 @@ export const HARDWARE_BLOCKER_CODES = new Set([
   "no-mda-chain",
 ]);
 
-// offline proof (hardware-attested?) keyed by attestation CID — immutable.
-const offlineTierCache = new Map<string, "hardware-attested" | "best-effort">();
+/** The offline (Apple-crypto) evidence a fetched attestation yields, cached by
+ *  attestation CID (immutable — a machine's attestation only changes when it
+ *  re-attests). `hardware` is whether it proves genuine Apple hardware bound to
+ *  the signing key; `keyHardwareBound` is whether that key is proven
+ *  Secure-Enclave-resident (a valid bound App Attest object) rather than a
+ *  possibly-exportable software key with only an MDA chain. */
+interface OfflineEvidence {
+  hardware: "hardware-attested" | "best-effort";
+  keyHardwareBound: boolean;
+}
+const offlineTierCache = new Map<string, OfflineEvidence>();
 
 function advisorBase(): string {
   return cocoreConfig().advisorUrl.replace(/\/$/, "");
@@ -118,42 +147,93 @@ async function fetchAttestation(
 }
 
 /** The offline half: does the signed attestation prove genuine Apple hardware
- *  bound to the signing key? Cached per attestation CID. */
-async function offlineHardwareTier(
-  did: string,
-  attestationUri: string,
-): Promise<"hardware-attested" | "best-effort"> {
+ *  bound to the signing key, and is that key proven Secure-Enclave-resident?
+ *  Cached per attestation CID. */
+async function offlineEvidence(did: string, attestationUri: string): Promise<OfflineEvidence> {
   const fetched = await fetchAttestation(did, attestationUri);
-  if (!fetched) return "best-effort";
+  if (!fetched) return { hardware: "best-effort", keyHardwareBound: false };
   const cached = offlineTierCache.get(fetched.cid);
   if (cached) return cached;
 
   const record = fetched.record;
   const mdaChain = (record as { mdaCertChain?: string[] }).mdaCertChain;
   let hardwareOk = false;
+  let keyHardwareBound = false;
   try {
-    // requireConfidential:false → compute the tier without hard-failing; we
-    // only read the findings to see if the hardware-attestation gates passed.
-    const result = await verifyProviderForSeal(record, mdaChain, { requireConfidential: false });
+    // requireConfidential:false → compute without hard-failing; we read the
+    // findings. requireHardwareBoundKey:true → the verifier always emits the
+    // `key-not-hardware-bound` finding when there's no bound App Attest object,
+    // so we can learn key residency here regardless of the production phase gate.
+    const result = await verifyProviderForSeal(record, mdaChain, {
+      requireConfidential: false,
+      requireHardwareBoundKey: true,
+    });
     hardwareOk = !result.findings.some((f) => HARDWARE_BLOCKER_CODES.has(f.code));
+    keyHardwareBound = !result.findings.some((f) => f.code === "key-not-hardware-bound");
   } catch {
     hardwareOk = false;
+    keyHardwareBound = false;
   }
-  const tier = hardwareOk ? "hardware-attested" : "best-effort";
-  offlineTierCache.set(fetched.cid, tier);
-  return tier;
+  const evidence: OfflineEvidence = {
+    hardware: hardwareOk ? "hardware-attested" : "best-effort",
+    keyHardwareBound,
+  };
+  offlineTierCache.set(fetched.cid, evidence);
+  return evidence;
 }
 
-/** Recompute a machine's tier from its actual attestation (offline proof) +
- *  the advisor's live measured confidential standing. Never trusts the
- *  self-asserted trustLevel. */
+/** A recomputed tier plus, when the machine was capped BELOW what it asked for,
+ *  a short operator-facing reason (the "why not confidential / why best-effort"
+ *  nudge). `reason` is undefined when the machine is at its ceiling. */
+export interface ResolvedTier {
+  tier: VerifiedTier;
+  reason?: string;
+}
+
+/** Recompute a machine's tier from its actual attestation (offline proof) + the
+ *  advisor's live measured standing. Never trusts the self-asserted trustLevel.
+ *  Every shortfall is a DOWNGRADE with a reason, never a hard failure — the
+ *  machine keeps whatever weaker tier it earned and keeps serving. */
+export async function resolveVerifiedTier(row: AdvisorRow): Promise<ResolvedTier> {
+  if (!row.attestationUri) return { tier: "best-effort", reason: "no attestation published" };
+
+  // C1 (soft cutover): a registration the advisor couldn't DID-authenticate
+  // can't be trusted to be the genuine owner of the attestation record we'd
+  // fetch, so it can't earn an attested tier. It still serves best-effort — we
+  // downgrade, we don't disconnect. `undefined` (pre-signal advisor) is treated
+  // as authenticated so an advisor rollout doesn't mass-downgrade the fleet.
+  if (row.registrationAuthenticated === false) {
+    return {
+      tier: "best-effort",
+      reason: "registration not DID-authenticated — upgrade the agent so it mints a register token",
+    };
+  }
+
+  const offline = await offlineEvidence(row.did, row.attestationUri);
+  if (offline.hardware === "best-effort") {
+    return { tier: "best-effort", reason: "attestation does not prove genuine Apple hardware" };
+  }
+
+  // Genuine Apple hardware bound to the signing key. Confidential additionally
+  // needs the advisor's measured + code-attested standing (the un-forgeable
+  // leg) AND — once the App Attest rollout is enforced — proof the signing key
+  // is Secure-Enclave-resident (not a portable software key).
+  if (row.confidentialEligible !== true) {
+    return { tier: "hardware-attested" };
+  }
+  if (confidentialRequiresAppAttest() && !offline.keyHardwareBound) {
+    return {
+      tier: "hardware-attested",
+      reason:
+        "confidential requires a Secure-Enclave (App Attest) signing key — upgrade to an App-Attest build to regain confidential",
+    };
+  }
+  return { tier: "attested-confidential" };
+}
+
+/** Back-compat thin wrapper: the tier alone. */
 export async function verifiedTierFor(row: AdvisorRow): Promise<VerifiedTier> {
-  if (!row.attestationUri) return "best-effort";
-  const offline = await offlineHardwareTier(row.did, row.attestationUri);
-  if (offline === "best-effort") return "best-effort";
-  // Genuine Apple hardware bound to the key. Confidential additionally needs
-  // the advisor's measured + code-attested standing (the un-forgeable leg).
-  return row.confidentialEligible === true ? "attested-confidential" : "hardware-attested";
+  return (await resolveVerifiedTier(row)).tier;
 }
 
 /** Set of MACHINE keys (`${did}:${machineId}`) whose VERIFIED tier meets

@@ -24,6 +24,7 @@ from typing import Optional
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -191,6 +192,67 @@ def verify_app_attest_b64(
         return res.valid and res.binds_signing_key
     except AppAttestError:
         return False
+
+
+def verify_app_attest_assertion(
+    public_key_b64: str,
+    assertion_b64: str,
+    message: bytes,
+    app_id: str,
+) -> bool:
+    """Verify an App Attest ASSERTION (ADR-0003) over ``message``, against the SE
+    key that IS the signing identity (``public_key_b64`` = the attestation's raw
+    64-byte X||Y publicKey). Checks the ES256 signature over
+    ``authenticatorData || sha256(message)`` and rpIdHash == sha256(app_id).
+    Returns False (never raises) on any shape/verify failure. Mirror of
+    ``verifyAppAttestAssertion`` in appattest.ts."""
+    try:
+        top, _ = _cbor_read(base64.b64decode(assertion_b64), 0)
+    except (AppAttestError, ValueError):
+        return False
+    if not isinstance(top, dict):
+        return False
+    signature = top.get("signature")
+    auth_data = top.get("authenticatorData")
+    if not isinstance(signature, (bytes, bytearray)) or not isinstance(auth_data, (bytes, bytearray)):
+        return False
+    signature = bytes(signature)
+    auth_data = bytes(auth_data)
+    # authenticatorData = rpIdHash(32) | flags(1) | signCount(4); assertions omit
+    # attested-credential-data, so 37 bytes is the minimum.
+    if len(auth_data) < 37:
+        return False
+    if not hmac.compare_digest(auth_data[:32], hashlib.sha256(app_id.encode()).digest()):
+        return False
+    signed = auth_data + hashlib.sha256(message).digest()
+    try:
+        raw = base64.b64decode(public_key_b64)
+        if len(raw) != 64:
+            return False
+        pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), b"\x04" + raw)
+        pub.verify(signature, signed, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def attested_key_matches_signing_key(
+    attested_uncompressed: bytes, signing_pubkey_b64: str
+) -> bool:
+    """Residency predicate (ADR-0003): does the App-Attest-attested key EQUAL the
+    signing key? ``attested_uncompressed`` is the 65-byte 0x04||X||Y; the signing
+    key is the attestation's raw 64-byte X||Y. Mirror of
+    ``attestedKeyMatchesSigningKey`` in appattest.ts."""
+    try:
+        sig = base64.b64decode(signing_pubkey_b64)
+    except (ValueError, TypeError):
+        return False
+    return (
+        len(attested_uncompressed) == 65
+        and len(sig) == 64
+        and attested_uncompressed[0] == 0x04
+        and hmac.compare_digest(attested_uncompressed[1:], sig)
+    )
 
 
 # ---- internals -------------------------------------------------------

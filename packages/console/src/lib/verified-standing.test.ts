@@ -98,3 +98,69 @@ describe("HARDWARE_BLOCKER_CODES tracks the SDK's actual finding codes", () => {
     expect(codes.some((c) => HARDWARE_BLOCKER_CODES.has(c))).toBe(true);
   });
 });
+
+// Key residency (ADR-0003): confidential requires a Secure-Enclave-resident
+// signing key (a bound App Attest object). A record without one is flagged with
+// `key-not-hardware-bound`, but that code must DOWNGRADE confidential to
+// hardware-attested — never drop the machine to best-effort — so it must NOT be
+// a hardware blocker.
+describe("key-not-hardware-bound residency gate", () => {
+  function signedRecord(): AttestationRecord {
+    const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string };
+    const pubB64 = Buffer.concat([
+      Buffer.from(jwk.x, "base64url"),
+      Buffer.from(jwk.y, "base64url"),
+    ]).toString("base64");
+    const unsigned: Omit<AttestationRecord, "selfSignature"> = {
+      publicKey: pubB64,
+      encryptionPubKey: "ZW5jcnlwdGlvbktleQ==",
+      chipName: "generic-linux",
+      hardwareModel: "linux",
+      serialNumberHash: "0".repeat(64),
+      osVersion: "Linux 6.12",
+      binaryHash: "1".repeat(64),
+      cdHash: "a".repeat(40),
+      teamId: "TEAM123456",
+      hardenedRuntime: true,
+      libraryValidation: true,
+      getTaskAllow: false,
+      inProcessBackend: true,
+      antiDebug: true,
+      coreDumpsDisabled: true,
+      envScrubbed: true,
+      sipEnabled: true,
+      secureBootEnabled: true,
+      secureEnclaveAvailable: false,
+      authenticatedRootEnabled: false,
+      attestedAt: "2026-06-19T00:00:00Z",
+      expiresAt: "2026-06-20T00:00:00Z",
+    };
+    return {
+      ...unsigned,
+      selfSignature: nodeSign(
+        "SHA256",
+        Buffer.from(new TextEncoder().encode(canonicalize(unsigned))),
+        privateKey,
+      ).toString("base64"),
+    };
+  }
+
+  it("`key-not-hardware-bound` is NOT a hardware blocker (caps confidential, keeps hardware-attested)", () => {
+    expect(HARDWARE_BLOCKER_CODES.has("key-not-hardware-bound")).toBe(false);
+  });
+
+  it("emits the finding under requireHardwareBoundKey:true, absent by default (ADR-0004 retired it)", async () => {
+    const rec = signedRecord();
+    const now = () => new Date("2026-06-19T12:00:00Z");
+
+    // Opt-in (a future confidential-compute backend) → the gate fires.
+    const on = await verifyProviderForSeal(rec, undefined, { now, requireHardwareBoundKey: true });
+    expect(on.findings.map((f) => f.code)).toContain("key-not-hardware-bound");
+
+    // ADR-0004 default: App Attest is retired for the Mac tier, so the gate is
+    // off unless explicitly requested.
+    const off = await verifyProviderForSeal(rec, undefined, { now });
+    expect(off.findings.map((f) => f.code)).not.toContain("key-not-hardware-bound");
+  });
+});

@@ -11,6 +11,7 @@
 // `p256::ecdsa::Signer for SigningKey` default and Apple's
 // `P256.Signing.PrivateKey.signature(for:)`.
 
+import { APP_ATTEST_APP_ID, verifyAppAttestAssertion } from "./appattest.ts";
 import { canonicalize } from "./canonical.ts";
 
 export class SignatureVerifyError extends Error {
@@ -91,11 +92,29 @@ export async function verifyP256(
 export async function verifyReceiptSignature(
   receipt: { enclaveSignature?: string } & Record<string, unknown>,
   attestationPublicKeyB64: string,
+  // ADR-0003: the receipt's enclaveSignature is signed by the attestation
+  // identity, so it follows the ATTESTATION's `sigScheme`. Pass it from the
+  // attestation record: 'appattest-assertion' verifies the signature as an App
+  // Attest assertion (the non-exportable-key form); absent/'p256' is the raw
+  // ECDSA default (unchanged for every existing receipt).
+  sigScheme?: string,
 ): Promise<boolean> {
   const sig = receipt.enclaveSignature;
   if (!sig) return false;
-  const { enclaveSignature: _omit, $type: _type, ...signed } = receipt as Record<string, unknown>;
+  // Strip fields NOT covered by the provider's enclaveSignature: the lexicon
+  // `$type` framing, the signature itself, and (ADR-0004) the
+  // `brokerageCountersignature` — that's signed by the brokerage, not the
+  // provider, and added after the provider signs.
+  const {
+    enclaveSignature: _omit,
+    $type: _type,
+    brokerageCountersignature: _cs,
+    ...signed
+  } = receipt as Record<string, unknown>;
   const message = new TextEncoder().encode(canonicalize(signed));
+  if (sigScheme === "appattest-assertion") {
+    return verifyAppAttestAssertion(attestationPublicKeyB64, sig, message, APP_ATTEST_APP_ID);
+  }
   try {
     return await verifyP256(attestationPublicKeyB64, sig, message);
   } catch (e) {

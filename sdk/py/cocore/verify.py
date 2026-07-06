@@ -22,7 +22,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
-from .appattest import APP_ATTEST_APP_ID, verify_app_attest_b64
+from .appattest import (
+    APP_ATTEST_APP_ID,
+    AppAttestError,
+    attested_key_matches_signing_key,
+    verify_app_attest,
+    verify_app_attest_assertion,
+)
 from .canonical import canonical_bytes
 from .mda import MdaError, verify_chain, verify_chain_against
 from .p256 import verify_attestation_signature, verify_p256
@@ -69,6 +75,12 @@ def verify_provider_for_seal(
     # proof unless explicitly opted out (the cdHash is self-reported; the
     # AMFI-gated push is the one leg an operator can't forge). Mirrors the TS SDK.
     require_code_attested: bool = True,
+    # Key residency. ADR-0004 RETIRES this gate for the Mac tier: App Attest does
+    # not function on macOS (ADR-0003 update), so no Mac provider can satisfy it.
+    # Confidential residency now rests on the BROKERAGE COUNTERSIGNATURE checked at
+    # receipt-validation time (cocore.brokerage). Default False; kept opt-in for a
+    # future confidential-compute backend. Mirrors the TS SDK.
+    require_hardware_bound_key: bool = False,
     trust_anchor_der: Optional[bytes] = None,
     app_attest_trust_anchor_der: Optional[bytes] = None,
     allow_development_app_attest: bool = False,
@@ -83,9 +95,28 @@ def verify_provider_for_seal(
     def block(code: str, message: str) -> None:
         blockers.append((code, message))
 
+    # A signature "by the attestation identity" (selfSignature, session key)
+    # dispatches on sigScheme (ADR-0003): raw ECDSA-P256 by default, or an App
+    # Attest assertion over `message` when the identity is the SE App Attest key
+    # — the form that proves the private key is non-exportable. Mirror of
+    # verifyIdentitySig in verify-provider.ts.
+    sig_scheme = attestation.get("sigScheme")
+
+    def _verify_identity_sig(sig_b64: str, message: bytes) -> bool:
+        pub = attestation.get("publicKey", "")
+        if sig_scheme == "appattest-assertion":
+            return verify_app_attest_assertion(pub, sig_b64, message, APP_ATTEST_APP_ID)
+        return verify_p256(pub, sig_b64, message)
+
     # 0. The attestation must be self-signed by its own publicKey — this
     #    authenticates every posture field below.
-    if not verify_attestation_signature(attestation, attestation.get("publicKey", "")):
+    if sig_scheme == "appattest-assertion":
+        self_sig = attestation.get("selfSignature", "")
+        body = {k: v for k, v in attestation.items() if k not in ("selfSignature", "$type")}
+        self_ok = bool(self_sig) and _verify_identity_sig(self_sig, canonical_bytes(body))
+    else:
+        self_ok = verify_attestation_signature(attestation, attestation.get("publicKey", ""))
+    if not self_ok:
         block(
             "attestation-signature-invalid",
             "attestation.selfSignature did not verify against attestation.publicKey",
@@ -99,19 +130,31 @@ def verify_provider_for_seal(
     mda = None
     pub_b64 = attestation.get("publicKey", "")
     aa = attestation.get("appAttest")
-    app_attest_binds = bool(
-        aa
-        and aa.get("object")
-        and aa.get("keyId")
-        and verify_app_attest_b64(
-            aa["object"],
-            aa["keyId"],
-            pub_b64,
-            APP_ATTEST_APP_ID,
-            trust_anchor_der=app_attest_trust_anchor_der,
-            allow_development=allow_development_app_attest,
-            now=now,
-        )
+    # Verify the App Attest object once and keep the rich result: we need both
+    # whether it BINDS (→ hardware-attested) and whether the attested SE key IS
+    # the signing key (→ the residency predicate for confidential; see below).
+    aa_result = None
+    if aa and aa.get("object") and aa.get("keyId"):
+        try:
+            aa_result = verify_app_attest(
+                base64.b64decode(aa["object"]),
+                base64.b64decode(aa["keyId"]),
+                base64.b64decode(pub_b64),
+                APP_ATTEST_APP_ID,
+                trust_anchor_der=app_attest_trust_anchor_der,
+                allow_development=allow_development_app_attest,
+                now=now,
+            )
+        except AppAttestError:
+            aa_result = None
+    app_attest_binds = bool(aa_result and aa_result.valid and aa_result.binds_signing_key)
+    # Residency: the attested key must EQUAL the signing key, not merely commit to
+    # it via clientData (a genuine SE key can attest a pointer to a separate
+    # software signing key — still portable). Only equality proves the signing
+    # private key itself is non-exportable.
+    key_is_hardware_resident = bool(
+        app_attest_binds
+        and attested_key_matches_signing_key(aa_result.attested_pubkey_uncompressed, pub_b64)
     )
 
     if app_attest_binds:
@@ -150,6 +193,26 @@ def verify_provider_for_seal(
                         "mda-unbound",
                         "MDA chain is not bound to attestation.publicKey (neither leaf-key nor freshness-code binding holds)",
                     )
+
+    # 2b. Key residency: the signing key must be provably non-exportable.
+    # `key_is_hardware_resident` requires a bound App Attest object WHOSE ATTESTED
+    # KEY IS the signing key (keyId == sha256(publicKey)). A mere binding (object
+    # present, or an MDA freshness code) only proves a genuine Apple device
+    # vouched for the PUBLIC key — a software private key with such a proof is
+    # portable to a non-Apple host (the 2026-07-05 spoof). Confidential-only: NOT
+    # a hardware blocker, so an MDA-only / pointer-bound machine caps at
+    # hardware-attested rather than dropping to best-effort.
+    if require_hardware_bound_key and not key_is_hardware_resident:
+        block(
+            "key-not-hardware-bound",
+            "App Attest object is present but its attested Secure-Enclave key is NOT the signing "
+            "key (keyId != sha256(publicKey)) — it only points at the signing key via clientData, "
+            "so the signing private key is still exportable/portable"
+            if app_attest_binds
+            else "signing key is not proven Secure-Enclave-resident: no bound App Attest object "
+            "whose attested key is the signing key (an MDA-freshness binding attests the device "
+            "that vouched for the public key, not that the private key is non-exportable)",
+        )
 
     # 3. cdHash in the known-good set.
     cd = attestation.get("cdHash")
@@ -216,8 +279,7 @@ def verify_provider_for_seal(
             block("session-nonce-mismatch", "session key nonce does not match the request nonce")
         if not attestation_cid or session_key.get("attestationCid") != attestation_cid:
             block("session-attestation-mismatch", "session key not bound to the attestation CID")
-        if not verify_p256(
-            attestation.get("publicKey", ""),
+        if not _verify_identity_sig(
             session_key.get("signature", ""),
             session_key_message(session_key),
         ):

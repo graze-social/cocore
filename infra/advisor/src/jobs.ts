@@ -29,6 +29,7 @@ import { Effect, Exit, Mailbox, Metric, Stream } from "effect";
 
 import { err } from "@cocore/o11y/http";
 
+import type { BrokerageAuthority } from "./brokerage.ts";
 import { dispatchOutcome } from "./metrics.ts";
 import type { AdvisorMessage, InferenceRequest } from "./protocol.ts";
 import { supportsToolCallsFor } from "./registry.ts";
@@ -257,6 +258,12 @@ export interface JobsContext {
    *  provider's socket). The brokerage-latency headline; main.ts feeds it
    *  into the rolling window the `/ack` route serves + an OTLP histogram. */
   onDispatched?: (ms: number) => void;
+  /** ADR-0004: the brokerage authority. When set (and the job carries the
+   *  fields needed to bind it), the advisor countersigns each dispatch and
+   *  attaches the block to the `inference_request`; the provider embeds it on
+   *  the receipt. Null → no countersignature (confidential unavailable through
+   *  this brokerage). */
+  brokerage?: BrokerageAuthority | null;
 }
 
 /** Outcome of selecting + preflighting a provider for a parsed job. */
@@ -459,6 +466,22 @@ function dispatch(
     receivedAt,
   );
 
+  // ADR-0004: countersign this dispatch so the receipt can prove a trusted
+  // brokerage routed THIS job to the attested machine. We can only bind when the
+  // job carries a jobCid and the chosen provider has a published attestation URI
+  // (both are part of the canonical witness); otherwise we attach nothing and
+  // the receipt is best-effort through this brokerage.
+  const countersignature =
+    ctx.brokerage && job.jobCid && provider.attestationUri
+      ? ctx.brokerage.sign({
+          jobUri: job.jobUri,
+          jobCid: job.jobCid,
+          machineId: provider.machineId,
+          attestation: provider.attestationUri,
+          requester: job.requesterDid,
+        })
+      : undefined;
+
   const inferenceFrame: AdvisorMessage = {
     type: "inference_request",
     job_uri: job.jobUri,
@@ -472,6 +495,7 @@ function dispatch(
     ...(job.outputSchema ? { output_schema: job.outputSchema } : {}),
     ...(job.tools ? { tools: job.tools } : {}),
     ...(job.toolChoice ? { tool_choice: job.toolChoice } : {}),
+    ...(countersignature ? { brokerage_countersignature: countersignature } : {}),
     session_id: job.sessionId,
   } as InferenceRequest & { type: "inference_request" };
 

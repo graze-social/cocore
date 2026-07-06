@@ -588,6 +588,12 @@ export function MachineDetail({ rkey }: { rkey: string }) {
                   ? "Upgrade pending — opted in; finishing on the next serve"
                   : "Best-effort — fast, but the operator can read prompts"}
             </dd>
+            {m.verifiedTierReason ? (
+              <>
+                <dt {...stylex.props(styles.kvDt)}>Tier capped</dt>
+                <dd {...stylex.props(styles.kvDd)}>⚠️ {m.verifiedTierReason}</dd>
+              </>
+            ) : null}
             <dt {...stylex.props(styles.kvDt)}>Supported models</dt>
             <dd {...stylex.props(styles.kvDd)}>
               {m.supportedModels && m.supportedModels.length > 0

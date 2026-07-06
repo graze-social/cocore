@@ -79,6 +79,8 @@ export interface TokenPatronageRecord {
 export interface AttestationRecord {
   publicKey: string;
   encryptionPubKey: string;
+  sigScheme?: "p256" | "appattest-assertion";
+  encScheme?: "x25519" | "p256-ecies-se";
   chipName: string;
   hardwareModel: string;
   serialNumberHash: string;
@@ -236,6 +238,7 @@ export interface ReceiptRecord {
   enclaveSignature: string;
   tier?: Tier;
   proBono?: boolean;
+  brokerageCountersignature?: Record<string, unknown>;
 }
 
 export interface SettlementRecord {

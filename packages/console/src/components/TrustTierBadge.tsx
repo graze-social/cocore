@@ -11,7 +11,7 @@ import { Badge } from "@/design-system/badge";
 export type TrustTier = "best-effort" | "hardware-attested" | "attested-confidential";
 
 const CONFIDENTIAL_TITLE =
-  "Confidential tier (experimental). Aims to keep prompts unreadable to the machine's operator by running them inside the measured, signed agent — a hardened-runtime posture, not a hardware enclave, and not independently audited. A compromised OS or a substituted build could still expose the prompt, so don't send anything you'd need kept private.";
+  "Confidential tier (experimental). A trusted brokerage routed this job to genuine Apple hardware running the measured, signed agent under a hardened runtime, and countersigned the receipt to prove it. It aims to keep prompts unreadable to the operator — a raised bar, not a hardware guarantee: Apple Silicon has no enclave for general compute, so a compromised kernel or physical access could still expose the prompt. Don't send anything you'd need cryptographically kept private.";
 
 const HARDWARE_TITLE =
   "Hardware-attested (experimental). A best-effort signal, recomputed from this machine's signed Apple-rooted attestation chain, that it's genuine Apple hardware. Treat it as a useful hint, not a guarantee.";

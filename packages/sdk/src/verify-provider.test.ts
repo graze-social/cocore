@@ -427,6 +427,11 @@ test.skipIf(!existsSync(CONF_APPATTEST_FIXTURE))(
     const noKey = await verifyProviderForSeal(att, undefined, {
       requireConfidential: true,
       requireCodeAttested: false,
+      // This fixture's App Attest object binds via clientData to a SEPARATE
+      // signing key (keyId != sha256(publicKey)) — the pointer form, which
+      // ADR-0003's residency gate now rejects for confidential. The test
+      // exercises object verification, not the residency identity, so opt out.
+      requireHardwareBoundKey: false,
       knownGoodCdHashes: [f.knownGoodCdHash],
       knownGoodMetallibHashes: [f.knownGoodMetallibHash],
       knownGoodEngineLibHashes: [f.knownGoodEngineLibHash],
@@ -477,6 +482,11 @@ test.skipIf(!existsSync(CONF_FIXTURE))(
       // MDA chain + session key); the live APNs code-identity leg is asserted
       // separately by the advisor, so opt out of it here.
       requireCodeAttested: false,
+      // This fixture predates the App Attest key-residency gate (ADR-0003) and
+      // binds via the MDA freshness path, which now caps at hardware-attested.
+      // Its purpose is cross-language signing parity, not residency policy, so
+      // opt out of the residency gate to keep exercising the crypto it tests.
+      requireHardwareBoundKey: false,
       knownGoodCdHashes: [f.knownGoodCdHash],
       knownGoodMetallibHashes: [f.knownGoodMetallibHash],
       knownGoodEngineLibHashes: [f.knownGoodEngineLibHash],
@@ -500,6 +510,8 @@ test.skipIf(!existsSync(CONF_FIXTURE))(
     const noKey = await verifyProviderForSeal(att, chain, {
       requireConfidential: true,
       requireCodeAttested: false,
+      // MDA-freshness fixture — opt out of the ADR-0003 residency gate (see above).
+      requireHardwareBoundKey: false,
       knownGoodCdHashes: [f.knownGoodCdHash],
       knownGoodMetallibHashes: [f.knownGoodMetallibHash],
       osFloor: f.osFloor,
@@ -546,4 +558,64 @@ test("freshnessBindsKey: binds iff freshness == sha256(publicKey), wrapper-toler
   // Missing/empty freshness → false, never throws.
   assert.equal(await freshnessBindsKey(undefined, pubB64), false);
   assert.equal(await freshnessBindsKey(new Uint8Array(0), pubB64), false);
+});
+
+// --- sigScheme dispatch: selfSignature as an App Attest assertion (ADR-0003) ---
+// A provider whose signing identity IS the SE App Attest key signs the record
+// with an assertion, not raw ECDSA. Gate #0 must verify it as an assertion when
+// sigScheme says so — and still catch a tamper (the assertion commits to the
+// canonical body via clientDataHash).
+test("sigScheme 'appattest-assertion': selfSignature verifies as an assertion, tamper still caught", async () => {
+  const APP_ID = "4L45P7CP9M.dev.cocore.provider";
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string };
+  const pubB64 = Buffer.concat([
+    Buffer.from(jwk.x, "base64url"),
+    Buffer.from(jwk.y, "base64url"),
+  ]).toString("base64");
+  const sha = (b: Uint8Array): Buffer => createHash("sha256").update(Buffer.from(b)).digest();
+  const bstr = (b: Buffer): Buffer =>
+    b.length < 24
+      ? Buffer.concat([Buffer.from([0x40 | b.length]), b])
+      : Buffer.concat([Buffer.from([0x58, b.length]), b]);
+  const tstr = (s: string): Buffer => {
+    const b = Buffer.from(s, "utf8");
+    return Buffer.concat([Buffer.from([0x60 | b.length]), b]);
+  };
+  const assertionOver = (msg: Uint8Array): string => {
+    const authData = Buffer.concat([
+      sha(new TextEncoder().encode(APP_ID)),
+      Buffer.from([0, 0, 0, 0, 1]),
+    ]);
+    const signature = nodeSign("SHA256", Buffer.concat([authData, sha(msg)]), privateKey);
+    return Buffer.concat([
+      Buffer.from([0xa2]),
+      tstr("signature"),
+      bstr(signature),
+      tstr("authenticatorData"),
+      bstr(authData),
+    ]).toString("base64");
+  };
+
+  const base: Record<string, unknown> = {
+    ...goodAttestation(pubB64),
+    sigScheme: "appattest-assertion",
+  };
+  delete base.selfSignature;
+  const message = new TextEncoder().encode(canonicalize(base));
+  const att = { ...base, selfSignature: assertionOver(message) } as unknown as AttestationRecord;
+
+  const ok = await verifyProviderForSeal(att, undefined, { requireConfidential: false, now: NOW });
+  assert.ok(
+    !codes(ok.findings).includes("attestation-signature-invalid"),
+    `assertion selfSignature should verify: ${JSON.stringify(ok.findings)}`,
+  );
+
+  // Tamper a signed posture field after signing → clientDataHash differs → fail.
+  const tampered = { ...att, getTaskAllow: true } as AttestationRecord;
+  const bad = await verifyProviderForSeal(tampered, undefined, {
+    requireConfidential: false,
+    now: NOW,
+  });
+  assert.ok(codes(bad.findings).includes("attestation-signature-invalid"));
 });

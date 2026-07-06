@@ -1806,6 +1806,17 @@ async fn publish_stub_receipt(
         price,
         attestation: attestation.clone(),
         pro_bono,
+        // ADR-0004: carry the brokerage's dispatch countersignature onto the
+        // receipt verbatim (wire snake_case → lexicon camelCase). Excluded from
+        // the enclaveSignature in receipt::build.
+        brokerage_countersignature: req.brokerage_countersignature.as_ref().map(|c| {
+            receipt::BrokerageCountersignature {
+                authority: c.authority.clone(),
+                machineId: c.machine_id.clone(),
+                nonce: c.nonce.clone(),
+                sig: c.sig.clone(),
+            }
+        }),
     };
     let (record, _canonical) = match receipt::build(inputs, ctx.signer) {
         Ok(t) => t,
@@ -2594,6 +2605,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             tool_choice_function: None,
+            brokerage_countersignature: None,
         };
         let replies = handle_inference_request(req, &cx).await;
         let chunks: Vec<&InferenceChunk> = replies
@@ -2652,6 +2664,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             tool_choice_function: None,
+            brokerage_countersignature: None,
         };
         let replies = handle_inference_request(req, &cx).await;
         assert!(replies.is_empty());
@@ -2693,6 +2706,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             tool_choice_function: None,
+            brokerage_countersignature: None,
         };
         let replies = handle_inference_request(req, &cx).await;
         match replies.last() {

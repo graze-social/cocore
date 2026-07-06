@@ -22,6 +22,7 @@
 
 import { X509Certificate, createHash } from "node:crypto";
 import { parseExtensions } from "./mda.ts";
+import { SignatureVerifyError, verifyP256 } from "./p256.ts";
 
 /// Apple App Attest Root CA, P-384, valid 2020 → 2045.
 /// Identical bytes to the Rust embed in provider/src/appattest.rs.
@@ -250,7 +251,87 @@ export function verifyAppAttestB64(
   }
 }
 
+// ---- App Attest ASSERTIONS (ADR-0003) --------------------------------
+//
+// An attestation OBJECT (above) is a one-time proof that a key was generated in
+// the Secure Enclave. An ASSERTION is the ongoing signature: DCAppAttestService
+// .generateAssertion(keyId, clientDataHash) signs `authenticatorData ‖
+// clientDataHash` with the SE key. The SE key can't be exported and can't raw-
+// sign arbitrary bytes, so an assertion can only be produced on the physical
+// device holding the key. When the confidential identity IS the App Attest key
+// (keyId == sha256(uncompressed publicKey)), every record signature becomes an
+// assertion over clientDataHash = sha256(canonical message) — and the identity
+// can no longer be lifted onto another host.
+
+/** Verify an App Attest assertion over `message`, against the SE key that IS the
+ *  signing identity (`publicKeyB64` = the attestation's `publicKey`, raw 64-byte
+ *  X‖Y). Checks the ES256 signature over `authenticatorData ‖ sha256(message)`
+ *  and that the assertion's rpIdHash == sha256(appId). Resolves false (never
+ *  throws) on any shape/verify failure. */
+export async function verifyAppAttestAssertion(
+  publicKeyB64: string,
+  assertionB64: string,
+  message: Uint8Array,
+  appId: string,
+): Promise<boolean> {
+  let signature: Uint8Array;
+  let authenticatorData: Uint8Array;
+  try {
+    const top = cborReadValue({ buf: b64ToBytes(assertionB64), pos: 0 });
+    if (!(top instanceof Map)) return false;
+    const sig = top.get("signature");
+    const ad = top.get("authenticatorData");
+    if (!(sig instanceof Uint8Array) || !(ad instanceof Uint8Array)) return false;
+    signature = sig;
+    authenticatorData = ad;
+  } catch {
+    return false;
+  }
+  // authenticatorData = rpIdHash(32) ‖ flags(1) ‖ signCount(4); assertions omit
+  // attested-credential-data, so 37 bytes is the minimum.
+  if (authenticatorData.length < 37) return false;
+  const rpIdHash = authenticatorData.slice(0, 32);
+  if (!ctEq(rpIdHash, sha256(new TextEncoder().encode(appId)))) return false;
+
+  const clientDataHash = sha256(message);
+  const signed = concat(authenticatorData, clientDataHash);
+  const sigDerB64 = Buffer.from(signature).toString("base64");
+  try {
+    return await verifyP256(publicKeyB64, sigDerB64, signed);
+  } catch (e) {
+    if (e instanceof SignatureVerifyError) return false;
+    throw e;
+  }
+}
+
+/** The residency predicate (ADR-0003): does the App-Attest-attested key EQUAL
+ *  the signing key? The attestation OBJECT proves a genuine SE key was attested,
+ *  but binds to the signing key only via clientData — so a genuine SE key can
+ *  attest a commitment to a SEPARATE (software) signing key, and that object is
+ *  still portable. Only when the attested key IS the signing key
+ *  (`sha256(uncompressed publicKey) == keyId`) is the signing private key itself
+ *  proven non-exportable. `attestedUncompressedB64` is the 65-byte 0x04‖X‖Y from
+ *  {@link AppAttestResult.attestedPubkeyUncompressed}; `signingPubKeyB64` is the
+ *  attestation's raw 64-byte `publicKey`. */
+export function attestedKeyMatchesSigningKey(
+  attestedUncompressedB64: string,
+  signingPubKeyB64: string,
+): boolean {
+  try {
+    const att = b64ToBytes(attestedUncompressedB64);
+    const sig = b64ToBytes(signingPubKeyB64);
+    if (att.length !== 65 || sig.length !== 64 || att[0] !== 0x04) return false;
+    return ctEq(att.subarray(1), sig);
+  } catch {
+    return false;
+  }
+}
+
 // ---- internals -------------------------------------------------------
+
+function b64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(Buffer.from(b64, "base64"));
+}
 
 function sha256(data: Uint8Array): Uint8Array {
   return Uint8Array.from(createHash("sha256").update(Buffer.from(data)).digest());

@@ -16,11 +16,19 @@ from datetime import datetime, timezone
 
 import pytest
 
+import hashlib
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from cocore import verify_provider_for_seal
 from cocore.appattest import (
     APPLE_APP_ATTEST_ROOT_CA_PEM,
     AppAttestError,
+    attested_key_matches_signing_key,
     verify_app_attest,
+    verify_app_attest_assertion,
     verify_app_attest_b64,
 )
 
@@ -142,6 +150,11 @@ def test_cross_language_confidential_via_app_attest():
         None,
         require_confidential=True,
         require_code_attested=False,
+        # This fixture's App Attest object binds via clientData to a SEPARATE
+        # signing key (keyId != sha256(publicKey)) — the pointer form that
+        # ADR-0003's residency gate rejects for confidential. The test exercises
+        # object verification, not the residency identity, so opt out.
+        require_hardware_bound_key=False,
         known_good_cdhashes=[f["knownGoodCdHash"]],
         known_good_metallib_hashes=[f["knownGoodMetallibHash"]],
         known_good_engine_lib_hashes=[f["knownGoodEngineLibHash"]],
@@ -166,3 +179,127 @@ def test_cross_language_confidential_via_app_attest():
     assert downgraded.tier == "best-effort"
     assert "no-mda-chain" in downgraded.codes()
     assert "attestation-signature-invalid" not in downgraded.codes()
+
+
+# ---- App Attest ASSERTION verification (ADR-0003) --------------------
+# Self-contained: synthesize an assertion the way DCAppAttestService would (a
+# P-256 SE key signs `authenticatorData || sha256(clientData)`), no device or
+# Rust fixture needed. Mirror of the TS appattest.test.ts assertion tests.
+
+_ASSERT_APP_ID = "4L45P7CP9M.dev.cocore.provider"
+
+
+def _sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+
+def _cbor_bstr(b: bytes) -> bytes:
+    if len(b) < 24:
+        return bytes([0x40 | len(b)]) + b
+    if len(b) < 256:
+        return bytes([0x58, len(b)]) + b
+    return bytes([0x59, len(b) >> 8, len(b) & 0xFF]) + b
+
+
+def _cbor_tstr(s: str) -> bytes:
+    b = s.encode()
+    return bytes([0x60 | len(b)]) + b  # len < 24
+
+
+def _encode_assertion(signature: bytes, auth_data: bytes) -> bytes:
+    return (
+        b"\xa2"
+        + _cbor_tstr("signature")
+        + _cbor_bstr(signature)
+        + _cbor_tstr("authenticatorData")
+        + _cbor_bstr(auth_data)
+    )
+
+
+def _make_identity():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    uncompressed = priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    pub_b64 = base64.b64encode(uncompressed[1:]).decode()  # raw 64-byte X||Y
+    return priv, uncompressed, pub_b64
+
+
+def _sign_assertion(priv, message: bytes, app_id: str = _ASSERT_APP_ID) -> str:
+    auth_data = _sha256(app_id.encode()) + bytes([0x00, 0, 0, 0, 1])
+    signed = auth_data + _sha256(message)
+    signature = priv.sign(signed, ec.ECDSA(hashes.SHA256()))
+    return base64.b64encode(_encode_assertion(signature, auth_data)).decode()
+
+
+def test_verify_app_attest_assertion_roundtrip():
+    priv, _, pub_b64 = _make_identity()
+    msg = b"canonical record bytes"
+    a = _sign_assertion(priv, msg)
+    assert verify_app_attest_assertion(pub_b64, a, msg, _ASSERT_APP_ID) is True
+    # Tampered message.
+    assert verify_app_attest_assertion(pub_b64, a, b"tampered", _ASSERT_APP_ID) is False
+    # Wrong verifying key.
+    _, _, other = _make_identity()
+    assert verify_app_attest_assertion(other, a, msg, _ASSERT_APP_ID) is False
+    # Wrong appId (rpIdHash mismatch).
+    assert verify_app_attest_assertion(pub_b64, a, msg, "9Z9Z9Z9Z9Z.dev.cocore.provider") is False
+
+
+def test_attested_key_matches_signing_key():
+    _, uncompressed, pub_b64 = _make_identity()
+    assert attested_key_matches_signing_key(uncompressed, pub_b64) is True
+    _, other_unc, _ = _make_identity()
+    assert attested_key_matches_signing_key(other_unc, pub_b64) is False
+    # Raw 64 (no 0x04 prefix) doesn't match.
+    assert attested_key_matches_signing_key(base64.b64decode(pub_b64), pub_b64) is False
+
+
+def test_sig_scheme_appattest_assertion_selfsignature():
+    """A record with sigScheme 'appattest-assertion' whose selfSignature is an
+    App Attest assertion over the canonical body verifies at gate #0; a tamper is
+    still caught. Mirror of the TS verify-provider assertion-dispatch test."""
+    from cocore import verify_provider_for_seal
+    from cocore.canonical import canonical_bytes
+
+    priv, uncompressed, pub_b64 = _make_identity()
+
+    def _assertion_over(message: bytes) -> str:
+        auth_data = _sha256(_ASSERT_APP_ID.encode()) + bytes([0x00, 0, 0, 0, 1])
+        signature = priv.sign(auth_data + _sha256(message), ec.ECDSA(hashes.SHA256()))
+        return base64.b64encode(_encode_assertion(signature, auth_data)).decode()
+
+    base = {
+        "publicKey": pub_b64,
+        "encryptionPubKey": "ZW5jcnlwdGlvbktleQ==",
+        "chipName": "Apple M3",
+        "hardwareModel": "Mac15,8",
+        "serialNumberHash": "0" * 64,
+        "osVersion": "macOS 14.6.1",
+        "binaryHash": "1" * 64,
+        "cdHash": "a" * 40,
+        "teamId": "TEAM123456",
+        "hardenedRuntime": True,
+        "libraryValidation": True,
+        "getTaskAllow": False,
+        "inProcessBackend": True,
+        "antiDebug": True,
+        "coreDumpsDisabled": True,
+        "envScrubbed": True,
+        "sipEnabled": True,
+        "secureBootEnabled": True,
+        "secureEnclaveAvailable": True,
+        "authenticatedRootEnabled": True,
+        "sigScheme": "appattest-assertion",
+        "attestedAt": "2026-06-19T00:00:00Z",
+        "expiresAt": "2026-06-20T00:00:00Z",
+    }
+    att = dict(base)
+    att["selfSignature"] = _assertion_over(canonical_bytes(base))
+    now = datetime(2026, 6, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    ok = verify_provider_for_seal(att, None, require_confidential=False, now=now)
+    assert "attestation-signature-invalid" not in ok.codes(), ok.findings
+
+    tampered = dict(att)
+    tampered["getTaskAllow"] = True
+    bad = verify_provider_for_seal(tampered, None, require_confidential=False, now=now)
+    assert "attestation-signature-invalid" in bad.codes()

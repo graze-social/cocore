@@ -77,12 +77,12 @@
     },
     "trustLevel": {
       "type": "string",
-      "description": "How strongly the provider's environment is attested.",
+      "description": "How strongly the provider's environment is attested. `hardware-attested` means a verified Apple attestation (MDA chain or App Attest object) binds a genuine Apple device to the signing key; `self-attested` is a software key with no such chain. NOTE: `hardware-attested` alone does NOT imply the signing key is non-exportable — an MDA chain bound via freshness code attests the device that vouched for the PUBLIC key, not that the PRIVATE key is Secure-Enclave-resident. Key non-exportability is required only for the `attested-confidential` tier (see #tier) and is proven only by App Attest.",
       "knownValues": ["self-attested", "hardware-attested"]
     },
     "tier": {
       "type": "string",
-      "description": "Confidentiality tier of a unit of work — whether the prompt was provably handled only inside a measured, signed binary the owner cannot read. Distinct from `trustLevel` (which describes how the environment is attested) because a hardware-attested machine can still run a best-effort engine. A verifier MUST recompute this from evidence and never trust a self-asserted value: `attested-confidential` REQUIRES a verified Apple MDA chain bound to the signing key, a known-good measured `cdHash`, the hardened-runtime posture booleans (sip && hardenedRuntime && libraryValidation && !getTaskAllow && secureBoot), and a fresh enclave-signed session key; anything weaker is `best-effort`. Absent is equivalent to `best-effort` for pre-2026-06 readers.",
+      "description": "Confidentiality tier of a unit of work — whether the prompt was provably handled only inside a measured, signed binary the owner cannot read. Distinct from `trustLevel` (which describes how the environment is attested) because a hardware-attested machine can still run a best-effort engine. A verifier MUST recompute this from evidence and never trust a self-asserted value. `attested-confidential` REQUIRES, in addition to a verified Apple attestation bound to the signing key: (1) a signing key proven Secure-Enclave-RESIDENT and non-exportable via a bound Apple App Attest object — an MDA-freshness binding is INSUFFICIENT because it does not prove the private key cannot leave the host, so a software key with a genuine MDA chain is portable to any machine (the 2026-07-05 spoof; see ADR-0003); (2) a known-good measured `cdHash`; (3) the hardened-runtime posture booleans (sip && hardenedRuntime && libraryValidation && !getTaskAllow && secureBoot); and (4) a fresh enclave-signed session key. Anything weaker is `best-effort`. Absent is equivalent to `best-effort` for pre-2026-06 readers.",
       "knownValues": ["attested-confidential", "best-effort"]
     },
     "settlementStatus": {

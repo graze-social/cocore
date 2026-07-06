@@ -120,6 +120,8 @@ describe("C1 — DID-bound registration", () => {
     });
     expect(got).toContain("attestation_challenge");
     expect(h.registry.get(did, "a")).toBeDefined();
+    // A valid DID-bound JWT marks the registration authenticated (attested-tier eligible).
+    expect(h.registry.get(did, "a")?.registrationAuthenticated).toBe(true);
     ws.terminate();
   }, 5_000);
 
@@ -149,7 +151,11 @@ describe("C1 — DID-bound registration", () => {
     expect(h.registry.get("did:plc:noauth", "a")).toBeUndefined();
   }, 5_000);
 
-  it("accepts a register with no JWT when requireAuth is off (staged rollout)", async () => {
+  it("SOFT CUTOVER: admits a no-JWT register when requireAuth is off but downgrades it", async () => {
+    // ADR-0003: instead of the old silent full-trust, a missing register token
+    // (advisorDid set, requireAuth off) ADMITS the socket — it still serves —
+    // but marks it un-authenticated so consumers cap it out of the attested
+    // tiers. Downgrade, never disconnect.
     const { resolver } = await keyAndResolver("did:plc:whoever");
     h = await startHarness({ advisorDid: ADVISOR_DID, requireAuth: false, didResolver: resolver });
     const ws = new WebSocket(h.url);
@@ -162,8 +168,25 @@ describe("C1 — DID-bound registration", () => {
         resolve(d.toString("utf8"));
       });
     });
+    // Still admitted (a challenge was issued) — it keeps serving best-effort…
     expect(got).toContain("attestation_challenge");
-    expect(h.registry.get("did:plc:legacy", "a")).toBeDefined();
+    const entry = h.registry.get("did:plc:legacy", "a");
+    expect(entry).toBeDefined();
+    // …but it's flagged un-DID-authenticated so it can't earn an attested tier.
+    expect(entry?.registrationAuthenticated).toBe(false);
+    expect(entry?.confidentialEligible).toBe(false);
+    ws.terminate();
+  }, 5_000);
+
+  it("no DID-bound auth configured → no signal, registration stays authenticated", async () => {
+    // advisorDid unset: auth isn't enforced at all, so we don't penalize —
+    // registrationAuthenticated defaults true (the C1-dormant state).
+    h = await startHarness({});
+    const ws = new WebSocket(h.url);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    ws.send(registerFrame("did:plc:noauthcfg"));
+    await vi.waitFor(() => expect(h.registry.get("did:plc:noauthcfg", "a")).toBeDefined());
+    expect(h.registry.get("did:plc:noauthcfg", "a")?.registrationAuthenticated).toBe(true);
     ws.terminate();
   }, 5_000);
 });

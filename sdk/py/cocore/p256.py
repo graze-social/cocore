@@ -78,10 +78,32 @@ def verify_attestation_signature(attestation: Mapping[str, Any], public_key_b64:
     return verify_p256(public_key_b64, sig, canonical_bytes(body))
 
 
-def verify_receipt_signature(receipt: Mapping[str, Any], attestation_public_key_b64: str) -> bool:
-    """Verify a receipt's ``enclaveSignature`` against an attestation publicKey."""
+def verify_receipt_signature(
+    receipt: Mapping[str, Any],
+    attestation_public_key_b64: str,
+    sig_scheme: str | None = None,
+) -> bool:
+    """Verify a receipt's ``enclaveSignature`` against an attestation publicKey.
+
+    ADR-0003: the enclaveSignature is signed by the attestation identity, so it
+    follows the ATTESTATION's ``sigScheme`` — pass it from the attestation record.
+    'appattest-assertion' verifies as an App Attest assertion (the non-exportable
+    -key form); absent/'p256' is the raw ECDSA default. Mirror of
+    verifyReceiptSignature in p256.ts."""
     sig = receipt.get("enclaveSignature")
     if not sig:
         return False
-    body = {k: v for k, v in receipt.items() if k not in ("enclaveSignature", "$type")}
-    return verify_p256(attestation_public_key_b64, sig, canonical_bytes(body))
+    # Strip fields NOT covered by the provider's enclaveSignature: lexicon
+    # `$type`, the signature itself, and (ADR-0004) `brokerageCountersignature`
+    # (signed by the brokerage, added after the provider signs).
+    body = {
+        k: v
+        for k, v in receipt.items()
+        if k not in ("enclaveSignature", "$type", "brokerageCountersignature")
+    }
+    message = canonical_bytes(body)
+    if sig_scheme == "appattest-assertion":
+        from .appattest import APP_ATTEST_APP_ID, verify_app_attest_assertion
+
+        return verify_app_attest_assertion(attestation_public_key_b64, sig, message, APP_ATTEST_APP_ID)
+    return verify_p256(attestation_public_key_b64, sig, message)
