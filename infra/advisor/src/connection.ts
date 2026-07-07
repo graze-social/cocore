@@ -671,7 +671,37 @@ export function handleConnection(
     // late/replaced close then no-ops instead of stranding the machine.
     if (registeredDid && registeredMachineId) {
       const entry = registry.get(registeredDid, registeredMachineId);
-      if (entry && entry.send === send) registry.remove(registeredDid, registeredMachineId);
+      if (entry && entry.send === send) {
+        // A GENUINE drop of a socket that still owns its entry — not an
+        // advisor-initiated clean close ("replaced" on reconnect, "recycle" on
+        // the connection-age cap), where the machine is coming right back and
+        // its in-flight sessions can still be served by the replacement.
+        const reasonStr = reason?.toString() ?? "";
+        const advisorInitiated = reasonStr === "replaced" || reasonStr === "recycle";
+        if (!advisorInitiated) {
+          // Fail any in-flight requesters fast (clean SSE error) instead of
+          // leaving them to hang until the 90s idle timer, and count the drop
+          // ONCE toward this machine's cooldown ledger. A machine that keeps
+          // dropping mid-stream is exactly the "stream-truncated" case we want
+          // pulled from rotation.
+          const dropped = sessions.closeForMachine(
+            registeredDid,
+            registeredMachineId,
+            "provider-disconnected",
+          );
+          if (dropped > 0) {
+            const tripped = registry.recordFailure(
+              registeredDid,
+              registeredMachineId,
+              "provider-disconnected",
+            );
+            console.error(
+              `[ws] mid-job drop did=${registeredDid} machine=${registeredMachineId}; closed ${dropped} session(s)${tripped ? ", repeated → cooldown" : ""}`,
+            );
+          }
+        }
+        registry.remove(registeredDid, registeredMachineId);
+      }
     }
     console.error(
       `[ws] close peer=${peer} did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} code=${code} reason=${reason}`,

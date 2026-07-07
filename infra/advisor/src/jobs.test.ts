@@ -12,7 +12,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { renderSseEvent } from "./events.ts";
 import { handleJobsRequest } from "./jobs.ts";
 import type { AdvisorMessage } from "./protocol.ts";
-import { CRASH_LOOP_THRESHOLD, ProviderRegistry } from "./registry.ts";
+import { CRASH_LOOP_THRESHOLD, FAILURE_COOLDOWN_THRESHOLD, ProviderRegistry } from "./registry.ts";
 import { SessionManager } from "./sessions.ts";
 
 interface Harness {
@@ -374,6 +374,60 @@ describe("POST /jobs", () => {
 
     h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 2, receiptUri: "at://r" });
     await linesP;
+  });
+
+  it("does not route to a machine on a failure cooldown when a healthy one exists", async () => {
+    // The reported bug: a machine that keeps failing (streamed-then-dropped)
+    // must be steered around even though it answers the preflight ping. Trip
+    // its cooldown via the ledger, make it the freshest so it would otherwise
+    // rank first, and assert the job lands on the healthy one.
+    const cooling = fakeProvider(h.registry, "did:plc:cooling", "pub-cooling", true);
+    const healthy = fakeProvider(h.registry, "did:plc:ok", "pub-ok", true);
+    h.registry.get("did:plc:cooling", cooling.machineId)!.lastSeen = Date.now() + 10_000;
+    for (let i = 0; i < FAILURE_COOLDOWN_THRESHOLD; i++) {
+      h.registry.recordFailure("did:plc:cooling", cooling.machineId, "stream-stalled");
+    }
+
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+    });
+
+    await vi.waitFor(
+      () => expect(healthy.sent.some((m) => m.type === "inference_request")).toBe(true),
+      { timeout: 2_000 },
+    );
+    expect(cooling.sent.some((m) => m.type === "inference_request")).toBe(false);
+
+    h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 2, receiptUri: "at://r" });
+    await linesP;
+  });
+
+  it("503s a PINNED job when the named provider's only machine is cooling down", async () => {
+    const fp = fakeProvider(h.registry, "did:plc:pinned-cool", "pub-pcool");
+    for (let i = 0; i < FAILURE_COOLDOWN_THRESHOLD; i++) {
+      h.registry.recordFailure("did:plc:pinned-cool", fp.machineId, "provider-disconnected");
+    }
+    const resp = await fetch(`${h.url}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jobUri: "at://x",
+        requesterDid: "did:plc:requester",
+        requesterPubKey: "abcd",
+        model: "stub",
+        maxTokensOut: 10,
+        ciphertext: "QQ==",
+        targetProviderDid: "did:plc:pinned-cool",
+      }),
+    });
+    expect(resp.status).toBe(503);
+    const j = (await resp.json()) as { error: string };
+    expect(j.error).toMatch(/cooling down/);
   });
 
   it("fails over to a healthy sibling machine under the SAME did", async () => {
