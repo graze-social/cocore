@@ -22,17 +22,18 @@ let package = Package(
     ],
     dependencies: [
         // High-level LLM API (MLXLLM, MLXLMCommon) — pulls mlx-swift +
-        // swift-transformers transitively. Pinned to a release for
-        // reproducibility (the known-good set depends on a stable build).
-        .package(url: "https://github.com/ml-explore/mlx-swift-examples", from: "2.21.0"),
+        // swift-transformers transitively. Pinned to the 2.x MLX Swift LM
+        // line that adds Qwen3.5/Qwen3.5-MoE architecture support while
+        // preserving the API shape this bridge uses.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.31.3"),
     ],
     targets: [
         .target(
             name: "CoCoreMLX",
             dependencies: [
-                .product(name: "MLXLLM", package: "mlx-swift-examples"),
-                .product(name: "MLXVLM", package: "mlx-swift-examples"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-examples"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             ],
             path: "Sources/CoCoreMLX",
             publicHeadersPath: "include"

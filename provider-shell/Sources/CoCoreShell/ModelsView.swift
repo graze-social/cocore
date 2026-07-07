@@ -512,23 +512,22 @@ final class ModelManager: ObservableObject {
     }
 
     /// Classify a model's confidential capability from its id. The confidential
-    /// engine is the vendored mlx-swift-examples LLM set, which loads
-    /// Qwen2 / Qwen3 / Llama(≤3) / Gemma(2,3) / Phi / Mistral-class archs — but
-    /// NOT the newer Qwen3.5+ / Gemma4 / Llama4 architectures. We assert
+    /// engine is the vendored mlx-swift-lm LLM set, which loads
+    /// Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 / Llama(≤3) / Gemma(2,3) / Phi /
+    /// Mistral-class archs — but NOT Gemma4 / Llama4 architectures. We assert
     /// `incapable` only for archs we KNOW it can't load, `capable` for the
     /// known-good families, and `unknown` otherwise (so we never over-claim — an
     /// unknown that can't load surfaces honestly as an engineFault at serve).
     static func confidentialCompat(_ nsid: String) -> ConfidentialCompat {
         let id = nsid.lowercased()
         // Newer than the vendored engine's arch set — definitionally best-effort.
-        let unsupported = [
-            "qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6", "gemma-4", "gemma4", "llama-4", "llama4",
-        ]
+        let unsupported = ["gemma-4", "gemma4", "llama-4", "llama4"]
         if unsupported.contains(where: id.contains) { return .incapable }
         // Families the in-process engine loads.
         let supported = [
-            "qwen2", "qwen3", "gemma-2", "gemma2", "gemma-3", "gemma3", "llama-2", "llama2",
-            "llama-3", "llama3", "phi", "mistral",
+            "qwen2", "qwen3", "qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6", "gemma-2",
+            "gemma2", "gemma-3", "gemma3", "llama-2", "llama2", "llama-3", "llama3",
+            "phi", "mistral",
         ]
         if supported.contains(where: id.contains) { return .capable }
         return .unknown
@@ -1197,7 +1196,7 @@ struct ModelsView: View {
                 Text("Add a model")
             } footer: {
                 sectionFooter(
-                    "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential ✓” models can serve in the confidential engine (Qwen2/Qwen3/Llama/Gemma/Phi-class). A “Best-effort only” model (newer Qwen3.5+/Gemma4/Llama4 archs) runs in a helper the operator can read — choosing one means this machine can't offer requestors the confidential posture for it."
+                    "Search any MLX model on HuggingFace, or pick a suggestion. co/core runs MLX weights (mlx-community/… or another 4-bit MLX conversion); a stock PyTorch repo won't load.\n\nOnly “Confidential” models can serve in the confidential engine (Qwen2/Qwen3/Qwen3.5/Qwen3.6/Llama/Gemma/Phi-class). A “Best-effort only” model (for example Gemma4 or Llama4) runs in a helper the operator can read — choosing one means this machine can't offer requestors the confidential posture for it."
                 )
             }
             .onChange(of: searchQuery) { query in runSearch(query) }
@@ -1255,7 +1254,7 @@ struct ModelsView: View {
     /// the other trashes stay live.
     /// A small capsule marking whether a model can serve confidentially. Shown
     /// in the picker + active list so the operator sees — before choosing — that
-    /// some models (the newer Qwen3.5+ / Gemma4 / Llama4 archs) can only serve
+    /// some models (for example Gemma4 / Llama4 archs) can only serve
     /// best-effort: picking one means this machine can't offer requestors the
     /// confidential guarantee for it.
     @ViewBuilder private func confidentialBadge(_ nsid: String) -> some View {

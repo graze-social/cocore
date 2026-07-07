@@ -514,7 +514,7 @@ final class MenuBarController {
                 let alert = NSAlert()
                 alert.messageText = "Enable confidential serving?"
                 alert.informativeText =
-                    "Inference will run entirely inside the measured, signed agent, under a hardened runtime with no subprocess to tap — which aims to keep prompts unreadable to this machine's operator. This is experimental and not independently audited: a software-sealed posture, not a hardware enclave, so don't present it to requestors as a hard guarantee.\n\nThe confidential engine serves Qwen2 / Llama / Gemma / Phi models — an incompatible model (e.g. a Qwen3 model) will show a fault, so pick a compatible one under Models. The agent will restart to switch over."
+                    "Inference will run entirely inside the measured, signed agent, under a hardened runtime with no subprocess to tap — which aims to keep prompts unreadable to this machine's operator. This is experimental and not independently audited: a software-sealed posture, not a hardware enclave, so don't present it to requestors as a hard guarantee.\n\nThe confidential engine serves Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 / Llama / Gemma / Phi models — an incompatible model will show a fault, so pick a compatible one under Models. The agent will restart to switch over."
                 alert.addButton(withTitle: "Enable")
                 alert.addButton(withTitle: "Cancel")
                 guard alert.runModal() == .alertFirstButtonReturn else { return }

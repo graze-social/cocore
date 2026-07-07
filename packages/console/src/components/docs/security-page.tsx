@@ -142,10 +142,10 @@ export function SecurityDocsPage() {
         <h2 {...stylex.props(docsStyles.h2)}>The model constraint for operators</h2>
         <p {...stylex.props(docsStyles.prose)}>
           Confidential serving runs in the agent&apos;s in-process engine, which only loads certain
-          model architectures — Qwen2 / Qwen3 / Llama / Gemma / Phi / Mistral-class weights. A model
-          outside that set (for example a newer Qwen3.5+, Gemma 4, or Llama 4 architecture) can only
-          be served best-effort, in the readable helper process. The provider app marks each model
-          in the picker as <strong>“Confidential&nbsp;✓”</strong> or{" "}
+          model architectures — Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 / Llama / Gemma / Phi /
+          Mistral-class weights. A model outside that set (for example a Gemma 4 or Llama 4
+          architecture) can only be served best-effort, in the readable helper process. The provider
+          app marks each model in the picker as <strong>“Confidential”</strong> or{" "}
           <strong>“Best-effort only”</strong>: choosing a best-effort-only model means your machine
           can&apos;t offer requestors the confidential posture while serving it, even if the machine
           is otherwise confidential-capable. Pick a confidential-capable model to keep it.

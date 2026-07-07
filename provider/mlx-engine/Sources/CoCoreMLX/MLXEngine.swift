@@ -120,11 +120,11 @@ public final class MLXEngine {
         let params = GenerateParameters(maxTokens: maxTokens)
         var tokensIn = 0
         var tokensOut = 0
-        let inputImages: [UserInput.Image] = images.compactMap { data in
-            CIImage(data: data).map { UserInput.Image.ciImage($0) }
-        }
         let stream: AsyncStream<Generation> = try await container.perform {
             (context: ModelContext) in
+            let inputImages: [UserInput.Image] = images.compactMap { data in
+                CIImage(data: data).map { UserInput.Image.ciImage($0) }
+            }
             let userInput =
                 inputImages.isEmpty
                 ? UserInput(chat: [.user(prompt)])

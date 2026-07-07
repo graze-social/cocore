@@ -134,16 +134,28 @@ const FLEET_TABLE_COLUMNS: {
 interface ModelFloor {
   /** Floor RAM in GB below which the model is unlikely to load. */
   minRamGB: number;
-  /** Short human label for the warning copy (e.g. "Qwen2.5-3B"). */
+  /** Short human label for the warning copy (e.g. "Qwen3.5-4B"). */
   label: string;
 }
 
 const MODEL_RAM_FLOORS: Readonly<Record<string, ModelFloor>> = {
+  "mlx-community/Qwen3.5-0.8B-MLX-4bit": { minRamGB: 4, label: "Qwen3.5-0.8B" },
+  "mlx-community/Qwen3.5-2B-MLX-4bit": { minRamGB: 6, label: "Qwen3.5-2B" },
+  "mlx-community/Qwen3.5-4B-MLX-4bit": { minRamGB: 8, label: "Qwen3.5-4B" },
+  "mlx-community/Qwen3.5-9B-MLX-4bit": { minRamGB: 16, label: "Qwen3.5-9B" },
+  "mlx-community/Qwen3.5-27B-4bit": { minRamGB: 24, label: "Qwen3.5-27B" },
+  "mlx-community/Qwen3.6-27B-4bit": { minRamGB: 24, label: "Qwen3.6-27B" },
+  "mlx-community/Qwen3.5-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.5-35B-A3B" },
+  "mlx-community/Qwen3.6-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.6-35B-A3B" },
+  "mlx-community/Qwen3.6-35B-A3B-4bit-DWQ": { minRamGB: 32, label: "Qwen3.6-35B-A3B DWQ" },
+  "mlx-community/Qwen3.5-122B-A10B-4bit": { minRamGB: 96, label: "Qwen3.5-122B-A10B" },
+  "mlx-community/Qwen3.5-397B-A17B-4bit": { minRamGB: 256, label: "Qwen3.5-397B-A17B" },
   "mlx-community/Qwen2.5-0.5B-Instruct-4bit": { minRamGB: 4, label: "Qwen2.5-0.5B" },
   "mlx-community/Qwen2.5-3B-Instruct-4bit": { minRamGB: 8, label: "Qwen2.5-3B" },
   "mlx-community/Qwen2.5-7B-Instruct-4bit": { minRamGB: 16, label: "Qwen2.5-7B" },
   "mlx-community/gemma-3-4b-it-qat-4bit": { minRamGB: 8, label: "Gemma 3 4B" },
   "mlx-community/Qwen2.5-32B-Instruct-4bit": { minRamGB: 32, label: "Qwen2.5-32B" },
+  "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit": { minRamGB: 64, label: "Llama 4 Scout" },
   "mlx-community/Llama-3.3-70B-Instruct-4bit": { minRamGB: 64, label: "Llama 3.3 70B" },
 };
 
@@ -1281,7 +1293,7 @@ export function ManageModelsDialogContent({
               label="Add a model"
               value={draft}
               onChange={setDraft}
-              placeholder="mlx-community/Qwen2.5-3B-Instruct-4bit"
+              placeholder="mlx-community/Qwen3.5-4B-MLX-4bit"
               style={styles.modelAddField}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {

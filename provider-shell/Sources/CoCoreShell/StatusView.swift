@@ -206,7 +206,7 @@ struct StatusRows: View {
                     .orange)
             case .off:
                 secureCaption(
-                    "Requests run in a local helper process that you, this Mac's operator, could read — fine for non-sensitive work. Confidential mode aims to keep them unreadable to you by running inside the measured agent (experimental — a hardened-runtime posture, not a hardware enclave). The confidential engine serves Qwen2 / Qwen3 / Llama / Gemma / Phi-class models.",
+                    "Requests run in a local helper process that you, this Mac's operator, could read — fine for non-sensitive work. Confidential mode aims to keep them unreadable to you by running inside the measured agent (experimental — a hardened-runtime posture, not a hardware enclave). The confidential engine serves Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 / Llama / Gemma / Phi-class models.",
                     .secondary)
             }
             if let setConfidential = onSetConfidential {

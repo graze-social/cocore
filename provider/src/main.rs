@@ -1381,9 +1381,9 @@ async fn cmd_serve_entry(advisor: String) -> Result<()> {
 /// returns and export the two env vars `build_engines` reads
 /// (`COCORE_NATIVE_MLX_MODEL` + `COCORE_NATIVE_MLX_MODEL_DIR`). The native
 /// engine serves exactly ONE model — the owner's first non-`stub`
-/// `desiredModels`, else a small default. An incompatible pick (a non
-/// Qwen2/Llama/Gemma/Phi arch, e.g. `qwen3_5`) downloads fine but fails native
-/// load, which `build_engines` turns into an honest engineFault.
+/// `desiredModels`, else a small default. An incompatible pick downloads fine
+/// but fails native load, which `build_engines` turns into an honest
+/// engineFault.
 #[cfg(all(target_os = "macos", feature = "apns"))]
 async fn prepare_native_confidential_model() {
     const DEFAULT_MODEL: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
@@ -3029,10 +3029,10 @@ fn build_engines(
                         code: "native-load-failed".to_string(),
                         message: format!(
                             "The confidential (in-process MLX) engine couldn't load `{model}`. The \
-                             native engine supports Qwen2/Llama/Gemma/Phi-family MLX models; a \
-                             different architecture (e.g. a Qwen3 model) won't load in-process. \
-                             Pick a confidential-compatible model in the console. The machine is \
-                             online but only serving the no-op `stub` engine. ({e})"
+                             native engine supports Qwen2/Qwen3/Qwen3.5/Qwen3.6, Llama, Gemma, \
+                             Phi, and Mistral-family MLX models. Pick a confidential-compatible \
+                             model in the console. The machine is online but only serving the \
+                             no-op `stub` engine. ({e})"
                         ),
                         models: vec![model.clone()],
                         at: chrono::Utc::now(),
