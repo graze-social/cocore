@@ -90,3 +90,37 @@ test("the first-chunk (prefill) budget is independent of the steady-state idle b
   vi.advanceTimersByTime(3_600);
   expect(fired).toEqual([false]);
 });
+
+test("closeForMachine drains only the target machine's sessions and clears their idle timers", () => {
+  const fired: string[] = [];
+  const sm = new SessionManager({
+    idleTimeoutMs: 1_000,
+    firstChunkTimeoutMs: 1_000,
+    onIdleTimeout: (_did, machine) => fired.push(machine),
+  });
+  const bad1 = fakeRes();
+  const bad2 = fakeRes();
+  const other = fakeRes();
+  // Two in-flight sessions on the bad machine, one on a sibling.
+  sm.open("b1", "did:plc:p", "bad", "did:plc:r", asRes(bad1));
+  sm.open("b2", "did:plc:p", "bad", "did:plc:r", asRes(bad2));
+  sm.open("o1", "did:plc:p", "other", "did:plc:r", asRes(other));
+
+  const closed = sm.closeForMachine("did:plc:p", "bad", "provider-disconnected");
+  expect(closed).toBe(2);
+
+  // Both bad sessions ended with a final error event carrying the reason; the
+  // sibling's session is untouched.
+  expect(bad1.writableEnded).toBe(true);
+  expect(bad2.writableEnded).toBe(true);
+  expect(other.writableEnded).toBe(false);
+  expect(bad1.chunks.join("")).toContain("provider-disconnected");
+  expect(sm.has("b1")).toBe(false);
+  expect(sm.has("b2")).toBe(false);
+  expect(sm.has("o1")).toBe(true);
+
+  // The drained sessions' idle timers were cleared: advancing well past every
+  // budget fires onIdleTimeout only for the still-open sibling.
+  vi.advanceTimersByTime(5_000);
+  expect(fired).toEqual(["other"]);
+});

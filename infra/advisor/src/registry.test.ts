@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import { KnownGoodSet } from "./known-good.ts";
 import {
+  COOLDOWN_BASE_MS,
+  COOLDOWN_MAX_MS,
   CRASH_LOOP_THRESHOLD,
+  FAILURE_COOLDOWN_THRESHOLD,
+  FAILURE_DECAY_MS,
   ProviderRegistry,
   SILENT_FAILURE_DISPATCH_THRESHOLD,
+  STRIKE_RESET_MS,
 } from "./registry.ts";
 
 const noop = (): void => {};
@@ -756,5 +761,138 @@ describe("codeAttested survives a brief reconnect (WS-churn bridge)", () => {
     const r = new ProviderRegistry(new KnownGoodSet([GOOD_CD]));
     r.upsert(confReg, noop, noopSend, noopPing, 1000);
     expect(r.get(DID, MID)?.codeAttested).toBe(false);
+  });
+});
+
+describe("ProviderRegistry failure ledger / cooldown", () => {
+  // Attestation is orthogonal to the cooldown logic, so exercise selection with
+  // attestedOnly=false and an explicit `now` to isolate the ledger behavior.
+  const pick = (r: ProviderRegistry, now: number): string[] =>
+    r.pickCandidates(undefined, false, Number.POSITIVE_INFINITY, now).map((e) => e.machineId);
+
+  const T0 = 1_000_000;
+
+  it("trips a cooldown on the threshold-th clustered failure and excludes the machine", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    // Below threshold → still routable.
+    for (let i = 0; i < FAILURE_COOLDOWN_THRESHOLD - 1; i++) {
+      expect(r.recordFailure(DID, MID, "stream-stalled", T0 + i)).toBe(false);
+    }
+    expect(pick(r, T0 + 10)).toEqual([MID]);
+    // The threshold-th failure trips it (returns true exactly once) → excluded.
+    expect(r.recordFailure(DID, MID, "stream-stalled", T0 + 100)).toBe(true);
+    expect(pick(r, T0 + 200)).toEqual([]);
+    expect(r.isCoolingDown(DID, MID, T0 + 200)).toBe(true);
+    expect(r.getCooldown(DID, MID, T0 + 200)).toMatchObject({
+      coolingDown: true,
+      cooldownReason: "stream-stalled",
+    });
+  });
+
+  // Fire a full threshold-worth of failures at a single instant `at` (still
+  // clustered, well within the decay window) so lastFailureAt === at exactly —
+  // keeps the timing assertions below free of per-failure offsets.
+  const tripCooldown = (r: ProviderRegistry, at = T0): void => {
+    for (let i = 0; i < FAILURE_COOLDOWN_THRESHOLD; i++)
+      r.recordFailure(DID, MID, "stream-stalled", at);
+  };
+
+  it("cooldown SURVIVES a fresh register (reconnect) — the entry-reset regression guard", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    tripCooldown(r);
+    expect(pick(r, T0 + 200)).toEqual([]);
+    // Agent reconnects and re-registers a moment later — a clean-slate entry,
+    // but the ledger is independent of the entry so the cooldown holds.
+    r.upsert(baseReg, noop, noopSend, noopPing, T0 + 300);
+    expect(pick(r, T0 + 400)).toEqual([]);
+    expect(r.isCoolingDown(DID, MID, T0 + 400)).toBe(true);
+  });
+
+  it("cooldown SURVIVES remove + re-upsert (drop then reconnect) — anti-evasion", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    tripCooldown(r);
+    r.remove(DID, MID); // socket dropped
+    r.upsert(baseReg, noop, noopSend, noopPing, T0 + 500); // reconnected
+    expect(r.isCoolingDown(DID, MID, T0 + 600)).toBe(true);
+    expect(pick(r, T0 + 600)).toEqual([]);
+  });
+
+  it("a completion during an active cooldown does NOT clear it", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    tripCooldown(r);
+    // recordCompletion soon after (before the cooldown elapses and before the
+    // strike-reset window) must leave the cooldown intact.
+    r.recordCompletion(DID, MID, T0 + 1000);
+    expect(r.isCoolingDown(DID, MID, T0 + 1000)).toBe(true);
+    expect(pick(r, T0 + 1000)).toEqual([]);
+  });
+
+  it("cooldown self-expires and the machine rejoins the pool", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    tripCooldown(r);
+    // Just before COOLDOWN_BASE_MS → still excluded; just after → back.
+    expect(pick(r, T0 + COOLDOWN_BASE_MS - 1)).toEqual([]);
+    expect(pick(r, T0 + COOLDOWN_BASE_MS + 1)).toEqual([MID]);
+  });
+
+  it("escalates the cooldown length on each successive trip, capped at COOLDOWN_MAX_MS", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    const cooldownLenAfterTripAt = (at: number): number => {
+      tripCooldown(r, at);
+      const until = r.getCooldown(DID, MID, at + 100).cooldownUntil!;
+      return until - at;
+    };
+    // First trip ≈ BASE; let it expire, trip again ≈ 2×BASE.
+    const first = cooldownLenAfterTripAt(T0);
+    expect(first).toBe(COOLDOWN_BASE_MS);
+    const secondAt = T0 + COOLDOWN_BASE_MS + 1; // after the first cooldown elapsed
+    const second = cooldownLenAfterTripAt(secondAt);
+    expect(second).toBe(Math.min(COOLDOWN_BASE_MS * 2, COOLDOWN_MAX_MS));
+    expect(second).toBeGreaterThan(first);
+  });
+
+  it("does NOT trip when failures are spread beyond the decay window", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    // Two failures, then a third AFTER the decay window: the running count reset
+    // before the third landed, so no cooldown.
+    r.recordFailure(DID, MID, "stream-stalled", T0);
+    r.recordFailure(DID, MID, "stream-stalled", T0 + 1000);
+    const late = T0 + 1000 + FAILURE_DECAY_MS + 1;
+    expect(r.recordFailure(DID, MID, "stream-stalled", late)).toBe(false);
+    expect(pick(r, late + 10)).toEqual([MID]);
+  });
+
+  it("a clean STRIKE_RESET_MS stretch resets escalation so the next trip is back to BASE", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    tripCooldown(r); // strike 1
+    // Long quiet stretch, then a completion resets the strikes.
+    const quietAt = T0 + STRIKE_RESET_MS + 1;
+    r.recordCompletion(DID, MID, quietAt);
+    // A fresh cluster of failures now trips a strike-1-length (BASE) cooldown
+    // again, not the escalated 2×BASE it would be without the reset.
+    const at = quietAt + 10;
+    tripCooldown(r, at);
+    const until = r.getCooldown(DID, MID, at + 100).cooldownUntil!;
+    expect(until - at).toBe(COOLDOWN_BASE_MS);
+  });
+
+  it("getCooldown reports not-cooling (and prunes) once fully decayed", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, T0);
+    r.recordFailure(DID, MID, "stream-stalled", T0); // one lone failure, no cooldown
+    const decayed = T0 + STRIKE_RESET_MS + 1;
+    expect(r.getCooldown(DID, MID, decayed)).toEqual({
+      coolingDown: false,
+      cooldownReason: null,
+      cooldownUntil: null,
+    });
   });
 });

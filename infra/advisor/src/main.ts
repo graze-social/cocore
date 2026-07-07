@@ -343,20 +343,38 @@ async function main(): Promise<void> {
     },
     onIdleTimeout: (providerDid, providerMachineId, streamed) => {
       // The requester's SSE already got a clean `idle-timeout` error. How we
-      // treat the MACHINE depends on what it did:
+      // treat the MACHINE depends on what it did — but either way this is a
+      // failed job, so it's recorded in the failure ledger. Enough of them in a
+      // short window puts the machine on a routing cooldown (see
+      // registry.recordFailure); `tripped` is true only on the failure that
+      // trips a NEW cooldown, so we notify once.
       if (streamed) {
-        // It produced real tokens and then stalled (a slow machine on a long
-        // job, not a silent one). Don't mark it unhealthy or bounce its
-        // engine — that punishes a merely-slow provider and yanks it from
-        // routing. Just note it; the failed job is penalty enough.
+        // It produced real tokens and then stalled. A single such job might be
+        // a merely-slow provider on a long generation, so we DON'T immediately
+        // mark it unhealthy or bounce its engine. But a machine that does this
+        // repeatedly (the reported "stream-truncated" loop) is bad, and the
+        // ledger catches that pattern without punishing a one-off slow job.
+        const tripped = registry.recordFailure(providerDid, providerMachineId, "stream-stalled");
+        if (tripped) {
+          try {
+            registry
+              .get(providerDid, providerMachineId)
+              ?.send({ type: "health_notice", standing: "bad", reason: "stream-stalled" });
+          } catch {
+            // socket gone; the sweeper will evict it
+          }
+        }
         console.error(
-          `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; had streamed — slow job, NOT flagging`,
+          `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; had streamed — slow job${tripped ? ", repeated → cooldown" : ""}`,
         );
         return;
       }
       // It accepted the job and never sent a thing: genuinely wedged. Stop
       // routing to it, tell it so (red tray ping), and ask it to self-right.
+      // Also feed the ledger so repeated silents escalate to a cooldown that
+      // survives the reconnect which would otherwise clear `unhealthyAt`.
       registry.markUnhealthy(providerDid, providerMachineId, "job-idle-timeout");
+      const tripped = registry.recordFailure(providerDid, providerMachineId, "job-idle-timeout");
       try {
         const entry = registry.get(providerDid, providerMachineId);
         entry?.send({ type: "health_notice", standing: "bad", reason: "job-idle-timeout" });
@@ -365,7 +383,7 @@ async function main(): Promise<void> {
         // socket gone; the sweeper will evict it
       }
       console.error(
-        `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; silent — marked unhealthy, requested self-right`,
+        `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; silent — marked unhealthy, requested self-right${tripped ? ", repeated → cooldown" : ""}`,
       );
     },
   });
@@ -445,6 +463,18 @@ async function main(): Promise<void> {
             // Machine has been handed jobs but produced no completions —
             // it's failing silently (vs. openly crash-looping).
             silentFailure: p.silentFailure,
+            // On a routing cooldown from repeated recent failures (streamed
+            // then dropped, silent, or disconnected mid-job). Distinct from
+            // `unhealthy`: a cooldown is time-gated and simply elapses, so the
+            // console can show "cooling down until <time> (<reason>)".
+            ...(() => {
+              const c = registry.getCooldown(p.did, p.machineId);
+              return {
+                coolingDown: c.coolingDown,
+                cooldownReason: c.cooldownReason,
+                cooldownUntil: c.cooldownUntil ? new Date(c.cooldownUntil).toISOString() : null,
+              };
+            })(),
             // Confidential-tier routing hints (WS-COORDINATOR + P2). `trustTier`
             // is what the advisor computed; `cdHash` is the measured identity it
             // checked; `codeAttested` is the live APNs code-identity standing.
@@ -659,7 +689,13 @@ async function main(): Promise<void> {
           if (alive) {
             registry.markHealthy(m.did, m.machineId);
             try {
-              m.send({ type: "health_notice", standing: "ok" });
+              // A machine can be both unhealthy AND cooling down; clearing
+              // `unhealthyAt` doesn't return it to routing while the (time-gated)
+              // cooldown still holds, so don't tell it "ok" yet — that would
+              // flip its tray green while it's still excluded.
+              if (!registry.isCoolingDown(m.did, m.machineId)) {
+                m.send({ type: "health_notice", standing: "ok" });
+              }
             } catch {
               // socket gone; close hook will clean up
             }

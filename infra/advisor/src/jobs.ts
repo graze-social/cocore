@@ -330,6 +330,10 @@ async function selectProvider(
         return false;
       }
       if (m.unhealthyAt !== null) return false;
+      // Repeated recent failures → on a routing cooldown. Pinning a machine
+      // doesn't buy a pass around one that keeps dropping mid-stream; the open
+      // pool (pickCandidates) enforces the same via the shared `isCoolingDown`.
+      if (ctx.registry.isCoolingDown(m.did, m.machineId, now)) return false;
       // Version floor (e.g. image input → messages-v1). Fail-closed: a
       // machine that doesn't report a version is treated as below it.
       if (job.minProviderVersion && !meetsMinVersion(m.binaryVersion, job.minProviderVersion)) {
@@ -344,6 +348,12 @@ async function selectProvider(
       return true;
     });
     if (eligible.length === 0) {
+      // Distinguish "all this owner's machines are cooling down from repeated
+      // failures" from the generic no-healthy-machine case, so the requester
+      // sees why a named provider is temporarily unroutable.
+      const allCooling =
+        machines.length > 0 &&
+        machines.every((m) => ctx.registry.isCoolingDown(m.did, m.machineId, now));
       return {
         kind: "error",
         status: 503,
@@ -351,7 +361,9 @@ async function selectProvider(
           ? `provider ${job.targetProviderDid} has no machine with verified tool-calling for this model available`
           : job.minProviderVersion
             ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
-            : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
+            : allCooling
+              ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
+              : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
       };
     }
     eligible.sort((a, b) => b.lastSeen - a.lastSeen);
