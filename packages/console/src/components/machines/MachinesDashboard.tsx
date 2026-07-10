@@ -2392,7 +2392,7 @@ export function MachinesDashboard() {
                         if (column.id === "alias") {
                           return (
                             <TableCell contentStyle={styles.aliasCellContent}>
-                              <Flex direction="row" gap="md" align="center">
+                              <Flex direction="row" gap="md" align="center" wrap>
                                 <RouterLink
                                   to="/machines/$rkey"
                                   params={{ rkey: m.id }}
