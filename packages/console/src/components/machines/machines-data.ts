@@ -112,6 +112,8 @@ export interface Machine {
    *  than the self-asserted {@link tier}. Absent/false otherwise. */
   confidential?: boolean;
   chipMeta?: string;
+  /** Version of the cocore client that last published this machine's provider record. */
+  binaryVersion?: string;
   /** Model NSIDs the agent advertises in its provider record's
    *  `supportedModels` field. Mirrors what the engine registry
    *  actually loaded — see provider/src/main.rs build_engines. The
@@ -197,4 +199,16 @@ export function machineNetworkStanding(m: Machine): "on-network" | "not-reachabl
   if (m.standingKnown === true && m.advisorConnected === true) return "on-network";
   if (advisorUnreachable(m)) return "not-reachable";
   return null;
+}
+
+export function clientVersionStatus(
+  installed: string | undefined,
+  latest: string | null | undefined,
+): "latest" | "outdated" | null {
+  if (!installed || !latest) return null;
+  return installed.replace(/^v/i, "").localeCompare(latest.replace(/^v/i, ""), undefined, {
+    numeric: true,
+  }) < 0
+    ? "outdated"
+    : "latest";
 }

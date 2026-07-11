@@ -100,6 +100,7 @@ import { formatTokens, formatTokensCompact } from "@/lib/token-display.ts";
 
 import {
   advisorUnreachable,
+  clientVersionStatus,
   type Machine,
   type MachineState,
   machineStateLabel,
@@ -194,6 +195,15 @@ type FleetBodyRow = Machine | { id: string; kind: "empty" };
 
 function isFleetEmptyRow(row: FleetBodyRow): row is { id: string; kind: "empty" } {
   return "kind" in row && row.kind === "empty";
+}
+
+async function fetchLatestClientVersion(): Promise<string | null> {
+  const response = await fetch("/agent/policy");
+  if (!response.ok) return null;
+  const policy = (await response.json()) as unknown;
+  if (!policy || typeof policy !== "object") return null;
+  const latest = (policy as Record<string, unknown>)["latest"];
+  return typeof latest === "string" && latest.length > 0 ? latest : null;
 }
 
 const styles = stylex.create({
@@ -2719,6 +2729,15 @@ function MachineDrawer({
   onAction: (action: string, m: Machine) => void;
 }) {
   const tk = (tokens: number) => `${formatTokens(tokens)} tk`;
+  const { data: latestClientVersion } = useQuery({
+    queryKey: ["agent-policy", "latest"],
+    queryFn: fetchLatestClientVersion,
+    staleTime: 300_000,
+    enabled: Boolean(m.binaryVersion),
+  });
+  const versionStatus = clientVersionStatus(m.binaryVersion, latestClientVersion);
+  const installedVersion = m.binaryVersion?.replace(/^v/i, "");
+  const latestVersion = latestClientVersion?.replace(/^v/i, "");
   return (
     <div {...stylex.props(styles.drawer)}>
       <Flex gap="2xl" direction="column" style={styles.drawerSection}>
@@ -2831,6 +2850,20 @@ function MachineDrawer({
           </dd>
           <dt {...stylex.props(styles.kvDt)}>RAM</dt>
           <dd {...stylex.props(styles.kvDd)}>{m.ram}GB</dd>
+          <dt {...stylex.props(styles.kvDt)}>Client</dt>
+          <dd {...stylex.props(styles.kvDd)}>
+            {installedVersion ? (
+              <>
+                <InlineCode>v{installedVersion}</InlineCode>
+                {versionStatus === "latest" ? " · latest" : null}
+                {versionStatus === "outdated" && latestVersion
+                  ? ` · update available (v${latestVersion})`
+                  : null}
+              </>
+            ) : (
+              "Not reported"
+            )}
+          </dd>
           <dt {...stylex.props(styles.kvDt)}>Paired</dt>
           <dd {...stylex.props(styles.kvDd)}>{m.pairedAt}</dd>
           {m.trustLevel ? (

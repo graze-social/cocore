@@ -45,6 +45,7 @@ type ProviderRecordBody = {
   ramGB?: number;
   gpuCores?: number;
   memoryBandwidthGBs?: number;
+  binaryVersion?: string;
   createdAt?: string;
   active?: boolean;
   provisioning?: boolean;
@@ -96,6 +97,7 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
     ramGB: typeof o.ramGB === "number" ? o.ramGB : undefined,
     gpuCores: typeof o.gpuCores === "number" ? o.gpuCores : undefined,
     memoryBandwidthGBs: typeof o.memoryBandwidthGBs === "number" ? o.memoryBandwidthGBs : undefined,
+    binaryVersion: typeof o.binaryVersion === "string" ? o.binaryVersion : undefined,
     createdAt: typeof o.createdAt === "string" ? o.createdAt : undefined,
     active: typeof o.active === "boolean" ? o.active : undefined,
     provisioning: typeof o.provisioning === "boolean" ? o.provisioning : undefined,
@@ -589,7 +591,7 @@ export async function fetchAdvisorStanding(did: string): Promise<AdvisorStanding
           // when COCORE_CONFIDENTIAL_REQUIRE_SE_KEY is enforced.
           secureEnclaveAvailable: r.secureEnclaveAvailable === true,
         });
-        byMachineId.set(r.machineId as string, {
+        return byMachineId.set(r.machineId as string, {
           unhealthy: r.unhealthy === true,
           unhealthyReason: typeof r.unhealthyReason === "string" ? r.unhealthyReason : null,
           silentFailure: r.silentFailure === true,
@@ -735,6 +737,7 @@ export function providerRowsToMachines(
       vram: gpuCores > 0 ? gpuCores : ram,
       chipMeta,
       ram,
+      binaryVersion: body.binaryVersion,
       pairedAt: formatMachinePairedAt(body.createdAt),
       earnings24h: earn24,
       earnings7d: earn7,

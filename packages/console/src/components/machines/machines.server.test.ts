@@ -19,7 +19,12 @@ import type {
   FleetReceiptStats,
   MachineReceiptStats,
 } from "./machines.server.ts";
-import { advisorUnreachable, machineNetworkStanding, type Machine } from "./machines-data.ts";
+import {
+  advisorUnreachable,
+  clientVersionStatus,
+  machineNetworkStanding,
+  type Machine,
+} from "./machines-data.ts";
 
 const NOW = Date.UTC(2026, 5, 11, 12, 0, 0); // fixed "now"
 const minsAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
@@ -189,6 +194,19 @@ test("a healthy record produces no fault fields", () => {
   assert.equal(m.faultCode, undefined);
   assert.equal(m.faultReason, undefined);
   assert.equal(m.faultModels, undefined);
+});
+
+test("maps and compares the machine client version", () => {
+  const m = providerRowsToMachines(
+    [providerRow({ binaryVersion: "0.9.9" })],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(m.binaryVersion, "0.9.9");
+  assert.equal(clientVersionStatus(m.binaryVersion, "v0.9.10"), "outdated");
+  assert.equal(clientVersionStatus("0.9.10", "v0.9.10"), "latest");
+  assert.equal(clientVersionStatus("0.10.0", "v0.9.10"), "latest");
+  assert.equal(clientVersionStatus(undefined, "v0.9.10"), null);
 });
 
 test("a fault without a human-readable message is ignored (no empty alert)", () => {
