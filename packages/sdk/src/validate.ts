@@ -244,6 +244,7 @@ export async function verifyReceiptStrict(
       valid = await verifyReceiptSignature(
         receipt as unknown as { enclaveSignature?: string } & Record<string, unknown>,
         attestation.publicKey,
+        (attestation as { sigScheme?: string }).sigScheme,
       );
     } catch (e) {
       err(
@@ -535,6 +536,7 @@ export async function verifyForChargeStrict(
       valid = await verifyReceiptSignature(
         inputs.receipt as unknown as { enclaveSignature?: string } & Record<string, unknown>,
         attestation.publicKey,
+        (attestation as { sigScheme?: string }).sigScheme,
       );
     } catch (e) {
       err(

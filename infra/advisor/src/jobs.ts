@@ -29,8 +29,10 @@ import { Effect, Exit, Mailbox, Metric, Stream } from "effect";
 
 import { err } from "@cocore/o11y/http";
 
+import type { BrokerageAuthority } from "./brokerage.ts";
 import { dispatchOutcome } from "./metrics.ts";
 import type { AdvisorMessage, InferenceRequest } from "./protocol.ts";
+import { supportsToolCallsFor } from "./registry.ts";
 import type { ProviderEntry, ProviderRegistry } from "./registry.ts";
 import type { SseResponse } from "./sessions.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -256,6 +258,12 @@ export interface JobsContext {
    *  provider's socket). The brokerage-latency headline; main.ts feeds it
    *  into the rolling window the `/ack` route serves + an OTLP histogram. */
   onDispatched?: (ms: number) => void;
+  /** ADR-0004: the brokerage authority. When set (and the job carries the
+   *  fields needed to bind it), the advisor countersigns each dispatch and
+   *  attaches the block to the `inference_request`; the provider embeds it on
+   *  the receipt. Null → no countersignature (confidential unavailable through
+   *  this brokerage). */
+  brokerage?: BrokerageAuthority | null;
 }
 
 /** Outcome of selecting + preflighting a provider for a parsed job. */
@@ -282,6 +290,14 @@ async function selectProvider(
   const job = parsed.body;
 
   const preflightTimeoutMs = ctx.preflightTimeoutMs ?? 1500;
+
+  // A job carrying `tools` may only be routed to a machine with VERIFIED
+  // tool-call support for its model (the engine passed the forced-tool
+  // startup canary). Without this filter a tools request that clears the
+  // console's "some provider supports tool calling" preflight can still land
+  // on a sibling machine serving the same model WITHOUT tool calling enabled,
+  // whose vLLM then rejects the request mid-stream.
+  const wantsToolCalls = Array.isArray(job.tools) && job.tools.length > 0;
 
   // Build the candidate list. A pinned `targetProviderDid` restricts
   // dispatch to that owner's machines (optionally a single machine via
@@ -314,20 +330,40 @@ async function selectProvider(
         return false;
       }
       if (m.unhealthyAt !== null) return false;
+      // Repeated recent failures → on a routing cooldown. Pinning a machine
+      // doesn't buy a pass around one that keeps dropping mid-stream; the open
+      // pool (pickCandidates) enforces the same via the shared `isCoolingDown`.
+      if (ctx.registry.isCoolingDown(m.did, m.machineId, now)) return false;
       // Version floor (e.g. image input → messages-v1). Fail-closed: a
       // machine that doesn't report a version is treated as below it.
       if (job.minProviderVersion && !meetsMinVersion(m.binaryVersion, job.minProviderVersion)) {
         return false;
       }
+      // Tools in the request → the machine must have passed the forced-tool
+      // canary for this model. Pinning a provider doesn't buy a pass: the
+      // engine would reject the request anyway, so fail fast with the reason.
+      if (wantsToolCalls && !supportsToolCallsFor(m, job.model || undefined)) {
+        return false;
+      }
       return true;
     });
     if (eligible.length === 0) {
+      // Distinguish "all this owner's machines are cooling down from repeated
+      // failures" from the generic no-healthy-machine case, so the requester
+      // sees why a named provider is temporarily unroutable.
+      const allCooling =
+        machines.length > 0 &&
+        machines.every((m) => ctx.registry.isCoolingDown(m.did, m.machineId, now));
       return {
         kind: "error",
         status: 503,
-        error: job.minProviderVersion
-          ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
-          : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
+        error: wantsToolCalls
+          ? `provider ${job.targetProviderDid} has no machine with verified tool-calling for this model available`
+          : job.minProviderVersion
+            ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
+            : allCooling
+              ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
+              : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
       };
     }
     eligible.sort((a, b) => b.lastSeen - a.lastSeen);
@@ -339,14 +375,17 @@ async function selectProvider(
       ctx.attestationMaxAgeMs,
       Date.now(),
       job.minProviderVersion ?? null,
+      wantsToolCalls,
     );
     if (candidates.length === 0) {
       return {
         kind: "error",
         status: 503,
-        error: job.minProviderVersion
-          ? `no attested providers at version >= ${job.minProviderVersion} available`
-          : "no attested providers available",
+        error: wantsToolCalls
+          ? "no attested providers with verified tool-calling for this model available"
+          : job.minProviderVersion
+            ? `no attested providers at version >= ${job.minProviderVersion} available`
+            : "no attested providers available",
       };
     }
   }
@@ -439,6 +478,22 @@ function dispatch(
     receivedAt,
   );
 
+  // ADR-0004: countersign this dispatch so the receipt can prove a trusted
+  // brokerage routed THIS job to the attested machine. We can only bind when the
+  // job carries a jobCid and the chosen provider has a published attestation URI
+  // (both are part of the canonical witness); otherwise we attach nothing and
+  // the receipt is best-effort through this brokerage.
+  const countersignature =
+    ctx.brokerage && job.jobCid && provider.attestationUri
+      ? ctx.brokerage.sign({
+          jobUri: job.jobUri,
+          jobCid: job.jobCid,
+          machineId: provider.machineId,
+          attestation: provider.attestationUri,
+          requester: job.requesterDid,
+        })
+      : undefined;
+
   const inferenceFrame: AdvisorMessage = {
     type: "inference_request",
     job_uri: job.jobUri,
@@ -452,6 +507,7 @@ function dispatch(
     ...(job.outputSchema ? { output_schema: job.outputSchema } : {}),
     ...(job.tools ? { tools: job.tools } : {}),
     ...(job.toolChoice ? { tool_choice: job.toolChoice } : {}),
+    ...(countersignature ? { brokerage_countersignature: countersignature } : {}),
     session_id: job.sessionId,
   } as InferenceRequest & { type: "inference_request" };
 

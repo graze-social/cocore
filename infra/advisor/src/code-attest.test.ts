@@ -96,10 +96,11 @@ describe("apns sender", () => {
     expect(ok).toBe(true);
   });
 
-  it("sealCodeChallenge seals to K so only K's holder recovers the nonce", () => {
+  it("sealCodeChallenge seals to K so only K's holder recovers the nonce", async () => {
     const recipient = nacl.box.keyPair();
     const nonce = makeCodeNonce();
-    const { epk, n } = sealCodeChallenge(nonce, bytesToBase64(recipient.publicKey));
+    // Omit encScheme → the X25519 default (an old software-key agent).
+    const { epk, n } = await sealCodeChallenge(nonce, bytesToBase64(recipient.publicKey));
     // The provider opens it: framed = boxNonce(24) || box.
     const framed = new Uint8Array(Buffer.from(n, "base64"));
     const boxNonce = framed.slice(0, nacl.box.nonceLength);

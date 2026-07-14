@@ -34,11 +34,46 @@ final class AgentSupervisor {
     /// machine keeps crashing — Send bug report?" affordance instead of
     /// silently respawning while the ledger stays flat.
     var onCrashLoop: ((Int) -> Void)?
+    /// Fired when the supervisor has opened the restart circuit breaker — i.e.
+    /// the agent has been (re)spawned too many times in a short window and we
+    /// have STOPPED respawning it to end the churn. The menu bar surfaces this
+    /// as "auto-restart paused — Retry" so a machine that can't stabilise
+    /// (e.g. confidential never verifies) stops burning CPU on a ~1/min bounce
+    /// loop instead of respawning behind the user's back forever.
+    var onRestartStorm: (() -> Void)?
     /// Unexpected exits since the last clean run. Reset when the agent
     /// stays up long enough to look healthy.
     private var crashCount = 0
     /// At how many rapid crashes we start nudging the user.
     private let crashLoopThreshold = 3
+
+    // Restart circuit breaker (app-supervised path). EVERY (re)spawn — a
+    // crash-respawn, a reconciler auto-bounce, a user Resume — funnels through
+    // `spawnChild()`, so gating there catches a restart storm no matter which
+    // caller drives it. This is the belt-and-suspenders backstop for the
+    // per-reconciler #90 cooldown: bug report br_ed8f257c showed ~50
+    // graceful-shutdown+respawn cycles/hour (a steady ~62s loop) while
+    // attested-confidential refused to verify, yet the machine's `active`
+    // switch was on and no single reconciler should have bounced that fast —
+    // so a path was bypassing the cooldown. A choke-point limiter can't be
+    // bypassed. When too many spawns land in the window we OPEN the circuit:
+    // refuse to respawn for a cooldown, surface it, and self-heal with a single
+    // half-open probe once the cooldown passes.
+    private var spawnTimes: [Date] = []
+    private var circuitOpenUntil: Date?
+    /// Trip once this many spawns land within `restartStormWindow`. Tuned to
+    /// catch br_ed8f257c's ~62–68s cycle: at that cadence 5 prior spawns land
+    /// inside a 6-minute window, so the circuit opens ~5–6 min into a loop —
+    /// fast enough to stop the churn, while legitimate restarts (a model
+    /// change, a user Pause/Resume, an occasional crash) never reach 5 in 6
+    /// minutes, and the user-intent paths reset the window anyway.
+    private let restartStormThreshold = 5
+    private let restartStormWindow: TimeInterval = 360   // 6 min
+    /// How long the circuit stays open (no respawns) after it trips. After it
+    /// lapses, exactly one probe spawn is allowed; if that storms again the
+    /// circuit re-opens, so a persistently-broken machine settles at one probe
+    /// per cooldown instead of ~1 restart/min.
+    private let circuitOpenDuration: TimeInterval = 15 * 60
 
     // Crash-restart bookkeeping for the app-supervised (no-LaunchAgent)
     // path. When we own the agent process, nothing else resurrects it on an
@@ -99,6 +134,7 @@ final class AgentSupervisor {
         // (which fires on exit) doesn't treat this as a crash and respawn.
         intentionalStop = true
         if let p = process {
+            Self.supervisorLog("stop(): SIGINT agent pid \(p.processIdentifier) (intentional)")
             p.interrupt()
             await waitForExit(p, timeout: 5)
             if p.isRunning { p.terminate() }
@@ -151,7 +187,14 @@ final class AgentSupervisor {
         let p = Process()
         p.executableURL = bin
         p.arguments = ["agent", "diag"]
-        p.environment = ["HOME": NSHomeDirectory()]
+        // Inherit the full environment and only pin HOME. Replacing the env
+        // wholesale (the old `["HOME": ...]`) dropped PATH, so the diag's
+        // system-profile probes (`sysctl`, `ioreg` — both under /usr/sbin,
+        // which execvp's fallback path lacks) all failed and every uploaded
+        // bundle reported chip "unknown" / 0 GB RAM (ticket br_23e56917).
+        var env = ProcessInfo.processInfo.environment
+        env["HOME"] = NSHomeDirectory()
+        p.environment = env
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
@@ -179,8 +222,8 @@ final class AgentSupervisor {
     func sendBugReport(note: String? = nil) async -> String? {
         guard let bundle = Self.generateBugReportBundle() else { return nil }
         // Target session.apiBase — the service that paired us holds our bearer
-        // key. (Follow-up: the AppView should serve /api/agent/bug-report too,
-        // so device-pair'd agents can upload; today only the console does.)
+        // key (both the console and the AppView serve /api/agent/bug-report;
+        // each resolves the keys it minted).
         guard let session = SessionStore.load(),
               let apiKey = session.apiKey,
               let base = session.apiBase,
@@ -235,8 +278,66 @@ final class AgentSupervisor {
 
     // MARK: - dev-spawn fallback
 
+    // Pure decision for the restart circuit breaker, factored out of
+    // `spawnChild` so it's unit-testable without spawning real processes.
+    enum CircuitAction: Equatable { case allow, refuse, trip }
+    struct CircuitEval: Equatable {
+        let action: CircuitAction
+        /// Prior spawn instants still inside the window (already pruned).
+        /// Meaningful for `.allow` (append `now`) and `.trip` (cleared).
+        let prunedSpawnTimes: [Date]
+    }
+
+    /// Decide whether a spawn is permitted right now.
+    ///  * `.refuse` — circuit is open and still in its cooldown; stay down.
+    ///  * `.trip`   — this attempt pushes the recent spawn count to the
+    ///                threshold; open the circuit and don't spawn.
+    ///  * `.allow`  — spawn; caller appends `now` to `prunedSpawnTimes`.
+    /// A lapsed `circuitOpenUntil` (deadline in the past) is treated as closed,
+    /// so the first attempt after the cooldown is a half-open probe.
+    nonisolated static func evaluateCircuit(
+        now: Date, spawnTimes: [Date], circuitOpenUntil: Date?,
+        threshold: Int, window: TimeInterval
+    ) -> CircuitEval {
+        if let until = circuitOpenUntil, now < until {
+            return CircuitEval(action: .refuse, prunedSpawnTimes: spawnTimes)
+        }
+        let pruned = spawnTimes.filter { now.timeIntervalSince($0) < window }
+        if pruned.count >= threshold {
+            return CircuitEval(action: .trip, prunedSpawnTimes: [])
+        }
+        return CircuitEval(action: .allow, prunedSpawnTimes: pruned)
+    }
+
     private func spawnChild() {
         guard process == nil else { return }
+        // Restart circuit breaker. If we're inside a cooldown from a prior
+        // storm, refuse to respawn — the machine stays down (cleanly stopped,
+        // "Retry" in the menu) rather than churning. One probe is allowed once
+        // the cooldown lapses (half-open), so a machine whose problem cleared
+        // recovers on its own without a user click.
+        let now = Date()
+        let eval = Self.evaluateCircuit(
+            now: now, spawnTimes: spawnTimes, circuitOpenUntil: circuitOpenUntil,
+            threshold: restartStormThreshold, window: restartStormWindow)
+        switch eval.action {
+        case .refuse:
+            let mins = circuitOpenUntil.map { Int($0.timeIntervalSince(now) / 60) + 1 } ?? 0
+            Self.supervisorLog(
+                "spawn REFUSED — restart circuit open ~\(mins)m more; not respawning (waiting out a restart storm)")
+            return
+        case .trip:
+            circuitOpenUntil = now.addingTimeInterval(circuitOpenDuration)
+            spawnTimes = eval.prunedSpawnTimes
+            Self.supervisorLog(
+                "restart STORM: \(restartStormThreshold)+ spawns in \(Int(restartStormWindow))s — OPENING circuit for \(Int(circuitOpenDuration / 60))m; NOT respawning. Likely cause: a desired posture (e.g. attested-confidential) that never verifies.")
+            onRestartStorm?()
+            return
+        case .allow:
+            spawnTimes = eval.prunedSpawnTimes + [now]
+            Self.supervisorLog(
+                "spawnChild: launching agent (spawns in last \(Int(restartStormWindow))s = \(spawnTimes.count)/\(restartStormThreshold))")
+        }
         // A fresh deliberate start clears the stop latch so a later
         // unexpected exit is treated as a crash and respawned.
         intentionalStop = false
@@ -327,8 +428,15 @@ final class AgentSupervisor {
                 guard let self else { return }
                 self.process = nil
                 NSLog("cocore agent exited with %d", proc.terminationStatus)
+                let ranForLog = self.lastSpawnAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
                 // Deliberate stop → leave it down.
-                guard !self.intentionalStop else { return }
+                guard !self.intentionalStop else {
+                    Self.supervisorLog(
+                        "agent exited (status \(proc.terminationStatus), ran \(ranForLog)s) after an intentional stop — staying down")
+                    return
+                }
+                Self.supervisorLog(
+                    "agent exited UNEXPECTEDLY (status \(proc.terminationStatus), ran \(ranForLog)s) — will respawn")
                 // Unexpected exit (crash/kill) and we own its lifecycle:
                 // respawn. Widen the backoff if it died soon after starting
                 // (crash loop — e.g. a misconfig), reset it if it ran a
@@ -482,6 +590,51 @@ final class AgentSupervisor {
         while p.isRunning && Date() < deadline {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
+    }
+
+    /// Durable, timestamped record of every supervisor lifecycle decision
+    /// (spawn / stop / respawn / circuit trip) at
+    /// `~/.cocore/logs/supervisor.log`. The tray's NSLog ages out of the
+    /// unified log within hours — exactly why br_ed8f257c's ~62s restart loop
+    /// couldn't be attributed to a caller after the fact. This log persists in
+    /// the diagnostic bundle so the NEXT storm is attributable to the decision
+    /// that drove it, not inferred from the agent's own boot spam.
+    nonisolated static func supervisorLog(_ msg: String) {
+        NSLog("cocore supervisor: %@", msg)
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cocore/logs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let ts = ISO8601DateFormatter().string(from: Date())
+        guard let data = "\(ts) \(msg)\n".data(using: .utf8) else { return }
+        let url = dir.appendingPathComponent("supervisor.log")
+        if let h = try? FileHandle(forWritingTo: url) {
+            defer { try? h.close() }
+            _ = try? h.seekToEnd()
+            try? h.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// True while the restart circuit is open (in its cooldown, refusing
+    /// respawns). The menu bar mirrors this so the "auto-restart paused" row
+    /// clears on its own once the cooldown lapses and a probe succeeds.
+    var restartCircuitOpen: Bool {
+        guard let until = circuitOpenUntil else { return false }
+        return Date() < until
+    }
+
+    /// Clear the restart circuit so the next `start()` spawns immediately.
+    /// ONLY explicit user intent calls this — Resume, Retry confidential, a
+    /// tier change — so a fresh human decision always overrides a cooldown the
+    /// user can see and is deliberately acting against. Passive reconcilers
+    /// never call it, so they can't defeat the storm backstop.
+    func resetRestartCircuit() {
+        if circuitOpenUntil != nil || !spawnTimes.isEmpty {
+            Self.supervisorLog("restart circuit reset by explicit user action")
+        }
+        circuitOpenUntil = nil
+        spawnTimes.removeAll()
     }
 
     /// Write the console + advisor URLs into the LaunchAgent plist's
@@ -723,7 +876,25 @@ final class AgentSupervisor {
     /// non-entitled default binary. Synchronous + called once per spawn (the
     /// same pattern as the other CLI shell-outs in this type).
     nonisolated static func probeTier() -> String {
-        guard let bin = locateBinary() else { return "best-effort" }
+        probeTierResilient()
+    }
+
+    /// UserDefaults key holding the last *definite* tier the CLI resolved, so a
+    /// transient probe failure (the CLI couldn't launch, or returned nothing)
+    /// doesn't flip a confidential machine's worker to best-effort and set off
+    /// the reconcile→auto-bounce churn. This is worker *selection* only, never a
+    /// security grant: the advisor still gates the confidential tier on cdHash +
+    /// code-attestation, so preferring the confidential worker on an ambiguous
+    /// read cannot upgrade an ineligible machine — it just avoids a needless
+    /// restart while the CLI/PDS read recovers.
+    private nonisolated static let lastResolvedTierKey = "lastResolvedTier"
+
+    /// Definite CLI answer, or `nil` when the probe *failed to execute* (couldn't
+    /// launch the binary, or produced no output). A clean read of best-effort is
+    /// NOT a failure — it returns `"best-effort"`. Only genuine execution
+    /// failures return `nil` so the caller can hold the last known tier.
+    private nonisolated static func probeTierRaw() -> String? {
+        guard let bin = locateBinary() else { return nil }
         let p = Process()
         p.executableURL = bin
         p.arguments = ["agent", "tier"]
@@ -736,10 +907,31 @@ final class AgentSupervisor {
             p.waitUntilExit()
             let out = (String(data: data, encoding: .utf8) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            if out.isEmpty { return nil }
             return out == "attested-confidential" ? "attested-confidential" : "best-effort"
         } catch {
-            return "best-effort"
+            return nil
         }
+    }
+
+    /// Resolve the tier for worker selection, tolerant of a transient probe
+    /// failure. A definite answer is authoritative and cached; a hard failure
+    /// falls back to the last cached answer (defaulting to best-effort). The
+    /// Rust `agent tier` already survives an expired PDS session by honoring its
+    /// own durable cache — this layer only guards the case where the CLI itself
+    /// couldn't be run, so one bad spawn doesn't restart the wrong worker.
+    nonisolated static func probeTierResilient() -> String {
+        if let definite = probeTierRaw() {
+            UserDefaults.standard.set(definite, forKey: lastResolvedTierKey)
+            return definite
+        }
+        let cached = UserDefaults.standard.string(forKey: lastResolvedTierKey)
+        if cached == "attested-confidential" {
+            NSLog(
+                "cocore: `agent tier` probe failed to run — holding last-known tier=attested-confidential (worker selection only; advisor still gates confidential)")
+            return "attested-confidential"
+        }
+        return "best-effort"
     }
 
     /// This machine's receipt-signing P-256 public key (base64 of the raw

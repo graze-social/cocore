@@ -11,6 +11,7 @@ import { describe, test } from "vitest";
 import {
   assertPublicUrl,
   isBlockedAddress,
+  makePinnedLookup,
   safeFetchImage,
   UnsafeImageUrlError,
 } from "./safe-image-fetch.server.ts";
@@ -138,6 +139,48 @@ describe("assertPublicUrl", () => {
   test("allows a public literal IP URL", async () => {
     const { pinnedAddress } = await assertPublicUrl("https://8.8.8.8/x", publicDns);
     assert.equal(pinnedAddress, "8.8.8.8");
+  });
+});
+
+describe("makePinnedLookup", () => {
+  // Regression: the production fetch pins the socket via node's `lookup`
+  // option. Node's Happy-Eyeballs / autoSelectFamily (default-on, node 20+)
+  // calls lookup with `{ all: true }` and expects an ARRAY of {address,family};
+  // returning a bare string yielded "Invalid IP address: undefined" and broke
+  // EVERY legitimate image fetch in prod. Assert both call contracts.
+  test("returns an array for the Happy-Eyeballs { all: true } contract", () => {
+    const lookup = makePinnedLookup("93.184.216.34");
+    let out: unknown;
+    lookup("images.example.com", { all: true }, (_e, addr) => {
+      out = addr;
+    });
+    assert.deepEqual(out, [{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  test("returns (address, family) for the single-address contract", () => {
+    const lookup = makePinnedLookup("93.184.216.34");
+    let addr: unknown;
+    let fam: unknown;
+    lookup("images.example.com", {}, (_e, a, f) => {
+      addr = a;
+      fam = f;
+    });
+    assert.equal(addr, "93.184.216.34");
+    assert.equal(fam, 4);
+  });
+
+  test("reports family 6 for an IPv6 pinned address (both contracts)", () => {
+    const lookup = makePinnedLookup("2606:2800:220:1::");
+    let allOut: unknown;
+    lookup("v6.example.com", { all: true }, (_e, addr) => {
+      allOut = addr;
+    });
+    assert.deepEqual(allOut, [{ address: "2606:2800:220:1::", family: 6 }]);
+    let fam: unknown;
+    lookup("v6.example.com", undefined, (_e, _a, f) => {
+      fam = f;
+    });
+    assert.equal(fam, 6);
   });
 });
 

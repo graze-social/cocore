@@ -25,6 +25,12 @@
 // verify the caller's DID for:
 //   * dev.cocore.devicePair.confirm — approve a device-pairing
 //   * dev.cocore.inference.dispatch — forward an inference dispatch
+//   * dev.cocore.compute.register  — the agent's DID-bound advisor
+//     registration (the agent posts /api/pds/getServiceAuth with this lxm;
+//     without the grant every agent falls back to registering with the
+//     advisor unauthenticated — seen fleet-wide as `ScopeMissingError` in
+//     agent logs, e.g. ticket br_23e56917 — which blocks ever enforcing
+//     DID-auth at the advisor).
 // `aud: "*"` keeps the grant environment-agnostic (this static list can't
 // name a per-env AppView DID); the console only ever targets the AppView.
 //
@@ -57,7 +63,11 @@ export const oauthScopes = [
     action: ["create", "update", "delete"],
   }),
   atprotoScope.rpc({
-    lxm: ["dev.cocore.devicePair.confirm", "dev.cocore.inference.dispatch"],
+    lxm: [
+      "dev.cocore.devicePair.confirm",
+      "dev.cocore.inference.dispatch",
+      "dev.cocore.compute.register",
+    ],
     aud: "*",
   }),
 ];

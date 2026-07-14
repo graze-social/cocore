@@ -81,7 +81,11 @@ import {
   listMyFriendsQueryOptions,
   type ListedFriend,
 } from "@/components/friends/friends.functions.ts";
-import { ProBonoBadge, RegionFlag } from "@/components/machines/MachineBadges.tsx";
+import {
+  NetworkStandingBadge,
+  ProBonoBadge,
+  RegionFlag,
+} from "@/components/machines/MachineBadges.tsx";
 import {
   dedupMyProviderRecordsMutationOptions,
   deleteMyProviderRecordMutationOptions,
@@ -94,7 +98,14 @@ import {
 } from "@/components/machines/machines.functions.ts";
 import { formatTokens, formatTokensCompact } from "@/lib/token-display.ts";
 
-import { type Machine, type MachineState } from "./machines-data.ts";
+import {
+  advisorUnreachable,
+  clientVersionStatus,
+  type Machine,
+  type MachineState,
+  machineStateLabel,
+  machineStatusText,
+} from "./machines-data.ts";
 import { Page } from "@/design-system/page/index.tsx";
 import { Text } from "@/design-system/typography/text.tsx";
 import { ResizableTableContainer, Collection } from "react-aria-components";
@@ -106,7 +117,7 @@ const FLEET_TABLE_COLUMNS: {
   minWidth?: number;
   maxWidth?: number;
 }[] = [
-  { id: "alias", name: "Alias", width: 320 },
+  { id: "alias", name: "Alias", width: 400 },
   { id: "state", name: "State", width: 80 },
   { id: "gpu", name: "GPU", width: 120 },
   { id: "job", name: "Status", minWidth: 140 },
@@ -124,16 +135,28 @@ const FLEET_TABLE_COLUMNS: {
 interface ModelFloor {
   /** Floor RAM in GB below which the model is unlikely to load. */
   minRamGB: number;
-  /** Short human label for the warning copy (e.g. "Qwen2.5-3B"). */
+  /** Short human label for the warning copy (e.g. "Qwen3.5-4B"). */
   label: string;
 }
 
 const MODEL_RAM_FLOORS: Readonly<Record<string, ModelFloor>> = {
+  "mlx-community/Qwen3.5-0.8B-MLX-4bit": { minRamGB: 4, label: "Qwen3.5-0.8B" },
+  "mlx-community/Qwen3.5-2B-MLX-4bit": { minRamGB: 6, label: "Qwen3.5-2B" },
+  "mlx-community/Qwen3.5-4B-MLX-4bit": { minRamGB: 8, label: "Qwen3.5-4B" },
+  "mlx-community/Qwen3.5-9B-MLX-4bit": { minRamGB: 16, label: "Qwen3.5-9B" },
+  "mlx-community/Qwen3.5-27B-4bit": { minRamGB: 24, label: "Qwen3.5-27B" },
+  "mlx-community/Qwen3.6-27B-4bit": { minRamGB: 24, label: "Qwen3.6-27B" },
+  "mlx-community/Qwen3.5-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.5-35B-A3B" },
+  "mlx-community/Qwen3.6-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.6-35B-A3B" },
+  "mlx-community/Qwen3.6-35B-A3B-4bit-DWQ": { minRamGB: 32, label: "Qwen3.6-35B-A3B DWQ" },
+  "mlx-community/Qwen3.5-122B-A10B-4bit": { minRamGB: 96, label: "Qwen3.5-122B-A10B" },
+  "mlx-community/Qwen3.5-397B-A17B-4bit": { minRamGB: 256, label: "Qwen3.5-397B-A17B" },
   "mlx-community/Qwen2.5-0.5B-Instruct-4bit": { minRamGB: 4, label: "Qwen2.5-0.5B" },
   "mlx-community/Qwen2.5-3B-Instruct-4bit": { minRamGB: 8, label: "Qwen2.5-3B" },
   "mlx-community/Qwen2.5-7B-Instruct-4bit": { minRamGB: 16, label: "Qwen2.5-7B" },
   "mlx-community/gemma-3-4b-it-qat-4bit": { minRamGB: 8, label: "Gemma 3 4B" },
   "mlx-community/Qwen2.5-32B-Instruct-4bit": { minRamGB: 32, label: "Qwen2.5-32B" },
+  "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit": { minRamGB: 64, label: "Llama 4 Scout" },
   "mlx-community/Llama-3.3-70B-Instruct-4bit": { minRamGB: 64, label: "Llama 3.3 70B" },
 };
 
@@ -172,6 +195,15 @@ type FleetBodyRow = Machine | { id: string; kind: "empty" };
 
 function isFleetEmptyRow(row: FleetBodyRow): row is { id: string; kind: "empty" } {
   return "kind" in row && row.kind === "empty";
+}
+
+async function fetchLatestClientVersion(): Promise<string | null> {
+  const response = await fetch("/agent/policy");
+  if (!response.ok) return null;
+  const policy = (await response.json()) as unknown;
+  if (!policy || typeof policy !== "object") return null;
+  const latest = (policy as Record<string, unknown>)["latest"];
+  return typeof latest === "string" && latest.length > 0 ? latest : null;
 }
 
 const styles = stylex.create({
@@ -1271,7 +1303,7 @@ export function ManageModelsDialogContent({
               label="Add a model"
               value={draft}
               onChange={setDraft}
-              placeholder="mlx-community/Qwen2.5-3B-Instruct-4bit"
+              placeholder="mlx-community/Qwen3.5-4B-MLX-4bit"
               style={styles.modelAddField}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
@@ -2370,7 +2402,7 @@ export function MachinesDashboard() {
                         if (column.id === "alias") {
                           return (
                             <TableCell contentStyle={styles.aliasCellContent}>
-                              <Flex direction="row" gap="md" align="center">
+                              <Flex direction="row" gap="md" align="center" wrap>
                                 <RouterLink
                                   to="/machines/$rkey"
                                   params={{ rkey: m.id }}
@@ -2386,6 +2418,7 @@ export function MachinesDashboard() {
                                 {m.verifiedTier ? <TrustTierBadge tier={m.verifiedTier} /> : null}
                                 <RegionFlag region={m.region} />
                                 <ProBonoBadge mode={m.proBonoMode} />
+                                <NetworkStandingBadge m={m} />
                               </Flex>
                             </TableCell>
                           );
@@ -2408,7 +2441,7 @@ export function MachinesDashboard() {
                                   )}
                                 />
 
-                                {m.faultReason ? "fault" : m.state}
+                                {m.faultReason ? "fault" : machineStateLabel(m.state)}
                               </Flex>
                             </TableCell>
                           );
@@ -2425,20 +2458,16 @@ export function MachinesDashboard() {
                         if (column.id === "job") {
                           return (
                             <TableCell>
-                              {m.faultReason ? (
-                                <LabelText variant="secondary" style={styles.faultText}>
-                                  Engine not loaded — only serving stub
-                                </LabelText>
-                              ) : (
-                                <LabelText variant="secondary">
-                                  {m.state === "provisioning" &&
-                                    "Starting up — loading the engine…"}
-                                  {m.state === "idle" && "Eligible for matching when active"}
-                                  {m.state === "paused" && (m.pausedReason ?? "Paused")}
-                                  {m.state === "running" && "Served a job in the last 5 min"}
-                                  {m.state === "offline" && (m.offlineReason ?? "Offline")}
-                                </LabelText>
-                              )}
+                              <LabelText
+                                variant="secondary"
+                                style={
+                                  m.faultReason || advisorUnreachable(m)
+                                    ? styles.faultText
+                                    : undefined
+                                }
+                              >
+                                {machineStatusText(m)}
+                              </LabelText>
                             </TableCell>
                           );
                         }
@@ -2567,17 +2596,7 @@ function FleetMachineCard({
   onOpenDetail: () => void;
 }) {
   const tokensEarned24h = formatTokens(m.earnings24h);
-  const statusText = m.faultReason
-    ? "Engine not loaded — only serving stub"
-    : m.state === "provisioning"
-      ? "Starting up — loading the engine…"
-      : m.state === "idle"
-        ? "Eligible for matching when active"
-        : m.state === "paused"
-          ? (m.pausedReason ?? "Paused")
-          : m.state === "running"
-            ? "Served a job in the last 5 min"
-            : (m.offlineReason ?? "Offline");
+  const statusText = machineStatusText(m);
   return (
     <div {...stylex.props(styles.fleetCard)}>
       <div {...stylex.props(styles.fleetCardHead)}>
@@ -2592,6 +2611,7 @@ function FleetMachineCard({
           <span {...stylex.props(styles.fleetCardRkey)}>{m.id}</span>
         </div>
         <span {...stylex.props(styles.fleetCardState)}>
+          <NetworkStandingBadge m={m} />
           <span
             {...stylex.props(
               styles.statusDot,
@@ -2603,7 +2623,7 @@ function FleetMachineCard({
               Boolean(m.faultReason) && styles.statusFault,
             )}
           />
-          {m.faultReason ? "fault" : m.state}
+          {m.faultReason ? "fault" : machineStateLabel(m.state)}
         </span>
       </div>
 
@@ -2622,7 +2642,10 @@ function FleetMachineCard({
 
       <LabelText
         variant="secondary"
-        style={[styles.fleetCardStatus, m.faultReason ? styles.faultText : undefined]}
+        style={[
+          styles.fleetCardStatus,
+          m.faultReason || advisorUnreachable(m) ? styles.faultText : undefined,
+        ]}
       >
         {statusText}
       </LabelText>
@@ -2685,6 +2708,19 @@ function FleetMachineCard({
   );
 }
 
+/** "Jul 4, 01:52" for a fault's RFC3339 timestamp; the raw string when it
+ *  doesn't parse (the field is agent-published and advisory). */
+function formatMachineFaultAt(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function MachineDrawer({
   m,
   onAction,
@@ -2693,6 +2729,15 @@ function MachineDrawer({
   onAction: (action: string, m: Machine) => void;
 }) {
   const tk = (tokens: number) => `${formatTokens(tokens)} tk`;
+  const { data: latestClientVersion } = useQuery({
+    queryKey: ["agent-policy", "latest"],
+    queryFn: fetchLatestClientVersion,
+    staleTime: 300_000,
+    enabled: Boolean(m.binaryVersion),
+  });
+  const versionStatus = clientVersionStatus(m.binaryVersion, latestClientVersion);
+  const installedVersion = m.binaryVersion?.replace(/^v/i, "");
+  const latestVersion = latestClientVersion?.replace(/^v/i, "");
   return (
     <div {...stylex.props(styles.drawer)}>
       <Flex gap="2xl" direction="column" style={styles.drawerSection}>
@@ -2720,6 +2765,30 @@ function MachineDrawer({
                 <InlineCode>{m.faultCode ?? "unknown"}</InlineCode>, and we'll help you get it
                 online.
               </SmallBody>
+            </Flex>
+          </Alert>
+        ) : null}
+        {advisorUnreachable(m) ? (
+          <Alert variant="warning" title="Serving locally — can't reach the co/core network">
+            <Flex gap="md" direction="column">
+              <SmallBody>
+                {m.advisorFaultReason ??
+                  "This machine's record says it's serving, but the network currently holds no live connection to it — no jobs will reach it until it reconnects. It usually rejoins on its own within a minute; if this persists, the connection is likely being blocked."}
+              </SmallBody>
+              <SmallBody variant="secondary">
+                Common causes: a VPN or proxy on the machine's network, a firewall that blocks
+                outbound WebSocket (wss) connections, or captive/guest Wi-Fi that filters them. Try
+                a different network or allow secure WebSocket traffic, then the machine rejoins
+                automatically — no restart needed.
+              </SmallBody>
+              {m.advisorFaultCode ? (
+                <SmallBody variant="secondary">
+                  Fault code: <InlineCode>{m.advisorFaultCode}</InlineCode>
+                  {m.advisorFaultAt ? (
+                    <> · observed {formatMachineFaultAt(m.advisorFaultAt)}</>
+                  ) : null}
+                </SmallBody>
+              ) : null}
             </Flex>
           </Alert>
         ) : null}
@@ -2781,6 +2850,20 @@ function MachineDrawer({
           </dd>
           <dt {...stylex.props(styles.kvDt)}>RAM</dt>
           <dd {...stylex.props(styles.kvDd)}>{m.ram}GB</dd>
+          <dt {...stylex.props(styles.kvDt)}>Client</dt>
+          <dd {...stylex.props(styles.kvDd)}>
+            {installedVersion ? (
+              <>
+                <InlineCode>v{installedVersion}</InlineCode>
+                {versionStatus === "latest" ? " · latest" : null}
+                {versionStatus === "outdated" && latestVersion
+                  ? ` · update available (v${latestVersion})`
+                  : null}
+              </>
+            ) : (
+              "Not reported"
+            )}
+          </dd>
           <dt {...stylex.props(styles.kvDt)}>Paired</dt>
           <dd {...stylex.props(styles.kvDd)}>{m.pairedAt}</dd>
           {m.trustLevel ? (

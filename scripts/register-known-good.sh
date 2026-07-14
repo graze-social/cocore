@@ -24,7 +24,7 @@
 # Flags:
 #   --apply              set COCORE_KNOWN_GOOD_CDHASHES on Railway (redeploys).
 #   --service <name>     advisor service name (default "Advisor"; see note).
-#   --max <n>            retain at most the n most-recent cdHashes (default 5;
+#   --max <n>            retain at most the n most-recent cdHashes (default 20;
 #                        0 = unbounded). Oldest are evicted first so users still
 #                        on a recent prior release keep being recognized.
 #
@@ -48,7 +48,9 @@ SERVICE="${COCORE_ADVISOR_SERVICE:-Advisor}"
 # releases, while still recognizing recent prior versions so users mid-update
 # aren't dropped (the bug this whole flow exists to prevent). Oldest are evicted
 # first. 0 = unbounded. Override with --max or COCORE_KNOWN_GOOD_MAX.
-MAX="${COCORE_KNOWN_GOOD_MAX:-5}"
+# Bumped 5→20 (2026-07-06): the confidential fleet updates slowly and a wider
+# window keeps mid-update machines recognized across more releases.
+MAX="${COCORE_KNOWN_GOOD_MAX:-20}"
 apply="no"
 positional=()
 while [[ $# -gt 0 ]]; do

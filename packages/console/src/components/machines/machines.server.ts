@@ -1,6 +1,6 @@
 import type { AppviewIndexedRecord } from "@/integrations/appview/appview.server.ts";
 import { cocoreConfig } from "@/lib/cocore-config.ts";
-import { verifiedTierFor, type VerifiedTier } from "@/lib/verified-standing.server.ts";
+import { resolveVerifiedTier, type VerifiedTier } from "@/lib/verified-standing.server.ts";
 
 import type { Machine, MachineState } from "./machines-data.ts";
 
@@ -33,12 +33,19 @@ type EngineFaultBody = {
   models?: string[];
 };
 
+type AdvisorFaultBody = {
+  code?: string;
+  message?: string;
+  observedAt?: string;
+};
+
 type ProviderRecordBody = {
   machineLabel?: string;
   chip?: string;
   ramGB?: number;
   gpuCores?: number;
   memoryBandwidthGBs?: number;
+  binaryVersion?: string;
   createdAt?: string;
   active?: boolean;
   provisioning?: boolean;
@@ -49,10 +56,12 @@ type ProviderRecordBody = {
   supportedModels?: string[];
   desiredModels?: string[];
   engineFault?: EngineFaultBody;
+  advisorFault?: AdvisorFaultBody;
   shareLocation?: boolean;
   region?: string;
   proBono?: { mode?: string; dids?: string[] };
   toolCalls?: boolean;
+  attestationPubKey?: string;
 };
 
 type ReceiptRecordBody = {
@@ -88,6 +97,7 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
     ramGB: typeof o.ramGB === "number" ? o.ramGB : undefined,
     gpuCores: typeof o.gpuCores === "number" ? o.gpuCores : undefined,
     memoryBandwidthGBs: typeof o.memoryBandwidthGBs === "number" ? o.memoryBandwidthGBs : undefined,
+    binaryVersion: typeof o.binaryVersion === "string" ? o.binaryVersion : undefined,
     createdAt: typeof o.createdAt === "string" ? o.createdAt : undefined,
     active: typeof o.active === "boolean" ? o.active : undefined,
     provisioning: typeof o.provisioning === "boolean" ? o.provisioning : undefined,
@@ -102,10 +112,15 @@ function parseProviderBody(body: unknown): ProviderRecordBody {
       ? o.desiredModels.filter((m): m is string => typeof m === "string")
       : undefined,
     engineFault: parseEngineFault(o.engineFault),
+    advisorFault: parseAdvisorFault(o.advisorFault),
     shareLocation: typeof o.shareLocation === "boolean" ? o.shareLocation : undefined,
     region: typeof o.region === "string" ? o.region : undefined,
     proBono: parseProBono(o.proBono),
     toolCalls: typeof o.toolCalls === "boolean" ? o.toolCalls : undefined,
+    attestationPubKey:
+      typeof o.attestationPubKey === "string" && o.attestationPubKey.length > 0
+        ? o.attestationPubKey
+        : undefined,
   };
 }
 
@@ -136,6 +151,23 @@ function parseEngineFault(raw: unknown): EngineFaultBody | undefined {
     models: Array.isArray(o.models)
       ? o.models.filter((m): m is string => typeof m === "string")
       : undefined,
+  };
+}
+
+/** Parse the provider record's `advisorFault` — published by the agent when
+ *  its WebSocket to the advisor keeps failing to connect, i.e. the machine
+ *  serves locally but is invisible to the network. Same tolerance posture as
+ *  {@link parseEngineFault}: a fault is only meaningful with a message. */
+function parseAdvisorFault(raw: unknown): AdvisorFaultBody | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const code = typeof o.code === "string" ? o.code : undefined;
+  const message = typeof o.message === "string" ? o.message : undefined;
+  if (!message) return undefined;
+  return {
+    code,
+    message,
+    observedAt: typeof o.observedAt === "string" ? o.observedAt : undefined,
   };
 }
 
@@ -492,6 +524,9 @@ interface AdvisorStanding {
   /** Tier recomputed from the machine's actual signed attestation (proof-
    *  backed; see verified-standing.server.ts), not its self-asserted value. */
   verifiedTier: VerifiedTier;
+  /** Set when the machine was capped below the tier it opted into — the
+   *  operator-facing "why + how to regain it" nudge. */
+  verifiedTierReason?: string;
 }
 
 export interface AdvisorStandingResult {
@@ -513,6 +548,8 @@ interface AdvisorProviderRow {
   attestationUri?: unknown;
   confidentialEligible?: unknown;
   codeAttested?: unknown;
+  registrationAuthenticated?: unknown;
+  secureEnclaveAvailable?: unknown;
 }
 
 /** Read live machine standing from the advisor's `/providers` and key it by
@@ -539,17 +576,27 @@ export async function fetchAdvisorStanding(did: string): Promise<AdvisorStanding
     // (proof-backed, cached by attestation CID), in parallel with the rest.
     await Promise.all(
       mine.map(async (r) => {
-        const verifiedTier = await verifiedTierFor({
+        const { tier, reason } = await resolveVerifiedTier({
           did,
           attestationUri: typeof r.attestationUri === "string" ? r.attestationUri : null,
           confidentialEligible: r.confidentialEligible === true,
           codeAttested: r.codeAttested === true,
+          // Only an explicit `false` downgrades; a pre-signal advisor omits it
+          // (undefined) and is treated as authenticated.
+          registrationAuthenticated:
+            typeof r.registrationAuthenticated === "boolean"
+              ? r.registrationAuthenticated
+              : undefined,
+          // ADR-0005: the advisor-advertised SE-resident-key flag. Only gates
+          // when COCORE_CONFIDENTIAL_REQUIRE_SE_KEY is enforced.
+          secureEnclaveAvailable: r.secureEnclaveAvailable === true,
         });
-        byMachineId.set(r.machineId as string, {
+        return byMachineId.set(r.machineId as string, {
           unhealthy: r.unhealthy === true,
           unhealthyReason: typeof r.unhealthyReason === "string" ? r.unhealthyReason : null,
           silentFailure: r.silentFailure === true,
-          verifiedTier,
+          verifiedTier: tier,
+          ...(reason ? { verifiedTierReason: reason } : {}),
         });
       }),
     );
@@ -560,10 +607,14 @@ export async function fetchAdvisorStanding(did: string): Promise<AdvisorStanding
 }
 
 /** Overlay live advisor standing onto machines built from PDS records. The
- *  join is by machineId == provider-record rkey == {@link Machine.id}. When
- *  the advisor was unreachable, `standingKnown` is false on every machine and
- *  no unhealthy/connected claim is made (correctness over a fabricated
- *  green). */
+ *  join is by machineId == provider-record rkey == {@link Machine.id}, with a
+ *  fallback on the record's `attestationPubKey`: an agent that couldn't
+ *  publish its provider record at boot (dead PDS session) registers without
+ *  a `machine_id`, and the advisor then keys it by its attestation pubkey —
+ *  the machine is live on the network, so it must not read "not reachable".
+ *  When the advisor was unreachable, `standingKnown` is false on every
+ *  machine and no unhealthy/connected claim is made (correctness over a
+ *  fabricated green). */
 export function applyAdvisorStanding(
   machines: Machine[],
   standing: AdvisorStandingResult,
@@ -572,7 +623,9 @@ export function applyAdvisorStanding(
     if (!standing.reachable) {
       return { ...m, standingKnown: false };
     }
-    const s = standing.byMachineId.get(m.id);
+    const s =
+      standing.byMachineId.get(m.id) ??
+      (m.attestationPubKey ? standing.byMachineId.get(m.attestationPubKey) : undefined);
     return {
       ...m,
       standingKnown: true,
@@ -581,6 +634,7 @@ export function applyAdvisorStanding(
       unhealthyReason: s?.unhealthyReason ?? undefined,
       silentFailure: s?.silentFailure ?? false,
       verifiedTier: s?.verifiedTier ?? "best-effort",
+      verifiedTierReason: s?.verifiedTierReason,
     };
   });
 }
@@ -676,12 +730,14 @@ export function providerRowsToMachines(
 
     const base: Machine = {
       id: row.rkey,
+      attestationPubKey: body.attestationPubKey,
       alias: body.machineLabel?.trim() || row.rkey,
       state: machineStateFromProvider(body, recentlyActive),
       gpu: chip,
       vram: gpuCores > 0 ? gpuCores : ram,
       chipMeta,
       ram,
+      binaryVersion: body.binaryVersion,
       pairedAt: formatMachinePairedAt(body.createdAt),
       earnings24h: earn24,
       earnings7d: earn7,
@@ -699,6 +755,9 @@ export function providerRowsToMachines(
       faultCode: body.engineFault?.code,
       faultReason: body.engineFault?.message,
       faultModels: body.engineFault?.models,
+      advisorFaultCode: body.advisorFault?.code,
+      advisorFaultReason: body.advisorFault?.message,
+      advisorFaultAt: body.advisorFault?.observedAt,
       shareLocation: body.shareLocation,
       region: body.region,
       proBonoMode:

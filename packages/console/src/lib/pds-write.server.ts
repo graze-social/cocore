@@ -24,6 +24,7 @@ import {
   restoreAtprotoSessionEffect,
 } from "@/integrations/auth/atproto.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
+import { appviewBackedSession } from "@/lib/appview-backed-session.server.ts";
 import { forwardPdsWrite, isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
 import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
@@ -508,12 +509,33 @@ export async function pdsGetServiceAuth(request: Request): Promise<Response> {
     return jsonError(403, "aud not permitted");
   }
 
-  const session = await restoreSessionOr401(did);
+  // Single-owner cutover: when forwarding is configured the AppView OWNS and
+  // solely refreshes this DID's session. Minting a service-auth token requires
+  // a live PDS call (com.atproto.server.getServiceAuth) — and restoring the
+  // session locally here refreshes it, rotating the single-use DPoP refresh
+  // token out from under the AppView. The agent re-mints on EVERY advisor
+  // registration (~every 14 min), so this un-migrated path was the second
+  // refresher that cannibalized the session every few hours (browser logouts +
+  // agent 401s + registrationAuthenticated dropping → confidential/Secure off).
+  // Replay through the AppView-backed session instead; the AppView's internal
+  // proxy allowlists exactly this method (see packages/appview/src/pds/write.ts).
+  const session = isAppviewForwardConfigured()
+    ? appviewBackedSession(did)
+    : await restoreSessionOr401(did);
   if (session instanceof Response) return session;
   const qs = new URLSearchParams({ aud, lxm }).toString();
-  const r = await session.handle(`/xrpc/com.atproto.server.getServiceAuth?${qs}`, {
-    method: "GET",
-  });
+  let r: Response;
+  try {
+    r = await session.handle(`/xrpc/com.atproto.server.getServiceAuth?${qs}`, {
+      method: "GET",
+    });
+  } catch (e) {
+    // An AppView-backed `.handle()` throws only on an internal-layer failure
+    // (AppView unreachable / bad secret) — a transient transport problem, not
+    // an upstream PDS status. Surface a 502 so the agent registers without the
+    // token this cycle and retries on the next, rather than a 500 stack.
+    return jsonError(502, `pds getServiceAuth via appview: ${(e as Error).message.slice(0, 200)}`);
+  }
   if (!r.ok) {
     const body = await r.text().catch(() => "");
     return jsonError(r.status >= 500 ? 502 : r.status, `pds getServiceAuth: ${body.slice(0, 300)}`);

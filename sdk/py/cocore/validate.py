@@ -207,7 +207,7 @@ def verify_receipt_strict(
 
     sig = receipt.get("enclaveSignature")
     if sig:
-        if not verify_receipt_signature(receipt, pub):
+        if not verify_receipt_signature(receipt, pub, attestation.get("sigScheme")):
             _err(
                 findings,
                 "signature-invalid",
@@ -400,7 +400,7 @@ def verify_for_charge_strict(
     pub = attestation.get("publicKey", "")
 
     if inputs.receipt.get("enclaveSignature"):
-        if not verify_receipt_signature(inputs.receipt, pub):
+        if not verify_receipt_signature(inputs.receipt, pub, attestation.get("sigScheme")):
             _err(
                 findings,
                 "signature-invalid",

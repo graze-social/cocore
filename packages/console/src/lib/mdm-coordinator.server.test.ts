@@ -13,7 +13,9 @@ import {
   authenticateNanomdmWebhook,
   buildDeviceInformationAttestationCommand,
   buildEnrollmentProfile,
+  chainBindsPubkey,
   enqueueTargetNotEnrolled,
+  freshnessBindsPubkey,
   isValidSerial,
   isValidUdid,
   parseNanomdmAttestationWebhook,
@@ -346,5 +348,39 @@ describe("option-B DeviceInformation attestation (freshness binding)", () => {
     expect(authenticateNanomdmWebhook(wrong)).toBe(false);
     delete process.env["COCORE_NANOMDM_WEBHOOK_KEY"];
     expect(authenticateNanomdmWebhook(viaQuery)).toBe(false); // fail-closed when unset
+  });
+});
+
+describe("attestation key-binding guard (stale-command discard)", () => {
+  // A 64-byte raw P-256 pubkey (X||Y), base64 — the shape agent pubkey emits.
+  const PUBKEY = Buffer.alloc(64, 7).toString("base64");
+  const OTHER = Buffer.alloc(64, 9).toString("base64");
+
+  it("the nonce the coordinator sends for a key binds that key", () => {
+    // attestationNonceBytes(pubkey) is exactly the DeviceAttestationNonce we set,
+    // and Apple reflects it as the leaf freshness code.
+    const fresh = new Uint8Array(attestationNonceBytes(PUBKEY));
+    expect(freshnessBindsPubkey(fresh, PUBKEY)).toBe(true);
+  });
+
+  it("tolerates a DER OCTET STRING wrapper (04 20) on the freshness value", () => {
+    const fresh = attestationNonceBytes(PUBKEY);
+    const wrapped = new Uint8Array(Buffer.concat([Buffer.from([0x04, 0x20]), fresh]));
+    expect(freshnessBindsPubkey(wrapped, PUBKEY)).toBe(true);
+  });
+
+  it("REJECTS a stale key's freshness (the signing-key-rotation trap)", () => {
+    // A leftover queued command attested OTHER's nonce; it must not bind PUBKEY.
+    const staleFresh = new Uint8Array(attestationNonceBytes(OTHER));
+    expect(freshnessBindsPubkey(staleFresh, PUBKEY)).toBe(false);
+  });
+
+  it("rejects a wrong-length freshness value", () => {
+    expect(freshnessBindsPubkey(new Uint8Array(16), PUBKEY)).toBe(false);
+  });
+
+  it("chainBindsPubkey fails closed on an empty or unparseable chain", () => {
+    expect(chainBindsPubkey([], PUBKEY)).toBe(false);
+    expect(chainBindsPubkey(["not-base64-DER"], PUBKEY)).toBe(false);
   });
 });

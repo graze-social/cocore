@@ -30,6 +30,10 @@ pub struct AppAttestEvidence {
 pub struct AttestationInputs {
     pub provider_did: String,
     pub encryption_pub_key_b64: String,
+    /// Short `encScheme` tag for `encryption_pub_key_b64`: `"x25519"` (software,
+    /// extractable) or `"p256-ecies-se"` (Secure-Enclave-resident). Emitted only
+    /// when not `"x25519"` so best-effort canonical bytes stay minimal.
+    pub enc_scheme: String,
     pub chip_name: String,
     pub hardware_model: String,
     pub serial_number: String,
@@ -75,6 +79,12 @@ pub struct AttestationInputs {
 pub struct AttestationRecord {
     pub publicKey: String,
     pub encryptionPubKey: String,
+    /// Scheme for `encryptionPubKey`: absent/`"x25519"` (software, extractable)
+    /// or `"p256-ecies-se"` (Secure-Enclave-resident, non-extractable — required
+    /// for the confidential tier). Skipped when x25519 to keep best-effort bytes
+    /// minimal (an absent value reads as `"x25519"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encScheme: Option<String>,
     pub chipName: String,
     pub hardwareModel: String,
     pub serialNumberHash: String,
@@ -173,6 +183,10 @@ pub fn build_stub_inputs(provider_did: &str, encryption_pub_key_b64: &str) -> At
     AttestationInputs {
         provider_did: provider_did.into(),
         encryption_pub_key_b64: encryption_pub_key_b64.into(),
+        // Default to the software scheme; `build_and_publish_attestation`
+        // overrides this from the actual encryption key's `enc_scheme()` (and
+        // `secure_enclave_available` from the signer's `is_hardware_bound()`).
+        enc_scheme: "x25519".into(),
         chip_name,
         hardware_model,
         // Hashed before storage; the stub value is fine.
@@ -386,6 +400,12 @@ pub fn build(
         if let Some(eh) = &inputs.engine_lib_hash {
             map.insert("engineLibHash".into(), Value::String(eh.clone()));
         }
+        // Emit encScheme only when not the x25519 default, mirroring the stored
+        // record's skip-when-None, so best-effort attestations stay byte-minimal
+        // and old verifiers (which read absent as x25519) are unaffected.
+        if inputs.enc_scheme != "x25519" {
+            map.insert("encScheme".into(), Value::String(inputs.enc_scheme.clone()));
+        }
         if let Some(ev) = &app_attest {
             map.insert(
                 "appAttest".into(),
@@ -401,6 +421,11 @@ pub fn build(
     Ok(AttestationRecord {
         publicKey: public_key_b64,
         encryptionPubKey: inputs.encryption_pub_key_b64,
+        encScheme: if inputs.enc_scheme == "x25519" {
+            None
+        } else {
+            Some(inputs.enc_scheme.clone())
+        },
         chipName: inputs.chip_name,
         hardwareModel: inputs.hardware_model,
         serialNumberHash: serial_hash,
@@ -471,6 +496,7 @@ mod tests {
         let inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),
             encryption_pub_key_b64: "abc".into(),
+            enc_scheme: "x25519".into(),
             chip_name: "Apple M3 Max".into(),
             hardware_model: "Mac15,8".into(),
             serial_number: "ABC123".into(),
@@ -531,6 +557,7 @@ mod tests {
         let inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),
             encryption_pub_key_b64: "abc".into(),
+            enc_scheme: "x25519".into(),
             chip_name: "Apple M5 Max".into(),
             hardware_model: "Mac17,6".into(),
             serial_number: "STORE-EQ".into(),
@@ -595,6 +622,7 @@ mod tests {
         let inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),
             encryption_pub_key_b64: "abc".into(),
+            enc_scheme: "x25519".into(),
             chip_name: "Apple M4".into(),
             hardware_model: "Mac15,12".into(),
             serial_number: "MDA-TEST".into(),
@@ -646,6 +674,7 @@ mod tests {
         let mut inputs = AttestationInputs {
             provider_did: "did:plc:test".into(),
             encryption_pub_key_b64: "abc".into(),
+            enc_scheme: "x25519".into(),
             chip_name: "Apple M4".into(),
             hardware_model: "Mac15,12".into(),
             serial_number: "AA-TEST".into(),

@@ -13,6 +13,7 @@
 // `ConfidentialUnavailableError` rather than silently sealing best-effort.
 
 import nacl from "tweetnacl";
+import { eciesSeal } from "./ecies.ts";
 import type { AttestationRecord } from "./types.ts";
 import type { Finding } from "./validate.ts";
 import {
@@ -95,6 +96,22 @@ export async function sealConfidential(
   });
   if (!result.ok || !result.sealToKey) {
     throw new ConfidentialUnavailableError(result.findings);
+  }
+  // Pick the wire codec from the provider's advertised `encScheme`. A
+  // confidential (Secure Enclave) provider advertises `p256-ecies-se`, so the
+  // prompt is sealed with ephemeral-static P-256 ECIES to the SE-resident key —
+  // the decrypting scalar never leaves the enclave. An absent/`x25519` scheme
+  // (best-effort, or an older agent) keeps the NaCl crypto_box path. The
+  // ephemeral SENDER public key (`senderPublicKey`) is the `requester_pub_key`
+  // the provider needs to recompute the shared secret either way.
+  if (attestation.encScheme === "p256-ecies-se") {
+    const { epk, blob } = await eciesSeal(base64ToBytes(result.sealToKey), plaintext);
+    return {
+      ciphertext: blob,
+      senderPublicKey: bytesToBase64(epk),
+      tier: result.tier,
+      sealedToKey: result.sealToKey,
+    };
   }
   const ephemeral = nacl.box.keyPair();
   const sealed = sealToProvider(plaintext, base64ToBytes(result.sealToKey), ephemeral.secretKey);

@@ -57,6 +57,11 @@ mod ffi {
         ) -> c_int;
         pub fn cocore_mlx_metallib_hash(handle: *mut c_void, out: *mut c_char, len: usize)
             -> c_int;
+        /// Evict the Metal allocator's cached buffers (KV cache + scratch) so
+        /// per-request generation state doesn't linger in the GPU pool between
+        /// jobs. Best-effort scrub (ADR-0005 step 3): frees/evicts, does NOT
+        /// guarantee GPU-page zeroing (Metal exposes no memset-on-free).
+        pub fn cocore_mlx_clear_cache(handle: *mut c_void);
         pub fn cocore_mlx_release(handle: *mut c_void);
     }
 }
@@ -317,6 +322,11 @@ impl Engine for NativeMlxEngine {
                 &mut tout,
             )
         };
+        // Scrub the Metal cache before releasing the lock, on every path
+        // (success or error): the just-served prompt's KV cache + scratch
+        // shouldn't sit in the GPU allocator pool waiting to be reused. Best
+        // effort — see the FFI doc.
+        unsafe { ffi::cocore_mlx_clear_cache(guard.0) };
         drop(guard);
         // Flush any partial <think> marker buffered at end of stream.
         if ctx.err.is_none() {

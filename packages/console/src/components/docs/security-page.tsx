@@ -94,8 +94,12 @@ export function SecurityDocsPage() {
           for it: the matchmaker challenges the running agent with an AMFI-gated push that only the
           genuine, team-signed binary can answer, and the binary&apos;s measured code identity (its
           code-directory hash) must be in the blessed-build set, under a hardened runtime with
-          library validation and verified SIP. Only when all of that holds does the provider
-          advertise the <strong>attested-confidential</strong> tier.
+          library validation and verified SIP. The agent&apos;s signing and prompt-decryption keys
+          are held in the <strong>Secure Enclave</strong>, so they can&apos;t be lifted onto another
+          host — the fix for the 2026-07-05 copy-the-key spoof, where a genuine Mac&apos;s software
+          key was copied to a non-Apple box to serve &ldquo;confidential&rdquo; traffic. Only when
+          all of that holds does the provider advertise the <strong>attested-confidential</strong>{" "}
+          tier.
         </p>
 
         <h2 {...stylex.props(docsStyles.h2)}>What the confidential tier is — and isn&apos;t</h2>
@@ -138,10 +142,10 @@ export function SecurityDocsPage() {
         <h2 {...stylex.props(docsStyles.h2)}>The model constraint for operators</h2>
         <p {...stylex.props(docsStyles.prose)}>
           Confidential serving runs in the agent&apos;s in-process engine, which only loads certain
-          model architectures — Qwen2 / Qwen3 / Llama / Gemma / Phi / Mistral-class weights. A model
-          outside that set (for example a newer Qwen3.5+, Gemma 4, or Llama 4 architecture) can only
-          be served best-effort, in the readable helper process. The provider app marks each model
-          in the picker as <strong>“Confidential&nbsp;✓”</strong> or{" "}
+          model architectures — Qwen2 / Qwen3 / Qwen3.5 / Qwen3.6 / Llama / Gemma / Phi /
+          Mistral-class weights. A model outside that set (for example a Gemma 4 or Llama 4
+          architecture) can only be served best-effort, in the readable helper process. The provider
+          app marks each model in the picker as <strong>“Confidential”</strong> or{" "}
           <strong>“Best-effort only”</strong>: choosing a best-effort-only model means your machine
           can&apos;t offer requestors the confidential posture while serving it, even if the machine
           is otherwise confidential-capable. Pick a confidential-capable model to keep it.

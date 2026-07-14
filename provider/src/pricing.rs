@@ -180,6 +180,21 @@ pub const RATES: &[ModelRate] = &[
         recommended: true,
         tool_call_parser: Some("hermes"),
     },
+    // DWQ re-quant of the entry above. Same architecture and chat/tool
+    // template, so it pairs with the same parser — machines already serving
+    // it (via desiredModels) can pass the tool-call canary instead of being
+    // silently excluded from the curated set (issue #166). Not `recommended`:
+    // the picker rotation stays on the canonical 4bit quant.
+    ModelRate {
+        model_id: "mlx-community/Qwen3.6-35B-A3B-4bit-DWQ",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 32,
+        description: "Qwen3.6 35B-A3B MoE (DWQ quant) — fast for its size; 32GB+",
+        recommended: false,
+        tool_call_parser: Some("hermes"),
+    },
     ModelRate {
         model_id: "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit",
         input_per_mtok: 1_000_000,
@@ -682,6 +697,27 @@ mod tests {
 
     fn sv(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn dwq_requant_pairs_with_same_parser_but_stays_off_the_rotation() {
+        // The DWQ re-quant shares the canonical entry's chat/tool template,
+        // so it must carry the same parser pairing (issue #166: a machine
+        // serving it could never pass the tool-call canary)…
+        assert_eq!(
+            tool_call_parser("mlx-community/Qwen3.6-35B-A3B-4bit-DWQ"),
+            Some("hermes")
+        );
+        assert_eq!(
+            tool_call_parser("mlx-community/Qwen3.6-35B-A3B-4bit"),
+            Some("hermes")
+        );
+        // …while the picker rotation keeps recommending only the canonical
+        // quant.
+        let rec: Vec<&str> = recommended_models().iter().map(|m| m.model_id).collect();
+        assert!(!rec.contains(&"mlx-community/Qwen3.6-35B-A3B-4bit-DWQ"));
+        // Unknown ids still resolve to "no vetted pairing".
+        assert_eq!(tool_call_parser("custom/whatever-4bit"), None);
     }
 
     #[test]

@@ -85,6 +85,13 @@ export interface ProBonoPolicy {
 export interface AttestationRecord {
   publicKey: string;
   encryptionPubKey: string;
+  /** Scheme for `encryptionPubKey`: absent/`"x25519"` (software, extractable)
+   *  or `"p256-ecies-se"` (Secure-Enclave-resident, non-extractable). Required
+   *  for the confidential tier — a copied software key can't decrypt the prompt
+   *  off-box (ADR-0005). */
+  encScheme?: "x25519" | "p256-ecies-se";
+  /** Scheme for the `selfSignature` over `publicKey`. */
+  sigScheme?: "p256" | "appattest-assertion";
   chipName: string;
   hardwareModel: string;
   serialNumberHash: string;

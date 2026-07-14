@@ -29,6 +29,7 @@ import { makeRuntime, record } from "@cocore/o11y";
 import { bearer, err, jsonBody, makeNodeHandler, ok } from "@cocore/o11y/http";
 
 import { loadApnsConfig } from "./apns.ts";
+import { brokerageDidDocument, loadBrokerageAuthority } from "./brokerage.ts";
 import { handleConnection } from "./connection.ts";
 import { type DidDocumentResolver, LXM_CONTROL, verifyServiceAuthToken } from "./did-auth.ts";
 import { jobsRoute } from "./jobs.ts";
@@ -267,6 +268,20 @@ async function main(): Promise<void> {
       "[advisor] APNs code-identity capability OFF (APNS_* unset) — confidential tier unavailable",
     );
   }
+  // ADR-0004: the brokerage authority. When configured, the advisor countersigns
+  // each dispatch; requesters that trust this authority DID accept the resulting
+  // receipts as confidential. The public key is logged so ops can publish it in
+  // the authority's DID document (what the SDK verifier resolves).
+  const brokerage = loadBrokerageAuthority();
+  if (brokerage) {
+    console.error(
+      `[advisor] brokerage authority ON did=${brokerage.did} publicKey=${brokerage.publicKeyB64} (publish this key in the DID doc)`,
+    );
+  } else {
+    console.error(
+      "[advisor] brokerage authority OFF (COCORE_BROKERAGE_SIGNING_KEY_PEM unset) — receipts carry no countersignature",
+    );
+  }
   // DID-bound auth mode (C1 / M3). Three states:
   //   * no COCORE_ADVISOR_DID → auth OFF (legacy: any client can register).
   //   * ADVISOR_DID set, REQUIRE_AUTH false → staged rollout: a present JWT is
@@ -293,7 +308,11 @@ async function main(): Promise<void> {
   // Known-good cdHash set (WS-COORDINATOR). Empty unless COCORE_KNOWN_GOOD_CDHASHES
   // is set → fail-closed (no machine is confidential-eligible until a blessed-
   // build set is configured). Confidential eligibility is computed per-machine.
-  const registry = new ProviderRegistry(KnownGoodSet.fromEnv(), REGISTRY_MAX_SIZE);
+  // ADR-0005 soft cutover: enforce the Secure-Enclave-resident-key leg only
+  // when COCORE_CONFIDENTIAL_REQUIRE_SE_KEY=1. Default OFF (observe-only) so the
+  // fleet can adopt SE builds before enforcement flips a machine to best-effort.
+  const requireSeKey = process.env["COCORE_CONFIDENTIAL_REQUIRE_SE_KEY"] === "1";
+  const registry = new ProviderRegistry(KnownGoodSet.fromEnv(), REGISTRY_MAX_SIZE, requireSeKey);
   // Rolling time-to-first-token window (received → first chunk relayed),
   // surfaced at GET /ttft. Folds in the worker's model-load/prefill/gen.
   const ttft = new LatencyWindow(TTFT_WINDOW_SAMPLES);
@@ -324,20 +343,38 @@ async function main(): Promise<void> {
     },
     onIdleTimeout: (providerDid, providerMachineId, streamed) => {
       // The requester's SSE already got a clean `idle-timeout` error. How we
-      // treat the MACHINE depends on what it did:
+      // treat the MACHINE depends on what it did — but either way this is a
+      // failed job, so it's recorded in the failure ledger. Enough of them in a
+      // short window puts the machine on a routing cooldown (see
+      // registry.recordFailure); `tripped` is true only on the failure that
+      // trips a NEW cooldown, so we notify once.
       if (streamed) {
-        // It produced real tokens and then stalled (a slow machine on a long
-        // job, not a silent one). Don't mark it unhealthy or bounce its
-        // engine — that punishes a merely-slow provider and yanks it from
-        // routing. Just note it; the failed job is penalty enough.
+        // It produced real tokens and then stalled. A single such job might be
+        // a merely-slow provider on a long generation, so we DON'T immediately
+        // mark it unhealthy or bounce its engine. But a machine that does this
+        // repeatedly (the reported "stream-truncated" loop) is bad, and the
+        // ledger catches that pattern without punishing a one-off slow job.
+        const tripped = registry.recordFailure(providerDid, providerMachineId, "stream-stalled");
+        if (tripped) {
+          try {
+            registry
+              .get(providerDid, providerMachineId)
+              ?.send({ type: "health_notice", standing: "bad", reason: "stream-stalled" });
+          } catch {
+            // socket gone; the sweeper will evict it
+          }
+        }
         console.error(
-          `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; had streamed — slow job, NOT flagging`,
+          `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; had streamed — slow job${tripped ? ", repeated → cooldown" : ""}`,
         );
         return;
       }
       // It accepted the job and never sent a thing: genuinely wedged. Stop
       // routing to it, tell it so (red tray ping), and ask it to self-right.
+      // Also feed the ledger so repeated silents escalate to a cooldown that
+      // survives the reconnect which would otherwise clear `unhealthyAt`.
       registry.markUnhealthy(providerDid, providerMachineId, "job-idle-timeout");
+      const tripped = registry.recordFailure(providerDid, providerMachineId, "job-idle-timeout");
       try {
         const entry = registry.get(providerDid, providerMachineId);
         entry?.send({ type: "health_notice", standing: "bad", reason: "job-idle-timeout" });
@@ -346,7 +383,7 @@ async function main(): Promise<void> {
         // socket gone; the sweeper will evict it
       }
       console.error(
-        `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; silent — marked unhealthy, requested self-right`,
+        `[sessions] idle-timeout did=${providerDid} machine=${providerMachineId}; silent — marked unhealthy, requested self-right${tripped ? ", repeated → cooldown" : ""}`,
       );
     },
   });
@@ -361,6 +398,17 @@ async function main(): Promise<void> {
       Effect.sync(() =>
         ok({ ok: true, providers: registry.size(), sessions: sessions.size() }),
       ).pipe(Effect.withSpan("advisor.healthz")),
+    ),
+    HttpRouter.get(
+      // ADR-0004: serve this brokerage's DID document so a did:web verifier
+      // resolves the P-256 key its countersignatures are checked against. 404
+      // until a brokerage authority is configured.
+      "/.well-known/did.json",
+      Effect.sync(() =>
+        brokerage
+          ? ok(brokerageDidDocument(brokerage.did, brokerage.publicKeyB64))
+          : err(404, { error: "no brokerage authority configured" }),
+      ).pipe(Effect.withSpan("advisor.did-document")),
     ),
     HttpRouter.get(
       "/ttft",
@@ -415,6 +463,18 @@ async function main(): Promise<void> {
             // Machine has been handed jobs but produced no completions —
             // it's failing silently (vs. openly crash-looping).
             silentFailure: p.silentFailure,
+            // On a routing cooldown from repeated recent failures (streamed
+            // then dropped, silent, or disconnected mid-job). Distinct from
+            // `unhealthy`: a cooldown is time-gated and simply elapses, so the
+            // console can show "cooling down until <time> (<reason>)".
+            ...(() => {
+              const c = registry.getCooldown(p.did, p.machineId);
+              return {
+                coolingDown: c.coolingDown,
+                cooldownReason: c.cooldownReason,
+                cooldownUntil: c.cooldownUntil ? new Date(c.cooldownUntil).toISOString() : null,
+              };
+            })(),
             // Confidential-tier routing hints (WS-COORDINATOR + P2). `trustTier`
             // is what the advisor computed; `cdHash` is the measured identity it
             // checked; `codeAttested` is the live APNs code-identity standing.
@@ -432,7 +492,19 @@ async function main(): Promise<void> {
               cdHashKnownGood: p.cdHashKnownGood,
               challengeVerifiedSip: p.challengeVerifiedSip,
               codeAttested: p.codeAttested,
+              // ADR-0005: the SE-resident-key leg. Observe-only until the lever
+              // is enforced; surfaced so the console can name it as the blocker
+              // and ops can watch adoption.
+              secureEnclaveAvailable: p.secureEnclaveAvailable,
             },
+            // ADR-0005 confidential evidence, exposed so the console recompute
+            // can gate on it and ops can watch SE adoption across the fleet.
+            secureEnclaveAvailable: p.secureEnclaveAvailable,
+            encScheme: p.encScheme,
+            // C1: whether this registration proved control of its DID. `false`
+            // means the console recompute caps it at best-effort (soft cutover
+            // — it still serves, just not at an attested tier).
+            registrationAuthenticated: p.registrationAuthenticated,
             // Tool calling: verified by the provider's startup canary. The
             // per-model subset lets clients avoid treating one verified model
             // as capability for every model on the machine.
@@ -485,6 +557,9 @@ async function main(): Promise<void> {
           // route keeps serving the rolling in-memory window).
           record(runtime, Metric.update(ackMs, ms));
         },
+        // ADR-0004: countersign dispatches so receipts can prove a trusted
+        // brokerage routed the job to the attested machine.
+        brokerage,
       }),
     ),
   );
@@ -614,7 +689,13 @@ async function main(): Promise<void> {
           if (alive) {
             registry.markHealthy(m.did, m.machineId);
             try {
-              m.send({ type: "health_notice", standing: "ok" });
+              // A machine can be both unhealthy AND cooling down; clearing
+              // `unhealthyAt` doesn't return it to routing while the (time-gated)
+              // cooldown still holds, so don't tell it "ok" yet — that would
+              // flip its tray green while it's still excluded.
+              if (!registry.isCoolingDown(m.did, m.machineId)) {
+                m.send({ type: "health_notice", standing: "ok" });
+              }
             } catch {
               // socket gone; close hook will clean up
             }

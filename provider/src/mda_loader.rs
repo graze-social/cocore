@@ -418,6 +418,13 @@ pub fn any_explicit_mda_env() -> bool {
 /// attestation refresh). Always fail-soft.
 pub fn acquire_auto(console_base: &str, api_key: &str, public_key_b64: &str) -> Vec<Vec<u8>> {
     if !mdm_enrolled() {
+        // Log the skip: this is the ONLY signal in a diagnostic bundle that
+        // explains a machine stuck self-attested while its owner believes
+        // Secure Mode is applying. A silent return here cost a full triage
+        // round-trip on ticket br_23e56917.
+        tracing::info!(
+            "MDA auto: this Mac is not MDM-enrolled (per `profiles status`); staying self-attested"
+        );
         return Vec::new();
     }
     let Some(serial) = device_serial() else {
@@ -438,6 +445,10 @@ pub fn acquire_auto(console_base: &str, api_key: &str, public_key_b64: &str) -> 
     // Try the already-captured chain first (reused across refreshes; rate-limit
     // friendly — we never re-request once we have a bound chain). The endpoint
     // is bearer-gated, so we MUST present the api_key (a keyless GET 401s).
+    // Track whether the coordinator holds a chain that exists but is bound to a
+    // SUPERSEDED key, so the "why isn't this rebinding" log below can be honest
+    // about the actual state instead of implying every boot re-requests.
+    let mut stale_chain_held = false;
     if let Ok(chain) = load_from_url_with_key(&chain_url, api_key) {
         if !chain.is_empty() {
             // Only trust a chain that actually binds THIS signing key. After a
@@ -452,22 +463,55 @@ pub fn acquire_auto(console_base: &str, api_key: &str, public_key_b64: &str) -> 
                 );
                 return chain;
             }
+            stale_chain_held = true;
+            // NB: this is an OBSERVATION, not the action. Whether we actually
+            // re-request is decided (and logged) below — the old copy claimed
+            // "re-requesting" here unconditionally, which read as a re-request
+            // every ~60s cycle in br_ed8f257c even when the cooldown then held
+            // us off, and cost a full triage round-trip to see through.
             tracing::warn!(
-                "MDA auto: captured chain does not bind the current signing key (rotated?); re-requesting"
+                "MDA auto: captured chain is bound to a SUPERSEDED signing key, not the current one — it can never verify, so ignoring it"
             );
         }
     }
-    // No chain yet → request one (cooldown-gated), then return empty for now.
+    // No usable chain → request one (cooldown-gated), then return empty for now.
     let Some(udid) = device_hardware_uuid() else {
         tracing::warn!("MDA auto: could not read Hardware UUID; cannot request attestation");
         return Vec::new();
     };
-    if auto_request_cooldown_elapsed() {
+    // A signing-key ROTATION bypasses the time cooldown: the stale chain will
+    // never bind the new key, so waiting out 6h just prolongs "self-attested".
+    // The coordinator must issue a fresh key-bound attestation for the new key,
+    // and it can't until we ask with the new pubkey. Same key + within cooldown
+    // → hold off (don't hammer Apple's per-device attestation rate limit).
+    let key_rotated = last_requested_pubkey().as_deref() != Some(public_key_b64);
+    if key_rotated || auto_request_cooldown_elapsed() {
         let request_url = format!("{base}/api/agent/mdm/request-attestation");
         if post_request_attestation(&request_url, api_key, &serial, &udid, public_key_b64) {
-            mark_auto_requested();
-            tracing::info!("MDA auto: requested attestation; chain will land on a later refresh");
+            mark_auto_requested(public_key_b64);
+            if key_rotated {
+                tracing::info!(
+                    "MDA auto: signing key changed since the last request — requested a fresh key-bound attestation (bypassed cooldown); it lands on a later refresh"
+                );
+            } else {
+                // Same key, cooldown elapsed: we DID re-request. Name Apple's
+                // limit so a stuck machine reads as "waiting on Apple", not
+                // "broken" — Apple caps DeviceInformation attestation at
+                // ~1/device/7d, so a rebind only lands after that window opens,
+                // however often we ask.
+                tracing::info!(
+                    "MDA auto: re-requested a key-bound attestation for the current signing key; Apple rate-limits device attestation to ~1/device/7d, so the rebind lands once that window opens"
+                );
+            }
         }
+    } else if stale_chain_held {
+        // Honest about the hold-off: we are NOT re-requesting this boot, and the
+        // chain the coordinator holds is stale. This is the steady state of a
+        // machine whose key rotated inside Apple's 7-day attestation window.
+        tracing::info!(
+            cooldown_h = AUTO_REQUEST_COOLDOWN.as_secs() / 3600,
+            "MDA auto: stale chain, but already re-requested for the current key within the cooldown — holding off (waiting on Apple's ~7-day attestation window to rebind); not re-requesting this boot"
+        );
     } else {
         tracing::debug!("MDA auto: within request cooldown; not re-requesting this boot");
     }
@@ -491,11 +535,16 @@ fn chain_binds_key(chain: &[Vec<u8>], public_key_b64: &str) -> bool {
 /// Is this Mac currently MDM-enrolled? Reads `profiles status -type enrollment`
 /// ("MDM enrollment: Yes"). Any failure / non-macOS → false (skip option-B).
 pub fn mdm_enrolled() -> bool {
-    run_capture("profiles", &["status", "-type", "enrollment"])
+    // Case-insensitive on purpose: `profiles status` phrasing has shifted
+    // capitalization across macOS releases, and a silent parse miss here reads
+    // as "not enrolled" and quietly disables the whole MDA flow. Must stay in
+    // agreement with the tray's probe (SecureModeWizard.swift
+    // `EnrollmentProbe.isEnrolled`), which drives the Secure Mode UI copy.
+    run_capture("/usr/bin/profiles", &["status", "-type", "enrollment"])
         .map(|out| {
             out.lines().any(|l| {
-                let l = l.trim();
-                l.starts_with("MDM enrollment:") && l.contains("Yes")
+                let l = l.trim().to_lowercase();
+                l.starts_with("mdm enrollment:") && l.contains("yes")
             })
         })
         .unwrap_or(false)
@@ -524,7 +573,9 @@ pub fn device_hardware_uuid() -> Option<String> {
 
 /// Pull a string property off the IOPlatformExpertDevice node via `ioreg`.
 fn ioreg_value(key: &str) -> Option<String> {
-    let out = run_capture("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?;
+    // /usr/sbin isn't on execvp's fallback path — absolute path so this probe
+    // works however the agent was spawned (see system_profile.rs).
+    let out = run_capture("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?;
     for line in out.lines() {
         if line.contains(&format!("\"{key}\"")) {
             // line looks like:  "IOPlatformUUID" = "376AF848-..."
@@ -567,12 +618,38 @@ fn auto_request_cooldown_elapsed() -> bool {
     }
 }
 
-fn mark_auto_requested() {
+/// Record that we requested an attestation for `public_key_b64`. The marker's
+/// mtime drives the time cooldown; its CONTENT (the requested pubkey) lets a
+/// later boot detect a signing-key rotation and re-request immediately rather
+/// than waiting out the cooldown against a key the coordinator's chain can never
+/// bind. A legacy empty marker reads as a different key, so the first post-fix
+/// boot re-requests once — the desired behavior.
+fn mark_auto_requested(public_key_b64: &str) {
     if let Some(path) = auto_request_marker_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, b"");
+        let _ = std::fs::write(&path, public_key_b64.as_bytes());
+    }
+}
+
+/// True when we've already requested a key-bound MDA attestation for
+/// `public_key_b64`. When a machine is enrolled-but-not-attested and THIS is
+/// true, it's waiting on Apple's ~1/device/7-day DeviceInformation window — not
+/// on us to ask — so the UI should say "waiting on Apple", not "requesting".
+pub fn requested_for_key(public_key_b64: &str) -> bool {
+    last_requested_pubkey().as_deref() == Some(public_key_b64)
+}
+
+/// The signing key we last requested an MDA attestation for, if any.
+fn last_requested_pubkey() -> Option<String> {
+    let path = auto_request_marker_path()?;
+    let s = std::fs::read_to_string(path).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
     }
 }
 

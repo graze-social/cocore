@@ -20,6 +20,9 @@ const loadExplorerGraphServerFn = createServerFn({ method: "GET" }).handler(
 export const explorerGraphQueryOptions = queryOptions({
   queryKey: ["explorer", "graph"] as const,
   queryFn: (): Promise<ExplorerGraph> => loadExplorerGraphServerFn(),
-  staleTime: 300_000,
+  // Refetch readily on mount/focus; the server fn is itself cached
+  // (see CACHE_TTL_MS in explorer-graph.server.ts), so a fresh fetch is
+  // cheap and just picks up the newest server snapshot as the network grows.
+  staleTime: 60_000,
   gcTime: 600_000,
 });

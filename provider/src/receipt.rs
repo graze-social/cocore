@@ -63,6 +63,13 @@ pub struct ReceiptInputs {
     /// carve-out is part of the signed record. `false` omits the field
     /// entirely (a normal metered receipt).
     pub pro_bono: bool,
+    /// ADR-0004: the brokerage's session-bound countersignature from the
+    /// dispatch (`inference_request.brokerage_countersignature`). Copied onto
+    /// the published receipt VERBATIM and deliberately NOT covered by
+    /// `enclaveSignature` — a different party (the brokerage) signs it, so it is
+    /// excluded from the canonical bytes the provider signs. `None` when the
+    /// dispatch carried no countersignature (best-effort through this brokerage).
+    pub brokerage_countersignature: Option<BrokerageCountersignature>,
 }
 
 /// Sampling parameters committed to in a receipt. Integer-only because
@@ -122,6 +129,12 @@ pub struct ReceiptRecord {
     /// Base64 of the DER-encoded ECDSA-P256 signature over the
     /// canonical bytes of every other field in this record.
     pub enclaveSignature: String,
+    /// ADR-0004 brokerage witness. NOT covered by `enclaveSignature` — a
+    /// verifier strips it before checking the provider signature, exactly as it
+    /// strips `enclaveSignature` and `$type`. Absent when the dispatch carried
+    /// no countersignature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brokerageCountersignature: Option<BrokerageCountersignature>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +154,17 @@ pub struct TokenCounts {
 pub struct MoneyValue {
     pub amount: u64,
     pub currency: String,
+}
+
+/// ADR-0004 brokerage countersignature, as serialized onto the receipt (lexicon
+/// camelCase). Built from the `inference_request` wire block (snake_case).
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Serialize)]
+pub struct BrokerageCountersignature {
+    pub authority: String,
+    pub machineId: String,
+    pub nonce: String,
+    pub sig: String,
 }
 
 /// Build the unsigned receipt JSON, canonicalise it, sign with the
@@ -239,6 +263,9 @@ pub fn build(
             },
             proBono: inputs.pro_bono,
             enclaveSignature: B64.encode(&sig),
+            // Copied verbatim; intentionally NOT part of `unsigned`/`canonical`
+            // above, so the provider's enclaveSignature does not cover it.
+            brokerageCountersignature: inputs.brokerage_countersignature,
         },
         canonical,
     ))
@@ -282,7 +309,37 @@ mod tests {
                 cid: "bafyatt".into(),
             },
             pro_bono: false,
+            brokerage_countersignature: None,
         }
+    }
+
+    #[test]
+    fn brokerage_countersignature_is_excluded_from_enclave_signature() {
+        // ADR-0004: adding the brokerage witness MUST NOT change the canonical
+        // bytes the provider signs — a different party signs it, and verifiers
+        // strip it before checking enclaveSignature.
+        let _g = identity_lock();
+        let signer = load_or_create_identity().unwrap();
+        let now = chrono::Utc::now();
+
+        let (_rec_none, canonical_none) = build(fixture(now), &*signer).unwrap();
+
+        let mut with_cs = fixture(now);
+        with_cs.brokerage_countersignature = Some(BrokerageCountersignature {
+            authority: "did:web:advisor.cocore.dev".into(),
+            machineId: "3mplnovbfjc2a".into(),
+            nonce: "0011223344556677".into(),
+            sig: "ZmFrZXNpZw==".into(),
+        });
+        let (rec_cs, canonical_cs) = build(with_cs, &*signer).unwrap();
+
+        // The signed bytes are identical (countersignature excluded)…
+        assert_eq!(canonical_none, canonical_cs);
+        // …and the record still carries the countersignature for publishing.
+        assert!(rec_cs.brokerageCountersignature.is_some());
+        // …and it serializes under the lexicon camelCase key.
+        let json = serde_json::to_value(&rec_cs).unwrap();
+        assert!(json.get("brokerageCountersignature").is_some());
     }
 
     #[test]

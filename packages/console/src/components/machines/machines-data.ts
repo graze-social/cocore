@@ -2,8 +2,51 @@ import type { VerifiedTier } from "@/lib/verified-standing.server.ts";
 
 export type MachineState = "running" | "idle" | "paused" | "offline" | "provisioning";
 
+/** Owner-facing label for a machine state chip. `provisioning` is agent
+ *  jargon — the owner-facing story is "it's preparing: downloading model
+ *  weights before it can serve", so the chip says "preparing" and the
+ *  accompanying status line spells out the download. */
+export function machineStateLabel(state: MachineState): string {
+  return state === "provisioning" ? "preparing" : state;
+}
+
+/** One-line status description for a machine, shared by the fleet table and
+ *  the narrow-screen cards so the copy can't drift between the two. */
+export function machineStatusText(m: {
+  state: MachineState;
+  faultReason?: string;
+  pausedReason?: string;
+  offlineReason?: string;
+  advisorFaultReason?: string;
+  standingKnown?: boolean;
+  advisorConnected?: boolean;
+}): string {
+  if (m.faultReason) return "Engine not loaded — only serving stub";
+  if (advisorUnreachable(m)) return "Serving locally — can't reach the co/core network";
+  switch (m.state) {
+    case "provisioning":
+      return "Preparing — downloading models before it can serve…";
+    case "idle":
+      return "Eligible for matching when active";
+    case "paused":
+      return m.pausedReason ?? "Paused";
+    case "running":
+      return "Served a job in the last 5 min";
+    default:
+      return m.offlineReason ?? "Offline";
+  }
+}
+
 export interface Machine {
   id: string;
+  /** The machine's Secure-Enclave attestation pubkey from its provider
+   *  record. This is the machine's identity that does NOT depend on a
+   *  successful boot-time PDS publish: when the agent couldn't publish
+   *  (dead session → no rkey to echo), it registers with the advisor
+   *  without a `machine_id` and the advisor keys it by this pubkey
+   *  instead. The advisor-standing join falls back to it so such a
+   *  machine still reads as connected. */
+  attestationPubKey?: string;
   alias: string;
   state: MachineState;
   gpu: string;
@@ -28,6 +71,19 @@ export interface Machine {
   /** The configured model ids that failed to load, if the agent
    *  reported them. */
   faultModels?: string[];
+  /** Machine-readable advisor-connectivity fault class published by the
+   *  agent when its WebSocket to the advisor keeps failing to connect
+   *  (e.g. "upgrade-blocked", "dns-failure", "connect-timeout"). The
+   *  machine is healthy and serving LOCALLY but invisible to the network —
+   *  no jobs will reach it. Cleared by the agent on its next successful
+   *  registration. See the provider record's `advisorFault` field. */
+  advisorFaultCode?: string;
+  /** Human-readable, content-safe summary of {@link advisorFaultCode} with
+   *  remediation guidance (VPN / firewall / WebSocket filtering). Present
+   *  iff the fault is. */
+  advisorFaultReason?: string;
+  /** RFC3339 timestamp of when the agent recorded the advisor fault. */
+  advisorFaultAt?: string;
   /** How the machine's environment is attested (from the provider record):
    *  `self-attested` (software) or `hardware-attested` (genuine Apple hardware +
    *  SIP, via a bound MDA chain). Evidence-derived; the UI humanizes it. */
@@ -44,12 +100,20 @@ export interface Machine {
    *  backed; see verified-standing.server.ts), overlaid from live advisor
    *  standing. Drives the fleet trust badge. Absent until standing is known. */
   verifiedTier?: VerifiedTier;
+  /** When the machine was capped BELOW the tier it opted into (e.g. confidential
+   *  downgraded to hardware-attested because its signing key isn't proven
+   *  Secure-Enclave-bound, or best-effort because its registration wasn't
+   *  DID-authenticated), a short operator-facing nudge explaining why + how to
+   *  regain it. Undefined when the machine is at its ceiling. */
+  verifiedTierReason?: string;
   /** The advisor's VERIFIED confidential standing — the machine passed every
    *  earned leg (known-good cdHash + challenge-verified SIP + code-identity).
    *  This is the honest "operator cannot read your prompt" signal, stricter
    *  than the self-asserted {@link tier}. Absent/false otherwise. */
   confidential?: boolean;
   chipMeta?: string;
+  /** Version of the cocore client that last published this machine's provider record. */
+  binaryVersion?: string;
   /** Model NSIDs the agent advertises in its provider record's
    *  `supportedModels` field. Mirrors what the engine registry
    *  actually loaded — see provider/src/main.rs build_engines. The
@@ -107,4 +171,44 @@ export interface Machine {
    *  pairing for and verifies each with a startup canary before advertising it.
    *  Drives the "Tool calling" toggle in per-machine settings. Absent ≡ off. */
   toolCalls?: boolean;
+}
+
+/** Whether this machine looks cut off from the co/core network while
+ *  serving locally: its agent published an `advisorFault` (repeated
+ *  WebSocket connect failures), and/or its record says it's serving yet
+ *  the advisor holds no live connection to it. Only meaningful for a
+ *  machine that SHOULD be connected — a paused / offline / provisioning
+ *  box is expected to be absent from the advisor's registry. */
+export function advisorUnreachable(
+  m: Pick<Machine, "state" | "advisorFaultReason" | "standingKnown" | "advisorConnected">,
+): boolean {
+  if (m.state !== "idle" && m.state !== "running") return false;
+  // A live advisor connection outranks a fault the agent published earlier
+  // and hasn't gotten around to clearing yet (it clears on registration).
+  if (m.standingKnown === true && m.advisorConnected === true) return false;
+  if (m.advisorFaultReason) return true;
+  return m.standingKnown === true && m.advisorConnected === false;
+}
+
+/** The machine's live network standing for the "on network / not
+ *  reachable" badge. `null` when a badge would be noise: the machine
+ *  isn't expected on the network (paused/offline/provisioning) or the
+ *  advisor overlay was unavailable and the agent reports no fault. */
+export function machineNetworkStanding(m: Machine): "on-network" | "not-reachable" | null {
+  if (m.state !== "idle" && m.state !== "running") return null;
+  if (m.standingKnown === true && m.advisorConnected === true) return "on-network";
+  if (advisorUnreachable(m)) return "not-reachable";
+  return null;
+}
+
+export function clientVersionStatus(
+  installed: string | undefined,
+  latest: string | null | undefined,
+): "latest" | "outdated" | null {
+  if (!installed || !latest) return null;
+  return installed.replace(/^v/i, "").localeCompare(latest.replace(/^v/i, ""), undefined, {
+    numeric: true,
+  }) < 0
+    ? "outdated"
+    : "latest";
 }

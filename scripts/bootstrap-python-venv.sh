@@ -35,6 +35,7 @@
 #   0  success
 #   2  uv install failed
 #   3  pip install vllm-mlx failed
+#   4  venv verification failed (packages installed but don't import)
 
 set -euo pipefail
 
@@ -118,8 +119,16 @@ install_packages() {
   # HF_HUB_ENABLE_HF_TRANSFER when the package is importable.
   # uv pip install needs the venv activated; we pass --python pointing
   # at the venv's interpreter to make it scope to that venv.
+  #
+  # transformers is CONSTRAINED, not floated: transformers 5.13.0 broke
+  # mlx-lm's tokenizer registration (`AutoTokenizer.register("NewlineTokenizer",
+  # ...)` with a string key → `AttributeError: 'str' object has no attribute
+  # '__module__'` at import), which kills every engine spawn on a fresh
+  # install. Because this script re-runs idempotently, the constraint also
+  # REPAIRS an already-broken venv by downgrading it. Lift the ceiling once
+  # mlx-lm registers its tokenizer with a real config class upstream.
   if ! "$COCORE_UV" pip install --python "$COCORE_PYTHON_VENV/bin/python" \
-        "$pkg" mlx-lm uvicorn hf_transfer >&2; then
+        "$pkg" mlx-lm uvicorn hf_transfer "transformers<5.13" >&2; then
     err "uv pip install $pkg failed"
     exit 3
   fi
@@ -136,8 +145,17 @@ verify() {
   if "$py" -c 'import vllm_mlx.server, uvicorn' 2>/dev/null; then
     note "import vllm_mlx.server, uvicorn: ok"
   else
-    warn "import failed — agent will fall back to StubEngine on next serve"
+    # Hard failure, not a warning: a venv that installed but doesn't import
+    # means EVERY engine spawn will crash at startup and the machine will
+    # silently serve stub-only. Failing here surfaces the problem at install
+    # time, where the user is watching, instead of at serve time, where they
+    # aren't. (Exactly this bit a fresh install when transformers 5.13.0
+    # broke mlx-lm's import — the old warn-and-continue let the install
+    # "succeed" and the engine crash-loop.)
+    err "venv verification failed — the installed packages don't import:"
     "$py" -c 'import vllm_mlx.server, uvicorn' 2>&1 | sed 's/^/    /' >&2 || true
+    err "re-run this installer to retry; if it persists, DM @cocore.dev on Bluesky"
+    exit 4
   fi
 }
 

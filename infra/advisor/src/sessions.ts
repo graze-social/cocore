@@ -178,6 +178,23 @@ export class SessionManager {
     return n;
   }
 
+  /** Tear down every in-flight session dispatched to a specific machine,
+   *  writing a final `error` event with `reason` to each requester's SSE.
+   *  Used when the machine's socket drops mid-job so the requester fails fast
+   *  (and can fail over) instead of hanging until the idle timer fires. Reuses
+   *  {@link close} for each session (which also clears its idle timer).
+   *  Returns the number of sessions closed. */
+  closeForMachine(providerDid: string, providerMachineId: string, reason: string): number {
+    // Collect first, then close: close() mutates bySessionId, so iterating it
+    // while deleting would skip entries.
+    const ids: string[] = [];
+    for (const [id, e] of this.bySessionId) {
+      if (e.providerDid === providerDid && e.providerMachineId === providerMachineId) ids.push(id);
+    }
+    for (const id of ids) this.close(id, reason);
+    return ids.length;
+  }
+
   /** Write an SSE event to the session's response. No-op if the
    *  session isn't tracked or the response is already closed. */
   write(sessionId: string, ev: AttestedSseEvent): void {

@@ -19,6 +19,7 @@ import { Flex } from "@/design-system/flex";
 import { Page } from "@/design-system/page";
 import { SearchField } from "@/design-system/search-field";
 import { SegmentedControl, SegmentedControlItem } from "@/design-system/segmented-control";
+import { Select, SelectItem } from "@/design-system/select";
 import { uiColor } from "@/design-system/theme/color.stylex";
 import { radius } from "@/design-system/theme/radius.stylex";
 import { gap, verticalSpace } from "@/design-system/theme/semantic-spacing.stylex";
@@ -287,6 +288,19 @@ function NodeDetail({ node }: { node: ExplorerNode }) {
         </div>
       ) : null}
 
+      {node.versions.length > 0 ? (
+        <div>
+          <div {...stylex.props(styles.specLabel)}>agent version</div>
+          <div {...stylex.props(styles.chips)}>
+            {node.versions.map((v) => (
+              <span key={v} {...stylex.props(styles.chip)}>
+                v{v}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
       <Link
         to="/u/$identifier"
         params={{ identifier: node.handle ?? node.did }}
@@ -299,11 +313,33 @@ function NodeDetail({ node }: { node: ExplorerNode }) {
   );
 }
 
+/** Newest-first ordering for agent version strings — numeric dot-part
+ *  compare with lexicographic fallback (mirrors the server's ordering
+ *  inside a node's own `versions`, which we can't import client-side). */
+function compareVersionsDesc(a: string, b: string): number {
+  const pa = a.split(".").map((p) => Number.parseInt(p, 10));
+  const pb = b.split(".").map((p) => Number.parseInt(p, 10));
+  if (pa.every(Number.isFinite) && pb.every(Number.isFinite)) {
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pb[i] ?? 0) - (pa[i] ?? 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  }
+  return b.localeCompare(a);
+}
+
+/** Sentinel ids for the version filter's non-version choices. Real agent
+ *  versions are dotted numerics, so these can't collide. */
+const VERSION_ANY = "any";
+const VERSION_NONE = "unversioned";
+
 export function ExplorerPage() {
   const graphQuery = useQuery(explorerGraphQueryOptions);
   const [selectedDid, setSelectedDid] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "providers">("all");
+  const [versionFilter, setVersionFilter] = useState<string>(VERSION_ANY);
 
   const graph = graphQuery.data;
   const nodesByDid = useMemo(() => {
@@ -312,6 +348,40 @@ export function ExplorerPage() {
     return m;
   }, [graph]);
   const selected = selectedDid ? (nodesByDid.get(selectedDid) ?? null) : null;
+
+  // Distinct agent versions on the network, newest first, with provider
+  // counts for the dropdown labels. "unversioned" appears only when some
+  // provider's records predate the binaryVersion field.
+  const versionOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    let unversioned = 0;
+    for (const n of graph?.nodes ?? []) {
+      if (!n.isProvider) continue;
+      if (n.versions.length === 0) unversioned += 1;
+      for (const v of n.versions) counts.set(v, (counts.get(v) ?? 0) + 1);
+    }
+    const versions = [...counts.keys()].sort(compareVersionsDesc);
+    return { versions, counts, unversioned };
+  }, [graph]);
+
+  // The DID set the graph should keep for the active version filter; null
+  // when the filter is off. Keeping the sentinel logic here means the
+  // graph component only ever sees a plain allow-set.
+  const versionDids = useMemo(() => {
+    if (versionFilter === VERSION_ANY) return null;
+    const keep = new Set<string>();
+    for (const n of graph?.nodes ?? []) {
+      if (!n.isProvider) continue;
+      if (
+        versionFilter === VERSION_NONE
+          ? n.versions.length === 0
+          : n.versions.includes(versionFilter)
+      ) {
+        keep.add(n.did);
+      }
+    }
+    return keep;
+  }, [graph, versionFilter]);
 
   return (
     <Page.Root variant="large" style={styles.root}>
@@ -344,6 +414,13 @@ export function ExplorerPage() {
             </div>
           ) : null}
 
+          {graph?.summary.rendered.truncated ? (
+            <div {...stylex.props(styles.metaRow)}>
+              Graphing the {intFmt.format(graph.summary.rendered.nodes)} most-connected of{" "}
+              {intFmt.format(graph.summary.people)} — search to find anyone not drawn.
+            </div>
+          ) : null}
+
           <div {...stylex.props(styles.controls)}>
             <div {...stylex.props(styles.searchWrap)}>
               <SearchField
@@ -367,6 +444,29 @@ export function ExplorerPage() {
                 <SegmentedControlItem id="all">everyone</SegmentedControlItem>
                 <SegmentedControlItem id="providers">providers</SegmentedControlItem>
               </SegmentedControl>
+              <Select
+                aria-label="filter by agent version"
+                label="version"
+                labelVariant="horizontal"
+                selectedKey={versionFilter}
+                onSelectionChange={(key) => {
+                  if (key != null) setVersionFilter(String(key));
+                }}
+              >
+                <SelectItem id={VERSION_ANY} textValue="any">
+                  any
+                </SelectItem>
+                {versionOptions.versions.map((v) => (
+                  <SelectItem key={v} id={v} textValue={`v${v}`}>
+                    v{v} · {versionOptions.counts.get(v)}
+                  </SelectItem>
+                ))}
+                {versionOptions.unversioned > 0 ? (
+                  <SelectItem id={VERSION_NONE} textValue="unversioned">
+                    unversioned · {versionOptions.unversioned}
+                  </SelectItem>
+                ) : null}
+              </Select>
               <div {...stylex.props(styles.legend)}>
                 <span {...stylex.props(styles.legendItem)}>
                   <span {...stylex.props(styles.dot, styles.dotProvider)} />
@@ -388,6 +488,7 @@ export function ExplorerPage() {
               onSelect={setSelectedDid}
               query={query}
               providersOnly={filter === "providers"}
+              versionDids={versionDids}
             />
             <Card size="md" style={styles.detailCard}>
               <CardHeader hasBorder style={styles.detailCardHeader}>

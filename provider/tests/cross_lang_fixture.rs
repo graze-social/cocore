@@ -62,6 +62,9 @@ fn writes_cross_lang_fixture() {
         // Off here too — a metered receipt omits proBono, keeping the pinned
         // canonical bytes identical to a pre-proBono record.
         pro_bono: false,
+        // None → excluded from the signed canonical bytes (ADR-0004), so the
+        // pinned cross-language golden fixture is unchanged.
+        brokerage_countersignature: None,
     };
     let (record, canonical) = build(inputs, &*signer).unwrap();
 

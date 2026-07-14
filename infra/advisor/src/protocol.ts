@@ -72,6 +72,16 @@ export interface Register {
    *  Additive — pre-version agents omit it, and a version floor treats a
    *  machine that omits it as below the floor (fail-closed). */
   binary_version?: string;
+  /** True when the agent's signing key is Secure-Enclave-resident (ADR-0005
+   *  confidential-tier evidence, echoed from `attestation.secureEnclaveAvailable`).
+   *  Additive: old software-key agents omit it; the SE gate (when enforced)
+   *  treats omitted/false as not-SE → best-effort. */
+  secure_enclave_available?: boolean;
+  /** The agent's encryption-key scheme: `"p256-ecies-se"` (Secure-Enclave key)
+   *  or absent/`"x25519"` (software). Tells the advisor which codec to seal the
+   *  APNs code-challenge nonce with, so an old X25519 agent keeps working.
+   *  Additive. */
+  enc_scheme?: string;
   /** atproto service-auth JWT that binds this Register to `provider_did`.
    *  The provider mints it via `com.atproto.server.getServiceAuth` with
    *  `aud = COCORE_ADVISOR_DID` and `lxm = "dev.cocore.compute.register"`; its
@@ -167,6 +177,19 @@ export interface InferenceRequest {
    *  a provider-specific object). Forwarded from the `/jobs` body; the
    *  advisor never inspects it. */
   tool_choice?: unknown;
+  /** ADR-0004: the brokerage's session-bound countersignature for this
+   *  dispatch, signed at routing time over {authority, job, requester, machine,
+   *  attestation, nonce}. The provider copies it onto the receipt as
+   *  `brokerageCountersignature` (lexicon camelCase) so a confidential requester
+   *  can verify the job was routed by a trusted authority to the attested
+   *  machine. Present only when the advisor has a brokerage authority key
+   *  configured AND the job carries the fields needed to bind it. Additive. */
+  brokerage_countersignature?: {
+    authority: string;
+    machine_id: string;
+    nonce: string;
+    sig: string;
+  };
 }
 
 interface InferenceChunk {

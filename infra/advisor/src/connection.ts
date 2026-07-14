@@ -301,6 +301,9 @@ export function handleConnection(
       entry.apnsDeviceToken,
       entry.encryptionPubKey,
       nonce,
+      // Seal with the codec the agent advertised: p256-ecies-se to a
+      // Secure-Enclave key, else the X25519 default for older agents.
+      entry.encScheme ?? undefined,
     );
     if (!res.ok) {
       console.error(
@@ -354,8 +357,15 @@ export function handleConnection(
         //   * a MISSING token is rejected only when `requireAuth` is true. In
         //     staged-rollout mode (requireAuth false) absence is tolerated so
         //     the fleet can upgrade before enforcement flips on.
+        // Default true = "no signal": auth isn't enforced (advisorDid unset), so
+        // we don't penalize. Flipped to false only in the soft-cutover branch
+        // below, where auth IS expected but the frame carried none.
+        let registrationAuthenticated = true;
         if (config.advisorDid) {
           if (msg.auth_jwt) {
+            // A PRESENT token is always fully verified. A bad/mismatched token is
+            // an active forgery attempt (someone trying to register AS another
+            // DID), not an un-upgraded client — hard-reject it either way.
             const auth = await verifyServiceAuthToken(msg.auth_jwt, {
               audience: config.advisorDid,
               lxm: LXM_REGISTER,
@@ -374,10 +384,21 @@ export function handleConnection(
               return close(1008, "register-did-mismatch");
             }
           } else if (config.requireAuth) {
+            // Hard mode (the eventual Phase-3 escalation): a missing token is
+            // refused outright. Off by default; ops flips COCORE_ADVISOR_REQUIRE_AUTH.
             console.error(
               `[ws] register missing auth_jwt did=${msg.provider_did} peer=${peer} (requireAuth on); closing`,
             );
             return close(1008, "register-auth-required");
+          } else {
+            // SOFT CUTOVER: auth is expected (advisorDid set) but this frame
+            // carried none, and we're not in hard requireAuth mode. Admit the
+            // socket — it still serves best-effort — but mark it unauthenticated
+            // so consumers refuse it an attested tier (it hasn't proven it owns
+            // `provider_did`, so its attestation record can't be trusted). This
+            // downgrades instead of disconnecting: an un-upgraded agent keeps
+            // working, it just can't be confidential/hardware-attested.
+            registrationAuthenticated = false;
           }
         }
         // M1: refuse the registration if the registry is at capacity (a
@@ -392,6 +413,16 @@ export function handleConnection(
         }
         registeredDid = msg.provider_did;
         registeredMachineId = ProviderRegistry.machineIdOf(msg);
+        // Record the C1 standing (default entry is authenticated=true, so only
+        // the soft-downgrade case needs a write). Drops the machine from
+        // confidential routing in the registry AND is surfaced on /providers so
+        // the console recompute caps it at best-effort.
+        if (!registrationAuthenticated) {
+          registry.setRegistrationAuthenticated(registeredDid, registeredMachineId, false);
+          console.error(
+            `[ws] register UNAUTHENTICATED (soft) did=${msg.provider_did} machine=${registeredMachineId} — admitted best-effort, no attested tier until it mints a register token`,
+          );
+        }
         console.error(
           `[ws] register did=${msg.provider_did} machine=${registeredMachineId} chip=${msg.chip} models=${msg.supported_models.length}`,
         );
@@ -640,7 +671,37 @@ export function handleConnection(
     // late/replaced close then no-ops instead of stranding the machine.
     if (registeredDid && registeredMachineId) {
       const entry = registry.get(registeredDid, registeredMachineId);
-      if (entry && entry.send === send) registry.remove(registeredDid, registeredMachineId);
+      if (entry && entry.send === send) {
+        // A GENUINE drop of a socket that still owns its entry — not an
+        // advisor-initiated clean close ("replaced" on reconnect, "recycle" on
+        // the connection-age cap), where the machine is coming right back and
+        // its in-flight sessions can still be served by the replacement.
+        const reasonStr = reason?.toString() ?? "";
+        const advisorInitiated = reasonStr === "replaced" || reasonStr === "recycle";
+        if (!advisorInitiated) {
+          // Fail any in-flight requesters fast (clean SSE error) instead of
+          // leaving them to hang until the 90s idle timer, and count the drop
+          // ONCE toward this machine's cooldown ledger. A machine that keeps
+          // dropping mid-stream is exactly the "stream-truncated" case we want
+          // pulled from rotation.
+          const dropped = sessions.closeForMachine(
+            registeredDid,
+            registeredMachineId,
+            "provider-disconnected",
+          );
+          if (dropped > 0) {
+            const tripped = registry.recordFailure(
+              registeredDid,
+              registeredMachineId,
+              "provider-disconnected",
+            );
+            console.error(
+              `[ws] mid-job drop did=${registeredDid} machine=${registeredMachineId}; closed ${dropped} session(s)${tripped ? ", repeated → cooldown" : ""}`,
+            );
+          }
+        }
+        registry.remove(registeredDid, registeredMachineId);
+      }
     }
     console.error(
       `[ws] close peer=${peer} did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} code=${code} reason=${reason}`,

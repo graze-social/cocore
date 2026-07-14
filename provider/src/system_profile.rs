@@ -75,9 +75,19 @@ pub fn collect() -> SystemProfile {
     }
 }
 
+// Absolute paths for the probe binaries: `sysctl`, `system_profiler`, and
+// `ioreg` live under /usr/sbin, which execvp's FALLBACK path (used when a
+// parent spawns us with no PATH at all) does not include. The tray shelled
+// `cocore agent diag` with a stripped env for a while, and every probe here
+// silently returned None — bundles reported chip "unknown" / 0 GB RAM
+// (ticket br_23e56917). These paths are stable on every macOS.
 #[cfg(target_os = "macos")]
 fn sysctl(key: &str) -> Option<String> {
-    let out = Command::new("sysctl").arg("-n").arg(key).output().ok()?;
+    let out = Command::new("/usr/sbin/sysctl")
+        .arg("-n")
+        .arg(key)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -96,10 +106,10 @@ fn sysctl_u32(key: &str) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 fn parse_gpu_cores() -> Option<u32> {
-    // `system_profiler -json SPDisplaysDataType` returns an array of GPU
-    // entries. Apple Silicon integrated GPUs carry an `sppci_cores` field; we
-    // take the first one we find.
-    let out = Command::new("system_profiler")
+    // `system_profiler -json SPDisplaysDataType` returns an array of
+    // GPU entries. Apple Silicon integrated GPUs carry an
+    // `sppci_cores` field; we take the first one we find.
+    let out = Command::new("/usr/sbin/system_profiler")
         .arg("-json")
         .arg("SPDisplaysDataType")
         .output()
@@ -121,7 +131,7 @@ fn parse_gpu_cores() -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 fn sw_vers_product_version() -> Option<String> {
-    let out = Command::new("sw_vers")
+    let out = Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
         .ok()?;

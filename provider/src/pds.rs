@@ -64,6 +64,16 @@ pub struct ProviderRecord {
     pub priceList: Vec<ModelPrice>,
     pub encryptionPubKey: String,
     pub attestationPubKey: String,
+    /// Stable per-machine identity that survives signing-key rotation (a hash of
+    /// the hardware serial, salted by DID). Unlike `attestationPubKey`, this does
+    /// NOT change when the signing key rotates (software -> Secure Enclave on the
+    /// 0.9.43 upgrade), so the agent can recognize an existing record as its own
+    /// prior incarnation and adopt it (carrying `desiredTier`/`active`/... forward)
+    /// instead of orphaning it. Absent on records written before 0.9.44 and on
+    /// hosts where the serial can't be read; identity then falls back to
+    /// `attestationPubKey` + hardware profile. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machineFingerprint: Option<String>,
     pub trustLevel: TrustLevel,
     /// Agent-published ACHIEVED confidentiality tier (`attested-confidential` |
     /// `best-effort`), derived from the signed attestation's evidence — NEVER
@@ -298,6 +308,207 @@ pub fn merge_agent_provider_fields(
     serde_json::Value::Object(out)
 }
 
+/// Stable per-machine fingerprint = `sha256(serial | did)`, hex. Salted by the
+/// owner DID so the value can't correlate a machine across different owners.
+/// Survives signing-key rotation because the hardware serial doesn't change.
+/// Mirrors the attestation's `serialNumberHash` salt scheme so the two agree.
+pub fn machine_fingerprint(serial: &str, did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(serial.as_bytes());
+    h.update(b"|");
+    h.update(did.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// One `dev.cocore.compute.provider` record on the DID, reduced to the fields
+/// record-identity reconciliation needs. Built from a PDS list result.
+#[derive(Debug, Clone)]
+pub struct ListedProviderRecord {
+    pub rkey: String,
+    pub cid: String,
+    pub created_at: String,
+    pub attestation_pub_key: Option<String>,
+    pub machine_fingerprint: Option<String>,
+    pub machine_label: Option<String>,
+    pub model_identifier: Option<String>,
+    pub chip: Option<String>,
+    pub value: serde_json::Value,
+}
+
+impl ListedProviderRecord {
+    /// Extract the identity fields from a raw PDS record body.
+    pub fn from_value(rkey: String, cid: String, value: serde_json::Value) -> Self {
+        let s = |k: &str| value.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        Self {
+            rkey,
+            cid,
+            created_at: s("createdAt").unwrap_or_default(),
+            attestation_pub_key: s("attestationPubKey"),
+            machine_fingerprint: s("machineFingerprint"),
+            machine_label: s("machineLabel"),
+            model_identifier: s("modelIdentifier"),
+            chip: s("chip"),
+            value,
+        }
+    }
+}
+
+/// This machine's identity, for matching its own records across a key rotation.
+#[derive(Debug, Clone)]
+pub struct MachineIdentity<'a> {
+    pub attestation_pub_key: &'a str,
+    /// `None` when the hardware serial couldn't be read.
+    pub machine_fingerprint: Option<&'a str>,
+    pub machine_label: &'a str,
+    pub model_identifier: Option<&'a str>,
+    pub chip: &'a str,
+    /// The rkey this agent last published to (from `provider-rkey.json`), if any.
+    pub cached_rkey: Option<&'a str>,
+}
+
+/// How a listed record relates to this machine.
+#[derive(Debug, PartialEq, Eq)]
+enum Kinship {
+    /// Definitely this machine (current key, matching fingerprint, or our cached rkey).
+    Mine,
+    /// A legacy record (no `machineFingerprint`) whose hardware profile matches —
+    /// probably ours from before the fix, but only adopted if it's the UNIQUE such
+    /// candidate (guards against two identically-named machines under one DID).
+    LegacyCandidate,
+    /// Someone else's machine (a different fingerprint, or an unrelated record).
+    Other,
+}
+
+fn classify(rec: &ListedProviderRecord, me: &MachineIdentity) -> Kinship {
+    // A present fingerprint is DEFINITIVE: equal => mine, unequal => not mine.
+    // This protects sibling machines from ever being adopted/deleted by heuristic.
+    if let (Some(rf), Some(mf)) = (rec.machine_fingerprint.as_deref(), me.machine_fingerprint) {
+        return if rf == mf {
+            Kinship::Mine
+        } else {
+            Kinship::Other
+        };
+    }
+    // A record carrying a fingerprint we don't share (we couldn't read our serial)
+    // is not something we can claim — leave it alone.
+    if rec.machine_fingerprint.is_some() {
+        return Kinship::Other;
+    }
+    // Current signing key matches (the common, un-rotated case).
+    if rec.attestation_pub_key.as_deref() == Some(me.attestation_pub_key) {
+        return Kinship::Mine;
+    }
+    // Our own record per the local rkey cache (survives a key rotation because the
+    // cache is keyed by DID, not pubkey).
+    if me.cached_rkey.is_some()
+        && rec.attestation_pub_key.is_some()
+        && rec.rkey == me.cached_rkey.unwrap()
+    {
+        return Kinship::Mine;
+    }
+    // Legacy record without a fingerprint: match on the stable hardware profile.
+    let profile_matches = rec.machine_label.as_deref() == Some(me.machine_label)
+        && rec.model_identifier.as_deref() == me.model_identifier
+        && rec.chip.as_deref() == Some(me.chip);
+    if profile_matches {
+        Kinship::LegacyCandidate
+    } else {
+        Kinship::Other
+    }
+}
+
+/// The outcome of reconciling this machine's provider records: which record to
+/// adopt (keep its rkey), the base body to publish onto (with the owner's intent
+/// harvested from any orphaned prior record), and which stale duplicates to delete.
+#[derive(Debug)]
+pub struct ProviderReconciliation {
+    pub canonical_rkey: String,
+    pub canonical_cid: String,
+    /// The canonical record body with owner-intent fields harvested from all of
+    /// this machine's records (so a `desiredTier` stranded on a pre-rotation
+    /// record is carried forward). Merge the agent's fields onto THIS.
+    pub base: serde_json::Value,
+    /// `(rkey, cid)` of stale duplicate records for THIS machine to delete.
+    pub delete: Vec<(String, String)>,
+    /// Count of legacy candidates left alone because the match was ambiguous
+    /// (more than one profile-matching record) — surfaced for logging.
+    pub ambiguous_legacy: usize,
+}
+
+/// Decide which of this machine's provider records to adopt and which to delete,
+/// carrying the owner's intent forward across a signing-key rotation. Returns
+/// `None` when no record belongs to this machine (caller creates a fresh one).
+///
+/// PURE (no I/O) so it's unit-testable; `dedup_and_publish_provider` supplies the
+/// listed records and performs the resulting put/delete under compare-and-swap.
+pub fn reconcile_provider_records(
+    listed: &[ListedProviderRecord],
+    me: &MachineIdentity,
+) -> Option<ProviderReconciliation> {
+    let mut mine: Vec<&ListedProviderRecord> = Vec::new();
+    let mut legacy: Vec<&ListedProviderRecord> = Vec::new();
+    for rec in listed {
+        match classify(rec, me) {
+            Kinship::Mine => mine.push(rec),
+            Kinship::LegacyCandidate => legacy.push(rec),
+            Kinship::Other => {}
+        }
+    }
+    // A legacy profile match is adopted ONLY when unique — otherwise two
+    // identically-named machines under one DID would cross-contaminate. When
+    // ambiguous, leave the legacy records untouched (they'll age out / be handled
+    // by the console cleanup), but still reconcile any definitively-mine records.
+    let ambiguous_legacy = if legacy.len() > 1 { legacy.len() } else { 0 };
+    if legacy.len() == 1 {
+        mine.push(legacy[0]);
+    }
+    if mine.is_empty() {
+        return None;
+    }
+    // Canonical = our cached rkey if it's among ours (keeps machineId stable),
+    // else the newest by createdAt.
+    mine.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let canonical = me
+        .cached_rkey
+        .and_then(|rk| mine.iter().find(|r| r.rkey == rk).copied())
+        .unwrap_or(mine[0]);
+
+    // Harvest owner-intent: fill any owner key ABSENT on the canonical from the
+    // most-recent OTHER record of ours that has it (mine is newest-first). This is
+    // what carries a `desiredTier` stranded on a pre-rotation record forward.
+    let mut base = canonical.value.clone();
+    if let Some(obj) = base.as_object_mut() {
+        for key in OWNER_INTENT_KEYS {
+            let present = obj.get(*key).map(|v| !v.is_null()).unwrap_or(false);
+            if present {
+                continue;
+            }
+            if let Some(v) = mine
+                .iter()
+                .filter_map(|r| r.value.get(*key))
+                .find(|v| !v.is_null())
+            {
+                obj.insert((*key).to_string(), v.clone());
+            }
+        }
+    }
+
+    let delete = mine
+        .iter()
+        .filter(|r| r.rkey != canonical.rkey)
+        .map(|r| (r.rkey.clone(), r.cid.clone()))
+        .collect();
+
+    Some(ProviderReconciliation {
+        canonical_rkey: canonical.rkey.clone(),
+        canonical_cid: canonical.cid.clone(),
+        base,
+        delete,
+        ambiguous_legacy,
+    })
+}
+
 /// The owner's pro-bono election for a machine, mirroring the lexicon
 /// `dev.cocore.compute.provider#proBonoPolicy`. Decides, per requester,
 /// whether a job is served free + unmetered with no exchange cut.
@@ -372,6 +583,46 @@ pub struct AttestationFault {
     pub message: String,
     /// When the agent recorded the fault.
     pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A content-safe description of why the advisor WebSocket cannot be
+/// established. Published on the provider record (mirroring [`EngineFault`] /
+/// [`AttestationFault`]) so the console can show "serving locally but can't
+/// reach the network" instead of a healthy-looking machine that silently
+/// never receives jobs. Written through the console's HTTPS proxy — exactly
+/// the transport that still works in the failure this diagnoses — and
+/// cleared on the next successful advisor registration.
+///
+/// Deliberately NOT a field on [`ProviderRecord`]: it changes mid-serve (set
+/// after repeated connect failures, cleared on registration), so it is
+/// written with the field-scoped [`PdsClient::patch_provider_advisor_fault`]
+/// rather than the whole-record merge — a full re-publish (offline marker,
+/// attestation refresh) carries it through untouched as an unknown key.
+#[allow(non_snake_case)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AdvisorFault {
+    /// Machine-readable fault class: `dns-failure`, `tls-failure`,
+    /// `connect-timeout`, `connect-refused`, `upgrade-blocked`,
+    /// `http-<status>`, `network-unreachable`, … (see the lexicon).
+    pub code: String,
+    /// Human-readable summary with remediation guidance. Carries only the
+    /// classified error kind — never raw error text, URLs, or credentials.
+    pub message: String,
+    /// When the agent recorded the fault.
+    pub observedAt: chrono::DateTime<chrono::Utc>,
+}
+
+/// Whether this process may have an `advisorFault` published on its provider
+/// record (or one left over from a previous process). Starts true so the
+/// first successful registration after boot checks the record once and
+/// removes any stale fault; [`PdsClient::patch_provider_advisor_fault`]
+/// keeps it in sync afterwards, so subsequent reconnects skip the read
+/// entirely instead of hitting the PDS every ~14-minute edge recycle.
+static ADVISOR_FAULT_MAYBE_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn advisor_fault_maybe_published() -> bool {
+    ADVISOR_FAULT_MAYBE_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[allow(non_snake_case)]
@@ -703,6 +954,89 @@ impl PdsClient {
         Some((active, desired, desired_tier, tool_calls))
     }
 
+    /// Field-scoped patch of this machine's provider record: set (or, with
+    /// `None`, remove) ONLY the `advisorFault` key, leaving every other field
+    /// exactly as read. The record-transactor rule in miniature — read the
+    /// LATEST record, patch one field, put under a compare-and-swap guard,
+    /// re-read and replay on a swap conflict — so a concurrent owner edit or
+    /// agent re-publish is never clobbered. Skips the write entirely (and
+    /// returns `Ok(false)`) when the record already carries the desired
+    /// state, so the serve loop's retries don't spam the PDS with no-op
+    /// commits. Fails closed: an unreadable record aborts rather than
+    /// fabricating a body.
+    ///
+    /// Returns whether a write actually happened. Keeps the process-wide
+    /// [`advisor_fault_maybe_published`] marker in sync on success.
+    pub async fn patch_provider_advisor_fault(
+        &self,
+        rkey: &str,
+        fault: Option<&AdvisorFault>,
+    ) -> Result<bool> {
+        const MAX_ATTEMPTS: u32 = 4;
+        let collection = "dev.cocore.compute.provider";
+        for attempt in 1..=MAX_ATTEMPTS {
+            let listed = self.list_my_records(collection).await?;
+            let Some(rec) = listed
+                .iter()
+                .find(|r| r.uri.rsplit('/').next() == Some(rkey))
+            else {
+                return Err(ProviderError::Pds(format!(
+                    "provider record {rkey} not found; cannot patch advisorFault"
+                )));
+            };
+            let existing = rec.value.get("advisorFault");
+            // Compare by code only: the message is deterministic per code and
+            // observedAt changes every classification, so keying on it would
+            // defeat the dedup and rewrite the record on every retry.
+            let existing_code = existing
+                .and_then(|f| f.get("code"))
+                .and_then(|c| c.as_str());
+            let unchanged = match fault {
+                Some(f) => existing_code == Some(f.code.as_str()),
+                None => existing.is_none(),
+            };
+            if unchanged {
+                ADVISOR_FAULT_MAYBE_PUBLISHED
+                    .store(fault.is_some(), std::sync::atomic::Ordering::Relaxed);
+                return Ok(false);
+            }
+            let mut body = rec.value.as_object().cloned().unwrap_or_default();
+            match fault {
+                Some(f) => {
+                    let v = serde_json::to_value(f)
+                        .map_err(|e| ProviderError::Pds(format!("encode advisorFault: {e}")))?;
+                    body.insert("advisorFault".to_string(), v);
+                }
+                None => {
+                    body.remove("advisorFault");
+                }
+            }
+            let patched = serde_json::Value::Object(body);
+            match self
+                .put_record(collection, rkey, &patched, Some(&rec.cid))
+                .await
+            {
+                Ok(_) => {
+                    ADVISOR_FAULT_MAYBE_PUBLISHED
+                        .store(fault.is_some(), std::sync::atomic::Ordering::Relaxed);
+                    return Ok(true);
+                }
+                Err(ProviderError::Pds(msg))
+                    if msg.contains("InvalidSwap") && attempt < MAX_ATTEMPTS =>
+                {
+                    // Someone committed between our read and put — re-read the
+                    // now-current record and replay the patch on top of it.
+                    tracing::debug!(attempt, "advisorFault patch swap conflict; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ProviderError::Pds(
+            "advisorFault patch exhausted swap retries".to_string(),
+        ))
+    }
+
     /// Walk the DID PLC directory to find this DID's PDS host. The
     /// agent only does this when it needs to read records directly
     /// (e.g. dedup); writes still go through the console proxy.
@@ -856,6 +1190,237 @@ impl PdsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(
+        rkey: &str,
+        created: &str,
+        pubkey: Option<&str>,
+        fp: Option<&str>,
+        label: &str,
+        model: &str,
+        chip: &str,
+        extra: serde_json::Value,
+    ) -> ListedProviderRecord {
+        let mut v = serde_json::json!({
+            "machineLabel": label, "modelIdentifier": model, "chip": chip, "createdAt": created,
+        });
+        if let Some(k) = pubkey {
+            v["attestationPubKey"] = serde_json::json!(k);
+        }
+        if let Some(f) = fp {
+            v["machineFingerprint"] = serde_json::json!(f);
+        }
+        if let Some(o) = extra.as_object() {
+            for (k, val) in o {
+                v[k] = val.clone();
+            }
+        }
+        ListedProviderRecord::from_value(rkey.into(), format!("cid-{rkey}"), v)
+    }
+
+    #[test]
+    fn reconcile_current_key_single_record() {
+        // The common case: one record, current key. Adopt it, nothing to delete.
+        let listed = [rec(
+            "r1",
+            "t1",
+            Some("KEY_A"),
+            None,
+            "Mac Mini 1",
+            "Macmini9,1",
+            "Apple M1",
+            serde_json::json!({}),
+        )];
+        let me = MachineIdentity {
+            attestation_pub_key: "KEY_A",
+            machine_fingerprint: Some("FP1"),
+            machine_label: "Mac Mini 1",
+            model_identifier: Some("Macmini9,1"),
+            chip: "Apple M1",
+            cached_rkey: Some("r1"),
+        };
+        let r = reconcile_provider_records(&listed, &me).expect("mine");
+        assert_eq!(r.canonical_rkey, "r1");
+        assert!(r.delete.is_empty());
+    }
+
+    #[test]
+    fn reconcile_key_rotation_adopts_legacy_and_harvests_desired_tier() {
+        // THE bug: an old-key record (v0.9.42, no fingerprint) holds
+        // desiredTier=attested-confidential; the new SE-key record has none. The
+        // agent must adopt (keep the new/cached rkey), harvest desiredTier, and
+        // delete the stale old record.
+        let listed = [
+            rec(
+                "r_old",
+                "t1",
+                Some("KEY_OLD"),
+                None,
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({ "desiredTier": "attested-confidential", "active": true }),
+            ),
+            rec(
+                "r_new",
+                "t2",
+                Some("KEY_NEW"),
+                None,
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({}),
+            ),
+        ];
+        let me = MachineIdentity {
+            attestation_pub_key: "KEY_NEW",
+            machine_fingerprint: None, // this build read no fingerprint on the new record yet
+            machine_label: "Mac Mini 1",
+            model_identifier: Some("Macmini9,1"),
+            chip: "Apple M1",
+            cached_rkey: Some("r_new"),
+        };
+        let r = reconcile_provider_records(&listed, &me).expect("mine");
+        assert_eq!(
+            r.canonical_rkey, "r_new",
+            "keeps the current rkey (machineId stable)"
+        );
+        assert_eq!(
+            r.base.get("desiredTier").and_then(|v| v.as_str()),
+            Some("attested-confidential"),
+            "harvested owner intent"
+        );
+        assert_eq!(r.base.get("active").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            r.delete,
+            vec![("r_old".into(), "cid-r_old".into())],
+            "prunes the stale duplicate"
+        );
+    }
+
+    #[test]
+    fn reconcile_never_touches_a_sibling_with_a_different_fingerprint() {
+        // A sibling machine (different fingerprint) under the same DID must be
+        // left completely alone even if some fields collide.
+        let listed = [
+            rec(
+                "r_me",
+                "t2",
+                Some("KEY_NEW"),
+                Some("FP_ME"),
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({}),
+            ),
+            rec(
+                "r_sib",
+                "t1",
+                Some("KEY_SIB"),
+                Some("FP_SIB"),
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({ "desiredTier": "attested-confidential" }),
+            ),
+        ];
+        let me = MachineIdentity {
+            attestation_pub_key: "KEY_NEW",
+            machine_fingerprint: Some("FP_ME"),
+            machine_label: "Mac Mini 1",
+            model_identifier: Some("Macmini9,1"),
+            chip: "Apple M1",
+            cached_rkey: Some("r_me"),
+        };
+        let r = reconcile_provider_records(&listed, &me).expect("mine");
+        assert_eq!(r.canonical_rkey, "r_me");
+        assert!(r.delete.is_empty(), "sibling never deleted");
+        assert!(
+            r.base.get("desiredTier").is_none(),
+            "sibling's intent never harvested"
+        );
+    }
+
+    #[test]
+    fn reconcile_ambiguous_legacy_left_alone() {
+        // Two legacy records with the SAME profile (identically-named machines):
+        // don't guess — adopt neither, delete neither.
+        let listed = [
+            rec(
+                "r1",
+                "t1",
+                Some("KEY_1"),
+                None,
+                "Mac",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({ "desiredTier": "attested-confidential" }),
+            ),
+            rec(
+                "r2",
+                "t2",
+                Some("KEY_2"),
+                None,
+                "Mac",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({}),
+            ),
+        ];
+        let me = MachineIdentity {
+            attestation_pub_key: "KEY_3", // neither matches our current key
+            machine_fingerprint: None,
+            machine_label: "Mac",
+            model_identifier: Some("Macmini9,1"),
+            chip: "Apple M1",
+            cached_rkey: None,
+        };
+        let r = reconcile_provider_records(&listed, &me);
+        assert!(r.is_none(), "ambiguous legacy → mint fresh, touch nothing");
+    }
+
+    #[test]
+    fn reconcile_fingerprint_match_survives_key_rotation() {
+        // Post-fix: both records carry a fingerprint. A rotated key with the same
+        // fingerprint is adopted; the older duplicate deleted.
+        let listed = [
+            rec(
+                "r_old",
+                "t1",
+                Some("KEY_OLD"),
+                Some("FP1"),
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({ "desiredTier": "attested-confidential" }),
+            ),
+            rec(
+                "r_new",
+                "t2",
+                Some("KEY_NEW"),
+                Some("FP1"),
+                "Mac Mini 1",
+                "Macmini9,1",
+                "Apple M1",
+                serde_json::json!({}),
+            ),
+        ];
+        let me = MachineIdentity {
+            attestation_pub_key: "KEY_NEW",
+            machine_fingerprint: Some("FP1"),
+            machine_label: "Mac Mini 1",
+            model_identifier: Some("Macmini9,1"),
+            chip: "Apple M1",
+            cached_rkey: Some("r_new"),
+        };
+        let r = reconcile_provider_records(&listed, &me).expect("mine");
+        assert_eq!(r.canonical_rkey, "r_new");
+        assert_eq!(
+            r.base.get("desiredTier").and_then(|v| v.as_str()),
+            Some("attested-confidential")
+        );
+        assert_eq!(r.delete, vec![("r_old".into(), "cid-r_old".into())]);
+    }
 
     #[test]
     fn pro_bono_mode_any_serves_everyone() {

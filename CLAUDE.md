@@ -25,10 +25,18 @@ not implementation details.
 
 1. **The provider's PDS is the source of truth for receipts.** No service in
    this repo may hold authoritative state that contradicts a signed record.
-   AppViews are caches and indexes, never ledgers.
+   AppViews are caches and indexes, never ledgers. _(ADR-0004 refinement: for
+   the **confidential** tier only, a receipt is confidential-valid only when it
+   also carries a trusted brokerage's session-bound countersignature — the PDS
+   still stores the record and the provider's own claims; the countersignature
+   is the attribute that elevates it. Best-effort is unaffected.)_
 2. **Receipts are self-verifying.** A receipt plus the lexicon plus the
    provider's DID document must be sufficient to validate the receipt
    offline. Do not introduce fields whose meaning depends on a live API.
+   _(ADR-0004: the confidential brokerage countersignature is verified OFFLINE
+   against the brokerage's DID document too, so this still holds — the live
+   challenge happens at seal time, but the receipt stays offline-verifiable
+   after the fact.)_
 3. **Lexicons evolve additively.** Existing field semantics never change.
    New behavior is a new optional field or a new NSID. If you find yourself
    wanting to repurpose a field, mint a new one.
@@ -36,10 +44,18 @@ not implementation details.
    receipt strong-refs an attestation record; many receipts share one
    attestation. This keeps receipts small and makes attestation rotation
    observable.
-5. **No coordinator-shaped components.** If a design needs a privileged
-   service that all providers must talk to in order for receipts to be
-   valid, the design is wrong. Routing, discovery, and settlement are all
-   federable.
+5. **No hardcoded singleton coordinator (ADR-0004).** Centralization *for
+   attestation and security* is allowed: a **brokerage** is a first-class
+   attestation authority identified by a DID + signing key, and confidential
+   validity is gated on its session-bound countersignature. What must stay true
+   is that the authority is **forkable** — the code and protocol let anyone
+   stand up a competing brokerage with a different authority account, providers
+   can register with several, and confidential validity is always *relative to
+   a named brokerage a verifier chooses to trust* (CA-style trust roots).
+   Federation is "forkable, competing authorities + federated storage," not "no
+   authority." Routing, discovery, and settlement remain federable. _(This
+   supersedes the original "no coordinator-shaped components" invariant, which
+   forbade exactly the attest↔serve binding that closes the astra seam.)_
 
 ## Repo layout
 

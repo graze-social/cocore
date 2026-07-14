@@ -41,3 +41,42 @@ export function getAttestationChain(
   }
   return null;
 }
+
+/** Record the signing key we just requested an MDA attestation for. Read at
+ *  capture time so we only store a chain whose freshness binds THIS key. */
+export function putExpectedAttestationKey(
+  serial: string,
+  pubkeyB64: string,
+  requestedAt: string,
+): void {
+  consoleDb()
+    .prepare(
+      `INSERT INTO mdm_attestation_expected (serial, pubkey, requested_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(serial) DO UPDATE SET
+         pubkey = excluded.pubkey,
+         requested_at = excluded.requested_at`,
+    )
+    .run(serial, pubkeyB64, requestedAt);
+}
+
+/** The signing key most recently requested for this device's attestation, or
+ *  null when none has been recorded (legacy captures — validation is skipped). */
+export function getExpectedAttestationKey(serial: string): string | null {
+  const row = consoleDb()
+    .prepare(`SELECT pubkey FROM mdm_attestation_expected WHERE serial = ?`)
+    .get(serial) as { pubkey: string } | undefined;
+  return row?.pubkey ?? null;
+}
+
+/** The key AND when it was requested — used to make DeviceInformation enqueue
+ *  idempotent (don't pile a second command for the same key onto NanoMDM's FIFO
+ *  queue while the first is still pending). Null when none recorded. */
+export function getExpectedAttestation(
+  serial: string,
+): { pubkey: string; requestedAt: string } | null {
+  const row = consoleDb()
+    .prepare(`SELECT pubkey, requested_at FROM mdm_attestation_expected WHERE serial = ?`)
+    .get(serial) as { pubkey: string; requested_at: string } | undefined;
+  return row ? { pubkey: row.pubkey, requestedAt: row.requested_at } : null;
+}

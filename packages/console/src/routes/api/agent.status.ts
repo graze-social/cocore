@@ -56,7 +56,18 @@ interface ConfidentialStanding {
    *  single most-actionable blocking leg, phrased for the operator. Null when
    *  verified, or when we can't reach the advisor to know. */
   blockedReason: string | null;
+  /** The machine is live on the advisor but registered WITHOUT proving control
+   *  of its DID (`registrationAuthenticated === false`) — its OAuth session has
+   *  expired, so it can't mint the service-auth JWT. This is the un-fixable-by-
+   *  waiting leg: the owner must sign in again. Distinct from a transient
+   *  advisor-unreachable ("can't tell"). */
+  needsReauth: boolean;
 }
+
+/** The C1 re-auth prompt. Phrased as an action, not a diagnosis: this is what
+ *  the owner sees when a confidential-desired machine can't authenticate. */
+const REAUTH_REASON =
+  "This Mac needs to sign in again — its co/core account session expired, so it can't prove its identity to the network. Open the app and choose “Sign in again”.";
 
 /** Map the advisor's per-leg breakdown to ONE operator-facing reason, in
  *  most-actionable-first order. Returns null when every leg holds (verified).
@@ -85,18 +96,21 @@ async function fetchConfidentialStanding(did: string): Promise<ConfidentialStand
   try {
     const base = cocoreConfig().advisorUrl.replace(/\/$/, "");
     const r = await fetch(`${base}/providers`);
-    if (!r.ok) return { verified: false, blockedReason: null };
+    if (!r.ok) return { verified: false, blockedReason: null, needsReauth: false };
     const list = (await r.json()) as Array<{
       did: string;
       confidentialEligible?: boolean;
       trustTier?: string;
+      // C1: whether this registration proved control of its DID. `false` means
+      // the agent couldn't mint a service-auth JWT — an expired OAuth session.
+      registrationAuthenticated?: boolean;
       confidentialLegs?: ConfidentialLegs;
     }>;
     const mine = list.filter((p) => p.did === did);
     const verified = mine.some(
       (p) => p.confidentialEligible === true || p.trustTier === "attested-confidential",
     );
-    if (verified) return { verified: true, blockedReason: null };
+    if (verified) return { verified: true, blockedReason: null, needsReauth: false };
     // Not verified on any row. Prefer the row that's claiming the confidential
     // tier (furthest along) for the most relevant blocking leg; fall back to
     // any row. With no rows at all the machine isn't connected to the advisor.
@@ -106,11 +120,24 @@ async function fetchConfidentialStanding(did: string): Promise<ConfidentialStand
         verified: false,
         blockedReason:
           "This Mac isn't connected to the co/core network yet — confidential can't be verified until it is.",
+        needsReauth: false,
       };
     }
-    return { verified: false, blockedReason: blockingLegReason(best.confidentialLegs ?? {}) };
+    // An unauthenticated registration can never reach an attested tier — the
+    // OAuth session that proves the DID has expired. This is the MOST-actionable
+    // block (it also silently pins the worker to best-effort and fails receipt
+    // publishing), so it outranks the per-leg reasons: tell the owner to sign in
+    // again rather than the misleading "not connected to the network".
+    if (best.registrationAuthenticated === false) {
+      return { verified: false, blockedReason: REAUTH_REASON, needsReauth: true };
+    }
+    return {
+      verified: false,
+      blockedReason: blockingLegReason(best.confidentialLegs ?? {}),
+      needsReauth: false,
+    };
   } catch {
-    return { verified: false, blockedReason: null };
+    return { verified: false, blockedReason: null, needsReauth: false };
   }
 }
 
@@ -170,6 +197,7 @@ export const Route = createFileRoute("/api/agent/status")({
           binaryVersion?: string;
           desiredTier?: string;
           attestationFault?: { code?: string; message?: string; at?: string };
+          advisorFault?: { code?: string; message?: string; observedAt?: string };
         };
 
         // Surface an attestation build/publish failure: a machine in this
@@ -183,6 +211,18 @@ export const Route = createFileRoute("/api/agent/status")({
             }
           : null;
 
+        // Surface an advisor-connectivity failure: a machine in this state is
+        // serving locally but invisible to the network (its WebSocket to the
+        // advisor never connects), so without this it just looks idle. Same
+        // shape and posture as attestationFault above.
+        const advisorFault = body.advisorFault
+          ? {
+              code: body.advisorFault.code ?? null,
+              message: body.advisorFault.message ?? null,
+              observedAt: body.advisorFault.observedAt ?? null,
+            }
+          : null;
+
         // The owner's DURABLE intent (written by `agent confidential`), distinct
         // from the advisor's verified standing. The app needs both: intent that
         // survives restarts, plus what's actually verified, so it can render an
@@ -193,6 +233,16 @@ export const Route = createFileRoute("/api/agent/status")({
         // confidential — a best-effort machine isn't "blocked", it's off.
         const confidentialBlockedReason =
           confidentialDesired && !standing.verified ? standing.blockedReason : null;
+
+        // A confidential-desired machine that's live on the advisor but
+        // registered unauthenticated (registrationAuthenticated === false) is a
+        // DEFINITIVE re-auth condition the session probe above can miss: the
+        // agent's OAuth session is dead but its WebSocket is healthy, so the
+        // AppView session store may not have observed the death. Trust the
+        // advisor-derived signal so the app's existing "Sign in again" prompt
+        // fires reliably. Scoped to confidential so a best-effort agent that's
+        // merely unauthenticated during staged rollout isn't nagged.
+        if (confidentialDesired && standing.needsReauth) needsReauth = true;
 
         return new Response(
           JSON.stringify({
@@ -209,6 +259,7 @@ export const Route = createFileRoute("/api/agent/status")({
             confidentialBlockedReason,
             agentVersion: body.binaryVersion ?? null,
             attestationFault,
+            advisorFault,
             needsReauth,
           }),
           { status: 200, headers: { "content-type": "application/json" } },

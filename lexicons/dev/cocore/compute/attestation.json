@@ -33,7 +33,17 @@
           "encryptionPubKey": {
             "type": "string",
             "maxLength": 128,
-            "description": "X25519 public key (base64) bound to the same Secure Enclave identity. Proves a single device controls both signing and request-encryption keys."
+            "description": "Public key (base64) a requester seals the prompt to. Its curve/scheme is given by `encScheme` (X25519 by default; a Secure-Enclave-resident P-256 key under 'p256-ecies-se'). Bound to the same device identity as `publicKey` — the selfSignature over this record authenticates it."
+          },
+          "sigScheme": {
+            "type": "string",
+            "description": "How `selfSignature` (and the `enclaveSignature` of receipts that strong-ref this attestation) is produced. 'p256' (default when absent) = raw ECDSA-P256 over the canonical bytes. 'appattest-assertion' = an Apple App Attest assertion from DCAppAttestService.generateAssertion, where the App Attest key IS this record's `publicKey` (so keyId == sha256(uncompressed publicKey)) and the signed message is carried as the assertion clientDataHash = sha256(canonical bytes). REQUIRED for `attested-confidential` (ADR-0003): only assertion signing proves the private key is Secure-Enclave-resident and non-exportable; a raw p256 key with any attestation is portable to another host.",
+            "knownValues": ["p256", "appattest-assertion"]
+          },
+          "encScheme": {
+            "type": "string",
+            "description": "Curve/scheme for `encryptionPubKey`. 'x25519' (default when absent) = a software X25519 key, which is extractable — the operator can lift it and decrypt the prompt off-box. 'p256-ecies-se' = a Secure-Enclave-resident P-256 key where ECIES key agreement runs inside the SEP and the private key is non-extractable. REQUIRED for `attested-confidential` (ADR-0003) so the decryption key cannot leave the measured machine.",
+            "knownValues": ["x25519", "p256-ecies-se"]
           },
           "chipName": { "type": "string", "maxLength": 64 },
           "hardwareModel": {

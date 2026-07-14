@@ -1,8 +1,45 @@
-// Small, shared visual indicators for a machine's advisory region and its
-// pro-bono election. Used in both the fleet table (MachinesDashboard) and the
-// machine detail header so the two stay in sync.
+// Small, shared visual indicators for a machine's advisory region, its
+// pro-bono election, and its live network standing. Used in both the fleet
+// table (MachinesDashboard) and the machine detail header so the two stay
+// in sync.
 
 import { Badge } from "@/design-system/badge";
+
+import { machineNetworkStanding, type Machine } from "./machines-data.ts";
+
+/** Live network-standing chip: "on network" when the advisor holds a live
+ *  connection to this machine, "not reachable" when the machine should be
+ *  serving but the network can't hear from it (absent from the advisor's
+ *  registry, and/or its agent published an `advisorFault`). Renders nothing
+ *  when a claim would be a guess — machine paused/offline/provisioning, or
+ *  live standing unavailable with no agent-reported fault. */
+export function NetworkStandingBadge({ m }: { m: Machine }) {
+  const standing = machineNetworkStanding(m);
+  if (standing === null) return null;
+  if (standing === "on-network") {
+    return (
+      <Badge
+        variant="success"
+        size="sm"
+        title="Connected to the co/core network — reachable for jobs"
+      >
+        on network
+      </Badge>
+    );
+  }
+  return (
+    <Badge
+      variant="warning"
+      size="sm"
+      title={
+        m.advisorFaultReason ??
+        "This machine is serving locally but the co/core network can't reach it — no jobs will arrive until it reconnects."
+      }
+    >
+      not reachable
+    </Badge>
+  );
+}
 
 /** Turn an ISO 3166-1 alpha-2 country code into a flag emoji by mapping each
  *  ASCII letter to its regional-indicator symbol. Returns null for anything

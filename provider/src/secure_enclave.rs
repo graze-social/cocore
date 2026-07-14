@@ -12,6 +12,9 @@
 //! distinguishes these cases.
 
 use anyhow::Result;
+use once_cell::sync::OnceCell;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnclaveError {
@@ -45,10 +48,89 @@ pub trait SigningIdentity: Send + Sync {
 pub fn load_or_create_identity() -> Result<Box<dyn SigningIdentity>> {
     #[cfg(all(target_os = "macos", feature = "secure_enclave"))]
     {
-        return Ok(Box::new(macos::EnclaveIdentity::load_or_create()?));
+        // Fall back rather than abort if the enclave is compiled in but
+        // unavailable at runtime (a chip-replaced host, a VM). The machine then
+        // signs with a software key, reports is_hardware_bound()=false, and
+        // self-caps at best-effort — no crash. This shouldn't fire on Apple
+        // Silicon, but the soft-degradation keeps such an edge host serving.
+        match macos::EnclaveIdentity::load_or_create() {
+            Ok(id) => return Ok(Box::new(id)),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Secure Enclave signing identity unavailable; falling back to software identity (best-effort)"
+            ),
+        }
     }
     #[allow(unreachable_code)]
     Ok(Box::new(software::SoftwareIdentity::generate()?))
+}
+
+/// Process-global signing identity, loaded exactly ONCE and shared thereafter.
+///
+/// Loading is NOT deterministic across repeated calls on a real machine: an SE
+/// key created/accessible in one process context is not always reconstructible
+/// in another, so a fresh `load_or_create_identity()` on each call could return
+/// DIFFERENT keys within the same process (observed: a serve publishing one
+/// attestation under `1feH…` then the rest under `1MPNTd…`). That flapping is
+/// fatal for MDM attestation — the captured chain binds `sha256(signing pubkey)`,
+/// so a moving key never binds. Memoizing here pins the process to the first key
+/// it successfully loads, which is what every in-process caller must share.
+static SHARED_IDENTITY: OnceCell<Arc<dyn SigningIdentity>> = OnceCell::new();
+
+pub fn shared_identity() -> Result<Arc<dyn SigningIdentity>> {
+    SHARED_IDENTITY
+        .get_or_try_init(|| -> Result<Arc<dyn SigningIdentity>> {
+            let arc: Arc<dyn SigningIdentity> = load_or_create_identity()?.into();
+            // DIAGNOSTIC (load-bearing for triaging Secure Mode): record exactly
+            // which key this process pinned and whether it's hardware-bound, so a
+            // serve↔wizard key mismatch is visible in the log instead of inferred
+            // from attestation records.
+            tracing::info!(
+                pubkey = %arc.public_key_b64(),
+                hardware_bound = arc.is_hardware_bound(),
+                "pinned process signing identity (memoized)"
+            );
+            Ok(arc)
+        })
+        .cloned()
+}
+
+/// `~/.cocore/signing-pubkey` — the serve's canonical signing public key in
+/// plaintext base64. The serve is the SINGLE process that holds the SE key; every
+/// other context (the `agent pubkey` CLI that backs the Secure Mode wizard) reads
+/// THIS file instead of loading its own SE key, so the wizard always requests MDM
+/// attestation for the exact key the serve signs with. This sidesteps the
+/// cross-context SE-key problem entirely: only one process ever touches the key.
+pub fn signing_pubkey_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cocore").join("signing-pubkey"))
+}
+
+/// Called by the SERVE (and only the serve) after it pins its identity, so the
+/// file always reflects the key the running serve actually uses. Best-effort.
+pub fn publish_signing_pubkey(pubkey_b64: &str) {
+    let Some(path) = signing_pubkey_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, pubkey_b64) {
+        tracing::warn!(error = %e, "could not publish signing-pubkey file");
+    } else {
+        tracing::info!(pubkey = %pubkey_b64, "published serve signing pubkey for the wizard/CLI");
+    }
+}
+
+/// Read the serve's published signing pubkey, if a serve has written it. `None`
+/// when absent (no serve has run yet) — the caller falls back to loading a key.
+pub fn read_published_signing_pubkey() -> Option<String> {
+    let raw = std::fs::read_to_string(signing_pubkey_path()?).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "secure_enclave"))]

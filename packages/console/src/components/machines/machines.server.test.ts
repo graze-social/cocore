@@ -19,7 +19,12 @@ import type {
   FleetReceiptStats,
   MachineReceiptStats,
 } from "./machines.server.ts";
-import type { Machine } from "./machines-data.ts";
+import {
+  advisorUnreachable,
+  clientVersionStatus,
+  machineNetworkStanding,
+  type Machine,
+} from "./machines-data.ts";
 
 const NOW = Date.UTC(2026, 5, 11, 12, 0, 0); // fixed "now"
 const minsAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
@@ -189,6 +194,19 @@ test("a healthy record produces no fault fields", () => {
   assert.equal(m.faultCode, undefined);
   assert.equal(m.faultReason, undefined);
   assert.equal(m.faultModels, undefined);
+});
+
+test("maps and compares the machine client version", () => {
+  const m = providerRowsToMachines(
+    [providerRow({ binaryVersion: "0.9.9" })],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(m.binaryVersion, "0.9.9");
+  assert.equal(clientVersionStatus(m.binaryVersion, "v0.9.10"), "outdated");
+  assert.equal(clientVersionStatus("0.9.10", "v0.9.10"), "latest");
+  assert.equal(clientVersionStatus("0.10.0", "v0.9.10"), "latest");
+  assert.equal(clientVersionStatus(undefined, "v0.9.10"), null);
 });
 
 test("a fault without a human-readable message is ignored (no empty alert)", () => {
@@ -419,4 +437,169 @@ test("applyAdvisorStanding never fabricates health when the advisor is unreachab
   // unhealthy / advisorConnected stay UNDEFINED — unknown, not a green claim.
   assert.equal(m!.unhealthy, undefined);
   assert.equal(m!.advisorConnected, undefined);
+});
+
+// --- advisorFault: "serving locally, invisible to the network" ---------
+
+test("advisorFault is mapped onto the machine when the record carries it", () => {
+  const m = providerRowsToMachines(
+    [
+      providerRow({
+        supportedModels: ["qwen"],
+        serving: true,
+        advisorFault: {
+          code: "upgrade-blocked",
+          message: "WebSocket connections are being filtered on this network.",
+          observedAt: "2026-07-04T01:52:00Z",
+        },
+      }),
+    ],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(m.advisorFaultCode, "upgrade-blocked");
+  assert.match(m.advisorFaultReason ?? "", /filtered/);
+  assert.equal(m.advisorFaultAt, "2026-07-04T01:52:00Z");
+  // Independent of the engine fault surface.
+  assert.equal(m.faultReason, undefined);
+});
+
+test("an advisorFault without a message is ignored (no empty alert)", () => {
+  const m = providerRowsToMachines(
+    [providerRow({ supportedModels: ["qwen"], advisorFault: { code: "dns-failure" } })],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(m.advisorFaultCode, undefined);
+  assert.equal(m.advisorFaultReason, undefined);
+});
+
+test("advisorUnreachable: fault on an idle machine ⇒ unreachable, even without live standing", () => {
+  const m: Machine = {
+    ...machineStub("rkey-1"),
+    advisorFaultCode: "upgrade-blocked",
+    advisorFaultReason: "WebSocket connections are being filtered on this network.",
+  };
+  assert.equal(advisorUnreachable(m), true);
+  assert.equal(machineNetworkStanding(m), "not-reachable");
+});
+
+test("advisorUnreachable: serving on PDS but absent from the advisor ⇒ unreachable (the Jesse Beck case)", () => {
+  // Agent 0.9.40 published a healthy record but its WS never arrived — no
+  // fault field yet (old agent), but the advisor join says "not connected".
+  const [m] = applyAdvisorStanding([machineStub("rkey-1")], {
+    reachable: true,
+    byMachineId: new Map(),
+  });
+  assert.equal(advisorUnreachable(m!), true);
+  assert.equal(machineNetworkStanding(m!), "not-reachable");
+});
+
+test("applyAdvisorStanding joins by attestation pubkey when the advisor has no rkey (dead-session agent)", () => {
+  // An agent whose PDS session died can't publish at boot, so it registers
+  // with no machine_id and the advisor keys it by its attestation pubkey.
+  // The machine is LIVE on the network — the pubkey fallback must find it.
+  const pubkey = "BFakeUncompressedP256PointBase64==";
+  const machines = [{ ...machineStub("rkey-mini"), attestationPubKey: pubkey }];
+  const [m] = applyAdvisorStanding(machines, {
+    reachable: true,
+    byMachineId: new Map([
+      [
+        pubkey,
+        {
+          unhealthy: false,
+          unhealthyReason: null,
+          silentFailure: false,
+          verifiedTier: "attested-confidential" as const,
+        },
+      ],
+    ]),
+  });
+  assert.equal(m!.standingKnown, true);
+  assert.equal(m!.advisorConnected, true);
+  assert.equal(m!.verifiedTier, "attested-confidential");
+  assert.equal(advisorUnreachable(m!), false);
+  assert.equal(machineNetworkStanding(m!), "on-network");
+});
+
+test("applyAdvisorStanding prefers the rkey join over the pubkey fallback", () => {
+  // Same machine present under BOTH keys (e.g. a race across reconnects):
+  // the rkey entry is the agent's own claim of identity — it wins.
+  const pubkey = "BFakeUncompressedP256PointBase64==";
+  const entry = (reason: string) => ({
+    unhealthy: true,
+    unhealthyReason: reason,
+    silentFailure: false,
+    verifiedTier: "best-effort" as const,
+  });
+  const machines = [{ ...machineStub("rkey-mini"), attestationPubKey: pubkey }];
+  const [m] = applyAdvisorStanding(machines, {
+    reachable: true,
+    byMachineId: new Map([
+      ["rkey-mini", entry("via-rkey")],
+      [pubkey, entry("via-pubkey")],
+    ]),
+  });
+  assert.equal(m!.unhealthyReason, "via-rkey");
+});
+
+test("providerRowsToMachines carries the record's attestationPubKey onto the machine", () => {
+  const withKey = providerRowsToMachines(
+    [providerRow({ attestationPubKey: "BSomeKey==" })],
+    ZERO_STATS,
+    new Map(),
+  )[0]!;
+  assert.equal(withKey.attestationPubKey, "BSomeKey==");
+  const withoutKey = providerRowsToMachines([providerRow({})], ZERO_STATS, new Map())[0]!;
+  assert.equal(withoutKey.attestationPubKey, undefined);
+});
+
+test("advisorUnreachable: a live advisor connection outranks a stale fault", () => {
+  const machines = [
+    {
+      ...machineStub("rkey-1"),
+      advisorFaultCode: "connect-timeout",
+      advisorFaultReason: "stale — the agent just reconnected and hasn't cleared it yet",
+    },
+  ];
+  const [m] = applyAdvisorStanding(machines, {
+    reachable: true,
+    byMachineId: new Map([
+      [
+        "rkey-1",
+        {
+          unhealthy: false,
+          unhealthyReason: null,
+          silentFailure: false,
+          verifiedTier: "best-effort" as const,
+        },
+      ],
+    ]),
+  });
+  assert.equal(advisorUnreachable(m!), false);
+  assert.equal(machineNetworkStanding(m!), "on-network");
+});
+
+test("advisorUnreachable: never claimed for a paused/offline/provisioning machine", () => {
+  for (const state of ["paused", "offline", "provisioning"] as const) {
+    const m: Machine = {
+      ...machineStub("rkey-1"),
+      state,
+      advisorFaultCode: "dns-failure",
+      advisorFaultReason: "lingering fault on a stopped machine",
+      standingKnown: true,
+      advisorConnected: false,
+    };
+    assert.equal(advisorUnreachable(m), false, state);
+    assert.equal(machineNetworkStanding(m), null, state);
+  }
+});
+
+test("advisorUnreachable: unknown standing with no fault makes no claim", () => {
+  const [m] = applyAdvisorStanding([machineStub("rkey-1")], {
+    reachable: false,
+    byMachineId: new Map(),
+  });
+  assert.equal(advisorUnreachable(m!), false);
+  assert.equal(machineNetworkStanding(m!), null);
 });

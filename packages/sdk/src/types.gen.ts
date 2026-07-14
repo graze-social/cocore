@@ -79,6 +79,8 @@ export interface TokenPatronageRecord {
 export interface AttestationRecord {
   publicKey: string;
   encryptionPubKey: string;
+  sigScheme?: "p256" | "appattest-assertion";
+  encScheme?: "x25519" | "p256-ecies-se";
   chipName: string;
   hardwareModel: string;
   serialNumberHash: string;
@@ -163,11 +165,9 @@ export interface JobRecord {
   expiresAt: string;
   createdAt: string;
   outputSchema?: { name?: string; strict?: boolean; schema?: Record<string, unknown> };
-  tools?: {
-    type: "function";
-    function: { name: string; description?: string; parameters?: Record<string, unknown> };
-  }[];
+  tools?: { type: "function"; function: { name: string; description?: string; parameters?: Record<string, unknown> } }[];
   toolChoice?: "auto" | "none" | "required";
+  toolChoiceFunction?: string;
 }
 
 export interface PaymentAuthorizationRecord {
@@ -196,6 +196,7 @@ export interface ProviderRecord {
   priceList: ModelPrice[];
   encryptionPubKey: string;
   attestationPubKey: string;
+  machineFingerprint?: string;
   trustLevel: TrustLevel;
   tier?: Tier;
   desiredTier?: Tier;
@@ -208,6 +209,9 @@ export interface ProviderRecord {
   payoutsEnabled?: boolean;
   binaryVersion?: string;
   engineFault?: { code: string; message: string; models?: string[]; at: string };
+  attestationFault?: { code: string; message: string; at: string };
+  advisorFault?: { code: string; message: string; observedAt: string };
+  toolCalls?: boolean;
   shareLocation?: boolean;
   region?: string;
   regionSource?: string;
@@ -235,6 +239,7 @@ export interface ReceiptRecord {
   enclaveSignature: string;
   tier?: Tier;
   proBono?: boolean;
+  brokerageCountersignature?: Record<string, unknown>;
 }
 
 export interface SettlementRecord {

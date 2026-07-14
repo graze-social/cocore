@@ -333,6 +333,106 @@ pub fn verify_b64(object_b64: &str, key_id_b64: &str, public_key_b64: &str, app_
     )
 }
 
+// ---- App Attest ASSERTIONS (ADR-0003) ----
+//
+// An attestation OBJECT (above) is a one-time proof a key was generated in the
+// Secure Enclave. An ASSERTION is the ongoing signature: `generateAssertion`
+// signs `authenticatorData ‖ clientDataHash` with the SE key, which can't be
+// exported or produced off-device. When the confidential identity IS the App
+// Attest key (`keyId == sha256(uncompressed publicKey)`), every record signature
+// becomes an assertion over `clientDataHash = sha256(canonical message)`.
+
+/// Verify an App Attest assertion over `message`, against the SE key that IS the
+/// signing identity (`public_key_raw` = raw 64-byte X‖Y). Checks the ES256
+/// signature over `authenticatorData ‖ sha256(message)` and that the assertion's
+/// rpIdHash == sha256(app_id). Mirror of `verifyAppAttestAssertion` (appattest.ts).
+pub fn verify_assertion(
+    public_key_raw: &[u8],
+    assertion_cbor: &[u8],
+    message: &[u8],
+    app_id: &str,
+) -> bool {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use p256::EncodedPoint;
+
+    // CBOR: { "signature": bstr, "authenticatorData": bstr }.
+    let Ok(val): Result<ciborium::value::Value, _> = ciborium::from_reader(assertion_cbor) else {
+        return false;
+    };
+    let Some(map) = val.as_map() else {
+        return false;
+    };
+    let get = |key: &str| {
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, v)| v)
+    };
+    let (Some(signature), Some(auth_data)) = (
+        get("signature").and_then(|v| v.as_bytes()),
+        get("authenticatorData").and_then(|v| v.as_bytes()),
+    ) else {
+        return false;
+    };
+    // authenticatorData = rpIdHash(32) ‖ flags(1) ‖ signCount(4); assertions omit
+    // attested-credential-data, so 37 bytes is the minimum.
+    if auth_data.len() < 37 {
+        return false;
+    }
+    if auth_data[..32] != Sha256::digest(app_id.as_bytes())[..] {
+        return false;
+    }
+    if public_key_raw.len() != 64 {
+        return false;
+    }
+    let mut uncompressed = Vec::with_capacity(65);
+    uncompressed.push(0x04);
+    uncompressed.extend_from_slice(public_key_raw);
+    let Ok(point) = EncodedPoint::from_bytes(&uncompressed) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_encoded_point(&point) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_der(signature) else {
+        return false;
+    };
+    let mut signed = Vec::with_capacity(auth_data.len() + 32);
+    signed.extend_from_slice(auth_data);
+    signed.extend_from_slice(&Sha256::digest(message));
+    vk.verify(&signed, &sig).is_ok()
+}
+
+/// Base64 wrapper over [`verify_assertion`] (mirrors `verify_b64`).
+pub fn verify_assertion_b64(
+    public_key_b64: &str,
+    assertion_b64: &str,
+    message: &[u8],
+    app_id: &str,
+) -> bool {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let (Ok(pk), Ok(a)) = (B64.decode(public_key_b64), B64.decode(assertion_b64)) else {
+        return false;
+    };
+    verify_assertion(&pk, &a, message, app_id)
+}
+
+/// Residency predicate (ADR-0003): does the App-Attest-attested key EQUAL the
+/// signing key? A bound attestation object proves a genuine SE key was attested,
+/// but binds to the signing key only via clientData — so a genuine SE key can
+/// attest a pointer to a SEPARATE (software) signing key, still portable. Only
+/// equality proves the signing private key itself is non-exportable.
+/// `attested_uncompressed` is 65 bytes (0x04‖X‖Y); `signing_pubkey_raw` is 64.
+/// Mirror of `attestedKeyMatchesSigningKey` (appattest.ts).
+pub fn attested_key_matches_signing_key(
+    attested_uncompressed: &[u8],
+    signing_pubkey_raw: &[u8],
+) -> bool {
+    attested_uncompressed.len() == 65
+        && signing_pubkey_raw.len() == 64
+        && attested_uncompressed[0] == 0x04
+        && attested_uncompressed[1..] == *signing_pubkey_raw
+}
+
 // ---- internals ----
 
 struct AttestationObject {
@@ -742,5 +842,76 @@ mod tests {
         // A 31-byte "nonce" (wrong length) is rejected.
         let bad = nonce_extension_der(&[0u8; 31]);
         assert_eq!(parse_nonce_extension(&bad), None);
+    }
+
+    // ---- App Attest ASSERTIONS (ADR-0003) ----
+    // Self-contained: synthesize an assertion the way DCAppAttestService would (a
+    // P-256 SE key signs `authenticatorData || sha256(clientData)`). Parity with
+    // the TS/Py appattest assertion tests.
+
+    fn assertion_identity() -> (p256::ecdsa::SigningKey, Vec<u8>) {
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+        let sk = SigningKey::random(&mut OsRng);
+        let vk = sk.verifying_key();
+        let ep = vk.to_encoded_point(false); // 0x04||X||Y
+        let raw = ep.as_bytes()[1..].to_vec(); // 64-byte X||Y
+        (sk, raw)
+    }
+
+    fn make_assertion(sk: &p256::ecdsa::SigningKey, message: &[u8], app_id: &str) -> Vec<u8> {
+        use ciborium::value::Value;
+        use p256::ecdsa::{signature::Signer, Signature};
+        let mut auth_data = Sha256::digest(app_id.as_bytes()).to_vec();
+        auth_data.extend_from_slice(&[0x00, 0, 0, 0, 1]); // flags + signCount → 37 bytes
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(message));
+        let sig: Signature = sk.sign(&signed);
+        let der = sig.to_der().as_bytes().to_vec();
+        let val = Value::Map(vec![
+            (Value::Text("signature".into()), Value::Bytes(der)),
+            (
+                Value::Text("authenticatorData".into()),
+                Value::Bytes(auth_data),
+            ),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&val, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn verify_assertion_accepts_valid_and_rejects_tamper() {
+        let (sk, pub_raw) = assertion_identity();
+        let msg = b"canonical record bytes";
+        let a = make_assertion(&sk, msg, TEST_APP_ID);
+        assert!(verify_assertion(&pub_raw, &a, msg, TEST_APP_ID));
+        // Tampered message.
+        assert!(!verify_assertion(&pub_raw, &a, b"tampered", TEST_APP_ID));
+        // Wrong verifying key.
+        let (_, other) = assertion_identity();
+        assert!(!verify_assertion(&other, &a, msg, TEST_APP_ID));
+        // Wrong appId (rpIdHash mismatch).
+        assert!(!verify_assertion(
+            &pub_raw,
+            &a,
+            msg,
+            "9Z9Z9Z9Z9Z.dev.cocore.provider"
+        ));
+    }
+
+    #[test]
+    fn attested_key_matches_signing_key_only_on_equality() {
+        let (_, pub_raw) = assertion_identity();
+        let mut uncompressed = vec![0x04u8];
+        uncompressed.extend_from_slice(&pub_raw);
+        assert!(attested_key_matches_signing_key(&uncompressed, &pub_raw));
+        // Different key.
+        let (_, other) = assertion_identity();
+        let mut other_unc = vec![0x04u8];
+        other_unc.extend_from_slice(&other);
+        assert!(!attested_key_matches_signing_key(&other_unc, &pub_raw));
+        // Raw 64 (missing 0x04 prefix) doesn't match.
+        assert!(!attested_key_matches_signing_key(&pub_raw, &pub_raw));
     }
 }

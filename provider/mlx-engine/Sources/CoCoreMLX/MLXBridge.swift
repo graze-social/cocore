@@ -5,6 +5,7 @@
 // Rust side already runs generation on a dedicated blocking thread.
 
 import Foundation
+import MLX
 
 @_cdecl("cocore_mlx_load_model")
 public func cocore_mlx_load_model(
@@ -105,8 +106,21 @@ public func cocore_mlx_metallib_hash(
     return 0
 }
 
+/// Free the Metal allocator's cached buffers (KV cache + scratch) so a just-
+/// served prompt's generation state doesn't linger in the GPU pool between jobs.
+/// `MLX.Memory.clearCache()` is process-global, so the handle is unused (kept for
+/// C-ABI symmetry). Best-effort (ADR-0005 step 3): evicts/frees, does not
+/// guarantee GPU-page zeroing — Metal exposes no memset-on-free.
+@_cdecl("cocore_mlx_clear_cache")
+public func cocore_mlx_clear_cache(_ handle: UnsafeMutableRawPointer?) {
+    _ = handle
+    MLX.Memory.clearCache()
+}
+
 @_cdecl("cocore_mlx_release")
 public func cocore_mlx_release(_ handle: UnsafeMutableRawPointer?) {
     guard let handle else { return }
+    // Drop the model, then evict its GPU buffers from the allocator pool.
     Unmanaged<MLXEngine>.fromOpaque(handle).release()
+    MLX.Memory.clearCache()
 }

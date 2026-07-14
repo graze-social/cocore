@@ -65,8 +65,12 @@ note "built $("$WORKER_BIN" --version)"
 bold "==> compile the MLX metallib (xcodebuild PrepareMetalShaders — swift build skips it)"
 MLX_ENGINE_DIR="$PROVIDER/mlx-engine"
 XCBUILD_DIR="$MLX_ENGINE_DIR/.xcbuild-metallib"
+# -skipPackagePluginValidation: mlx-swift 0.31+ ships a "CudaBuild" build-tool
+# plug-in that xcodebuild otherwise blocks pending interactive trust approval,
+# which fails a headless release build.
 ( cd "$MLX_ENGINE_DIR" && xcodebuild -scheme CoCoreMLX \
     -destination 'platform=macOS,arch=arm64' -configuration Release \
+    -skipPackagePluginValidation \
     -derivedDataPath "$XCBUILD_DIR" build >/dev/null 2>&1 ) \
   || die "metallib compile failed (xcodebuild -scheme CoCoreMLX)"
 METALLIB="$(find "$XCBUILD_DIR" -path '*Cmlx*' -name 'default.metallib' -print -quit 2>/dev/null || true)"

@@ -148,13 +148,15 @@ signals — **not** independently audited or proven guarantees:
 
 2. **The confidential tier** aims to keep your prompt unreadable to
    the machine's operator by running inference inside a measured,
-   signed build under a hardened runtime. It is a raised bar,
-   **not** a hardware enclave, and it is not audited: a compromised
-   OS, an agent bug, a mis-routed request, or a maliciously
-   substituted build could still expose your prompt. Treat every
-   provider as semi-trusted, and **do not send anything through a
-   confidential provider that you could not tolerate the operator
-   reading.**
+   signed build under a hardened runtime, with the agent's signing
+   and prompt-decryption keys held in the Secure Enclave so the
+   operator can't copy them to another machine. It is a raised bar,
+   **not** a hardware enclave for compute, and it is not audited: a
+   compromised OS, an agent bug, a mis-routed request, or a
+   maliciously substituted build could still expose your prompt.
+   Treat every provider as semi-trusted, and **do not send anything
+   through a confidential provider that you could not tolerate the
+   operator reading.**
 
 These features may change, regress, or be withdrawn at any time
 without notice.

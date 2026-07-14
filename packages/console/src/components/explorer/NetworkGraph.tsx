@@ -32,6 +32,10 @@ export interface NetworkGraphProps {
   query: string;
   /** Show only providers (and edges between them). */
   providersOnly: boolean;
+  /** When set, show only these DIDs (and edges between them) — the page
+   *  computes the set from its version filter so the sentinel semantics
+   *  ("unversioned") stay out of the graph. Null = no version filter. */
+  versionDids: ReadonlySet<string> | null;
 }
 
 function nodeRadius(n: ExplorerNode): number {
@@ -110,6 +114,7 @@ export function NetworkGraph({
   onSelect,
   query,
   providersOnly,
+  versionDids,
 }: NetworkGraphProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -129,13 +134,18 @@ export function NetworkGraph({
 
   // Filtered view of the graph.
   const { vizNodes, vizEdges } = useMemo(() => {
-    if (!providersOnly) return { vizNodes: nodes, vizEdges: edges };
-    const keep = new Set(nodes.filter((n) => n.isProvider).map((n) => n.did));
+    if (!providersOnly && !versionDids) return { vizNodes: nodes, vizEdges: edges };
+    const keep = new Set(
+      nodes
+        .filter((n) => !providersOnly || n.isProvider)
+        .filter((n) => !versionDids || versionDids.has(n.did))
+        .map((n) => n.did),
+    );
     return {
       vizNodes: nodes.filter((n) => keep.has(n.did)),
       vizEdges: edges.filter((e) => keep.has(e.source) && keep.has(e.target)),
     };
-  }, [nodes, edges, providersOnly]);
+  }, [nodes, edges, providersOnly, versionDids]);
 
   const degree = useMemo(() => {
     const d = new Map<string, number>();

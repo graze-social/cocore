@@ -9,6 +9,7 @@
 // read from the environment (never the repo). Proven end-to-end by the S5 spike
 // (provider/spikes/apns) — this is the same flow in TypeScript.
 
+import { eciesSeal } from "@cocore/sdk/ecies";
 import crypto from "node:crypto";
 import http2 from "node:http2";
 import nacl from "tweetnacl";
@@ -74,16 +75,31 @@ export function buildApnsJwt(
 }
 const jwtCache: { jwt?: string; iat?: number } = {};
 
-/** Seal `nonce` to the provider's X25519 key with a fresh ephemeral key
- *  (NaCl box, same wire format as the provider's `open_from`). Returns the
- *  push payload's `cc` object. Exported for testing. */
-export function sealCodeChallenge(
+/** Seal `nonce` to the provider's encryption key, picking the codec from the
+ *  provider's advertised `encScheme`. Returns the push payload's `cc` object
+ *  (`{ epk, n }` — the ephemeral pub + sealed nonce; the provider recomputes the
+ *  shared secret from `epk`). Exported for testing.
+ *
+ *  * `p256-ecies-se` — ephemeral-static P-256 ECIES to the Secure-Enclave key,
+ *    so a copied software key can't recover the nonce off-box (ADR-0005). Shared
+ *    byte-for-byte with the SDK/provider via `@cocore/sdk/ecies`.
+ *  * `x25519` / absent (older agents) — the NaCl box path. Kept as the default
+ *    so a pre-SE agent's challenge still seals correctly. */
+export async function sealCodeChallenge(
   nonce: string,
   encryptionPubKeyB64: string,
-): { epk: string; n: string } {
+  encScheme?: string,
+): Promise<{ epk: string; n: string }> {
   const recipient = new Uint8Array(Buffer.from(encryptionPubKeyB64, "base64"));
-  const eph = nacl.box.keyPair();
   const msg = new TextEncoder().encode(nonce);
+  if (encScheme === "p256-ecies-se") {
+    const { epk, blob } = await eciesSeal(recipient, msg);
+    return {
+      epk: Buffer.from(epk).toString("base64"),
+      n: Buffer.from(blob).toString("base64"),
+    };
+  }
+  const eph = nacl.box.keyPair();
   const boxNonce = nacl.randomBytes(nacl.box.nonceLength);
   const body = nacl.box(msg, boxNonce, recipient, eph.secretKey);
   const framed = new Uint8Array(boxNonce.length + body.length);
@@ -133,8 +149,9 @@ export async function sendCodeChallenge(
   deviceToken: string,
   encryptionPubKeyB64: string,
   nonce: string,
+  encScheme?: string,
 ): Promise<ApnsSendResult> {
-  const cc = sealCodeChallenge(nonce, encryptionPubKeyB64);
+  const cc = await sealCodeChallenge(nonce, encryptionPubKeyB64, encScheme);
   const body = Buffer.from(JSON.stringify({ aps: { "content-available": 1 }, cc }));
   let jwt: string;
   try {

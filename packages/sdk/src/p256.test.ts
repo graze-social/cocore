@@ -241,3 +241,65 @@ function findFixture(): string {
   const here = new URL(".", import.meta.url).pathname;
   return join(here, "..", "..", "..", "target", "cross-lang-fixture.json");
 }
+
+// --- receipt enclaveSignature as an App Attest assertion (ADR-0003) ---
+// When the attestation's sigScheme is 'appattest-assertion', the receipt is
+// signed by the same SE identity via an assertion. verifyReceiptSignature must
+// dispatch on the sigScheme argument.
+test("verifyReceiptSignature: verifies an assertion when sigScheme='appattest-assertion'", async () => {
+  const { createHash, generateKeyPairSync, sign: nodeSign } = await import("node:crypto");
+  const APP_ID = "4L45P7CP9M.dev.cocore.provider";
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const jwk = publicKey.export({ format: "jwk" }) as { x: string; y: string };
+  const pubB64 = Buffer.concat([
+    Buffer.from(jwk.x, "base64url"),
+    Buffer.from(jwk.y, "base64url"),
+  ]).toString("base64");
+  const sha = (b: Uint8Array): Buffer => createHash("sha256").update(Buffer.from(b)).digest();
+  const bstr = (b: Buffer): Buffer =>
+    b.length < 24
+      ? Buffer.concat([Buffer.from([0x40 | b.length]), b])
+      : Buffer.concat([Buffer.from([0x58, b.length]), b]);
+  const tstr = (s: string): Buffer =>
+    Buffer.concat([Buffer.from([0x60 | Buffer.from(s).length]), Buffer.from(s)]);
+  const assertionOver = (msg: Uint8Array): string => {
+    const authData = Buffer.concat([
+      sha(new TextEncoder().encode(APP_ID)),
+      Buffer.from([0, 0, 0, 0, 1]),
+    ]);
+    const signature = nodeSign("SHA256", Buffer.concat([authData, sha(msg)]), privateKey);
+    return Buffer.concat([
+      Buffer.from([0xa2]),
+      tstr("signature"),
+      bstr(signature),
+      tstr("authenticatorData"),
+      bstr(authData),
+    ]).toString("base64");
+  };
+
+  const body = {
+    job: { uri: "at://did:plc:req/dev.cocore.compute.job/j1", cid: "bafyjob" },
+    requester: "did:plc:req",
+    model: "m",
+    inputCommitment: "0".repeat(64),
+    outputCommitment: "1".repeat(64),
+    tokens: { in: 1, out: 2 },
+    startedAt: "2026-01-01T00:00:00Z",
+    completedAt: "2026-01-01T00:00:01Z",
+    price: { amount: 1, currency: "CC" },
+    attestation: { uri: "at://did:plc:prov/dev.cocore.compute.attestation/a1", cid: "bafyatt" },
+  };
+  const enclaveSignature = assertionOver(new TextEncoder().encode(canonicalize(body)));
+  const receipt = { $type: "dev.cocore.compute.receipt", ...body, enclaveSignature };
+
+  // With the scheme → verifies.
+  assert.equal(await verifyReceiptSignature(receipt, pubB64, "appattest-assertion"), true);
+  // Without the scheme it's treated as raw p256 → the assertion CBOR is not a
+  // valid DER sig, so it fails closed rather than false-accepting.
+  assert.equal(await verifyReceiptSignature(receipt, pubB64), false);
+  // Tampered body → assertion clientDataHash differs → fails.
+  assert.equal(
+    await verifyReceiptSignature({ ...receipt, model: "evil" }, pubB64, "appattest-assertion"),
+    false,
+  );
+});

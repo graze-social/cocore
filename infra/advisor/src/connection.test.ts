@@ -276,3 +276,135 @@ describe("WS connection stability", () => {
     }
   }, 5_000);
 });
+
+// A provider that drops its socket mid-job must (a) not strand the requester
+// and (b) count toward its failure cooldown — but an advisor-initiated clean
+// close (recycle/replace) must do neither, since the machine is coming right
+// back and its sessions can still be served.
+interface DropHarness {
+  server: Server;
+  url: string;
+  registry: ProviderRegistry;
+  sessions: SessionManager;
+}
+
+async function startDropHarness(opts: { maxConnectionMs?: number } = {}): Promise<DropHarness> {
+  const registry = new ProviderRegistry();
+  const sessions = new SessionManager({ idleTimeoutMs: 10_000 });
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: "/v1/agent", perMessageDeflate: false });
+  wss.on("connection", (socket, req) =>
+    handleConnection(socket, req, registry, sessions, {
+      rechallengeIntervalMs: 60_000,
+      responseTimeoutMs: 30_000,
+      ...opts,
+    }),
+  );
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("no addr");
+  return { server, url: `ws://127.0.0.1:${addr.port}/v1/agent`, registry, sessions };
+}
+
+function fakeSseRes() {
+  return {
+    statusCode: 0,
+    writableEnded: false,
+    chunks: [] as string[],
+    setHeader() {},
+    flushHeaders() {},
+    write(s: string) {
+      this.chunks.push(s);
+      return true;
+    },
+    end() {
+      this.writableEnded = true;
+    },
+  };
+}
+
+async function registerProvider(url: string, did: string): Promise<WebSocket> {
+  const ws = new WebSocket(url);
+  await new Promise<void>((r) => ws.once("open", () => r()));
+  const inbound: string[] = [];
+  ws.on("message", (data) => inbound.push(data.toString("utf-8")));
+  ws.send(
+    JSON.stringify({
+      type: "register",
+      provider_did: did,
+      machine_label: "m1",
+      chip: "M4",
+      ram_gb: 64,
+      supported_models: ["stub"],
+      encryption_pub_key: "k",
+      attestation_pub_key: "a", // no machine_id → machineId falls back to this
+      attestation_uri: "",
+    }),
+  );
+  // Wait for the challenge so we know the register frame was processed.
+  await vi.waitFor(
+    () => expect(inbound.some((f) => f.includes("attestation_challenge"))).toBe(true),
+    { timeout: 1_000 },
+  );
+  return ws;
+}
+
+describe("provider mid-job socket drop", () => {
+  it("drains in-flight sessions and records a failure on an abnormal drop", async () => {
+    const h = await startDropHarness();
+    try {
+      const ws = await registerProvider(h.url, "did:plc:dropme");
+      // Stand up an in-flight session dispatched to this machine.
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-1", "did:plc:dropme", "a", "did:plc:req", res as any);
+      expect(h.sessions.has("sess-1")).toBe(true);
+
+      const failSpy = vi.spyOn(h.registry, "recordFailure");
+      // Abrupt drop (1006) — the machine did NOT cleanly recycle/replace.
+      ws.terminate();
+
+      await vi.waitFor(() => expect(h.sessions.has("sess-1")).toBe(false), { timeout: 2_000 });
+      // Requester got a clean error event rather than hanging.
+      expect(res.writableEnded).toBe(true);
+      expect(res.chunks.join("")).toContain("provider-disconnected");
+      // The drop was counted once toward the machine's cooldown ledger.
+      expect(
+        failSpy.mock.calls.some(
+          (c) => c[0] === "did:plc:dropme" && c[1] === "a" && c[2] === "provider-disconnected",
+        ),
+      ).toBe(true);
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("does NOT drain or record a failure on an advisor-initiated recycle", async () => {
+    // maxConnectionMs tiny → the advisor cleanly recycles the connection.
+    const h = await startDropHarness({ maxConnectionMs: 150 });
+    try {
+      const ws = await registerProvider(h.url, "did:plc:recycle");
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-2", "did:plc:recycle", "a", "did:plc:req", res as any);
+      const failSpy = vi.spyOn(h.registry, "recordFailure");
+
+      // Wait for the advisor's clean recycle close.
+      const reason = await new Promise<string>((resolve) => {
+        ws.once("close", (_c, r) => resolve(r.toString("utf-8")));
+      });
+      expect(reason).toBe("recycle");
+      // Give the server-side close handler a tick to run.
+      await new Promise<void>((r) => setTimeout(r, 50));
+
+      // The session is untouched (the machine is expected to reconnect and keep
+      // serving it) and no failure was counted.
+      expect(h.sessions.has("sess-2")).toBe(true);
+      expect(res.writableEnded).toBe(false);
+      expect(failSpy).not.toHaveBeenCalled();
+      h.sessions.close("sess-2");
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+});

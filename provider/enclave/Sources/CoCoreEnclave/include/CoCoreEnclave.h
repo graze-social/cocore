@@ -40,6 +40,34 @@ int cocore_enclave_sign(
 /// Release the handle. Safe to call with NULL.
 void cocore_enclave_release(void *handle);
 
+// --- Encryption key (P-256 ECDH / KeyAgreement), for `p256-ecies-se` ---
+// A SECOND, independent Secure-Enclave-resident key used to seal/open the APNs
+// code-challenge nonce and confidential prompts. Same shapes as the signing
+// key; distinct handle + keychain slot. The private half never leaves the SEP —
+// only ECDH shared secrets come out.
+
+/// Load or create the SE-resident P-256 KeyAgreement key. Distinct handle from
+/// the signing identity; free with cocore_enclave_enc_release.
+int cocore_enclave_enc_create_or_load(void **out_handle);
+
+/// Copy the raw P-256 public key (uncompressed, 64 bytes: X || Y). `len` >= 64.
+int cocore_enclave_enc_public_key(void *handle, unsigned char *out, size_t len);
+
+/// Raw ECDH: scalar-mult the SE private key with `peer_pub` (64 bytes, X || Y)
+/// and write the 32-byte shared X-coordinate into `out_shared`. The caller runs
+/// HKDF over it (see crypto::ecies) — this is deliberately the raw secret so the
+/// KDF stays reproducible across Rust/TS/Python. `out_len` must be >= 32.
+int cocore_enclave_enc_ecdh(
+    void *handle,
+    const unsigned char *peer_pub_64,
+    size_t peer_len,
+    unsigned char *out_shared,
+    size_t out_len
+);
+
+/// Release the encryption-key handle. Safe to call with NULL.
+void cocore_enclave_enc_release(void *handle);
+
 #ifdef __cplusplus
 }
 #endif

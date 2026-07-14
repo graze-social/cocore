@@ -34,6 +34,8 @@ import { cocoreConfig } from "@/lib/cocore-config.ts";
 import { consoleDb } from "@/lib/console-db.server.ts";
 import { signRecordIfConfigured } from "@/lib/signing.server.ts";
 import { restoreAtprotoSessionEffect } from "@/integrations/auth/atproto.server.ts";
+import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-session.server.ts";
+import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts";
 import type { Did } from "@atcute/lexicons";
 import { isDid } from "@atcute/lexicons/syntax";
 
@@ -166,6 +168,23 @@ async function loadExchangeSession(): Promise<OAuthSession> {
       "exchange-not-onboarded",
       `cocoreConfig.exchangeDid is not a DID (${exchangeDid})`,
     );
+  }
+  // Single-owner cutover: when forwarding is configured the AppView owns and
+  // solely refreshes the exchange service DID's session (its keep-alive is the
+  // designated refresher — see packages/appview/src/auth/oauth-client.ts). A
+  // local restore here would refresh in parallel and cannibalize the single-use
+  // refresh token — precisely the 2026-06 settlement stall (a dead exchange
+  // session blocking every settlement write). Replay dispute writes through the
+  // AppView-backed session; only a DEFINITIVE "absent" means re-auth is needed.
+  if (isAppviewForwardConfigured()) {
+    const info = await appviewSessionInfo(exchangeDid);
+    if (info.checked && !info.present) {
+      throw new ResolveDisputeError(
+        "exchange-not-onboarded",
+        `no live AppView session for ${exchangeDid} — exchange must sign in to resolve disputes`,
+      );
+    }
+    return appviewBackedSession(exchangeDid as Did);
   }
   const session = await runTraced(
     "auth.restoreSession",

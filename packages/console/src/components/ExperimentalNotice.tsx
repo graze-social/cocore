@@ -19,11 +19,11 @@ export type ExperimentalTopic = "confidentiality" | "attestation" | "tokens";
 const EXPERIMENTAL_COPY: Record<ExperimentalTopic, { title: string; body: string }> = {
   confidentiality: {
     title: "Confidential mode is experimental",
-    body: "It aims to keep your prompt unreadable to the machine's operator, but that isn't proven or independently audited yet — a compromised OS, an agent bug, or a substituted build could still expose it. It's a meaningful raised bar, not a hardware enclave. Don't send anything you'd need kept private.",
+    body: "It aims to keep your prompt unreadable to the machine's operator: a trusted brokerage routes your job to genuine Apple hardware running a known build under a hardened runtime, with the agent's signing and prompt-decryption keys held in the Secure Enclave so the operator can't copy them to another machine, and the receipt is countersigned to prove that machine served it. But it's a raised bar, not a hardware guarantee — Apple Silicon has a secure enclave for keys but not for general compute, so a compromised OS kernel or someone with physical access to the machine could still read your prompt while it's being processed. Don't send anything you'd need cryptographically kept private.",
   },
   attestation: {
     title: "Attestation is experimental",
-    body: "Hardware attestation is a best-effort signal that a machine is genuine Apple hardware running a known build. It isn't independently verified, so treat it as a useful hint rather than a guarantee.",
+    body: "Hardware attestation is a best-effort signal that a machine is genuine Apple hardware running a known build, now bound to a Secure-Enclave key the operator can't lift off the machine. It still doesn't prove the hardware itself is uncompromised — a kernel exploit or physical access is out of scope — so treat it as a strong hint, not a guarantee.",
   },
   tokens: {
     title: "Credits and settlement are experimental",

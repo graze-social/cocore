@@ -142,6 +142,20 @@ CREATE TABLE IF NOT EXISTS mdm_attestation_chains (
   chain_json TEXT NOT NULL,
   captured_at TEXT NOT NULL
 );
+
+-- The signing key most recently requested for a device's MDA attestation. Set
+-- when the coordinator enqueues a DeviceInformation attestation (nonce =
+-- sha256(pubkey)); read when a chain is captured so we only STORE a chain whose
+-- freshness binds the currently-requested key. This is the fix for the
+-- signing-key rotation trap: stale queued commands (old-key nonces) drained by
+-- the device FIFO produced chains bound to a dead key, which then got served and
+-- rejected by the agent forever. We now discard those captures instead. Keyed
+-- by serial; a fresh request overwrites the expected key.
+CREATE TABLE IF NOT EXISTS mdm_attestation_expected (
+  serial TEXT PRIMARY KEY,
+  pubkey TEXT NOT NULL,
+  requested_at TEXT NOT NULL
+);
 `;
 
 // Indexes run after runMigrations() so they can reference columns

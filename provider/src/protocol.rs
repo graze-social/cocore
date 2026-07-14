@@ -212,6 +212,19 @@ pub struct Register {
     /// floor (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_version: Option<String>,
+    /// True when this agent's signing key is Secure-Enclave-resident
+    /// (`is_hardware_bound()`) — the ADR-0005 confidential-tier evidence. Echoed
+    /// from the attestation's `secureEnclaveAvailable`. Additive: pre-signal
+    /// advisors ignore it; an advisor enforcing the SE gate treats an omitted /
+    /// `false` value as not-SE (best-effort). Old software-key agents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_enclave_available: Option<bool>,
+    /// The `encScheme` for this machine's encryption key: `"p256-ecies-se"`
+    /// (Secure-Enclave-resident) or absent/`"x25519"` (software). Tells the
+    /// advisor which codec to seal the APNs code-challenge nonce with, so an old
+    /// X25519 agent keeps working. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc_scheme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +306,25 @@ pub struct InferenceRequest {
     /// Additive — absent means any tool may be called.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice_function: Option<String>,
+    /// ADR-0004: the brokerage's session-bound countersignature for this
+    /// dispatch, signed by the routing authority over
+    /// {authority, job, requester, machine, attestation, nonce}. The provider
+    /// copies it onto the published receipt as `brokerageCountersignature`
+    /// (lexicon camelCase). Additive — absent when the advisor has no brokerage
+    /// authority configured or couldn't bind the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brokerage_countersignature: Option<BrokerageCountersignatureWire>,
+}
+
+/// ADR-0004 brokerage countersignature as it arrives in the `inference_request`
+/// (snake_case wire). The provider maps it to the receipt's camelCase
+/// `BrokerageCountersignature` before publishing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerageCountersignatureWire {
+    pub authority: String,
+    pub machine_id: String,
+    pub nonce: String,
+    pub sig: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

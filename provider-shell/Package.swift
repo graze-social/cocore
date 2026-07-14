@@ -40,5 +40,10 @@ let package = Package(
                 .process("Resources"),
             ]
         ),
+        .testTarget(
+            name: "CoCoreShellTests",
+            dependencies: ["CoCoreShell"],
+            path: "Tests/CoCoreShellTests"
+        ),
     ]
 )

@@ -33,6 +33,11 @@ int cocore_mlx_generate(
 // loaded, written into `out` (capacity `len` >= 65). 0 on success.
 int cocore_mlx_metallib_hash(void *handle, char *out, size_t len);
 
+// Evict the Metal allocator's cached buffers (KV cache + scratch) so a served
+// prompt's generation state doesn't linger in the GPU pool between jobs.
+// Best-effort scrub; the handle is unused (clearCache is process-global).
+void cocore_mlx_clear_cache(void *handle);
+
 // Release a handle from cocore_mlx_load_model. Safe with NULL.
 void cocore_mlx_release(void *handle);
 

@@ -108,7 +108,40 @@
           "proBono": {
             "type": "boolean",
             "description": "True when the provider served this job pro bono under its `dev.cocore.compute.provider.proBono` election — free, unmetered, no exchange cut. A pro-bono receipt MUST carry `price.amount: 0` and `tokens: { in: 0, out: 0 }`: the work is explicitly not counted, so neither figure is a billing claim. An exchange settling a `proBono: true` receipt takes no fee and moves no balance (`amountCharged`, `providerPayout`, and `exchangeFee` are all 0). Covered by `enclaveSignature` like every other field, so the carve-out is part of the signed, self-verifying record rather than an off-record side channel. Absent/false ≡ a normal metered, billable receipt. Optional / additive; pre-2026-06 readers ignore it and still see a well-formed zero-price receipt."
+          },
+          "brokerageCountersignature": {
+            "type": "ref",
+            "ref": "#brokerageCountersignature",
+            "description": "ADR-0004: the session-bound witness of the BROKERAGE (the matchmaking authority the requester routed through — e.g. the advisor). The brokerage live-challenges the machine it dispatches to, so its countersignature proves 'authority X dispatched THIS job to the machine it attested, and that machine served it'. This is what elevates a receipt to `attested-confidential` under the forkable-authority model: a self-published attestation record is NOT sufficient without a trusted brokerage's countersignature. UNLIKE every other field, this is NOT covered by `enclaveSignature` — it is signed by the brokerage, not the provider, and is added after the provider signs (verifiers strip it before checking enclaveSignature, exactly as they strip enclaveSignature and $type). A confidential requester REQUIRES this from an authority in its trust set (default: cocore's brokerage DID); best-effort receipts omit it. Optional / additive."
           }
+        }
+      }
+    },
+    "brokerageCountersignature": {
+      "type": "object",
+      "description": "A brokerage's session-bound witness on a receipt (ADR-0004). Verified OFFLINE against the `authority` DID document's signing key (invariant #2 holds — the live challenge happened at seal time; the receipt stays verifiable after the fact). The signature covers the sorted-key canonical JSON of `{ authority, attestation, jobCid, jobUri, machineId, nonce, requester }`, where `attestation`/`jobUri` are the `uri` of the receipt's respective strong-refs, `jobCid` is the receipt's `job.cid`, and `requester` is the receipt's `requester` — so the witness is bound to this exact job, requester, serving machine, and attested identity, and cannot be lifted onto another receipt.",
+      "required": ["authority", "machineId", "nonce", "sig"],
+      "properties": {
+        "authority": {
+          "type": "string",
+          "format": "did",
+          "description": "The brokerage's DID (did:web or did:plc). The verifier resolves its DID document to get the signing key, and MUST require this DID to be in its configured trust set — validity is relative to a named authority the verifier chooses to trust (CA-style trust roots)."
+        },
+        "machineId": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "The stable per-machine id (the provider record's rkey / advisor machine_id) the brokerage dispatched to and live-challenged. Bound into `sig` so the witness names the specific machine that served."
+        },
+        "nonce": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "description": "Lowercase-hex nonce unique to this witness (the brokerage's per-job witness id). Bound into `sig`."
+        },
+        "sig": {
+          "type": "bytes",
+          "maxLength": 256,
+          "description": "P-256 signature (DER) by the brokerage authority key over the canonical message described above. Verified against the key in the `authority` DID document."
         }
       }
     },

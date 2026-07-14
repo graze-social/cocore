@@ -57,10 +57,64 @@
 //                              webhook presents to POST captured chains.
 //   COCORE_MDM_SIGNING_CERT_PEM / _KEY_PEM  CMS-sign the profile (TODO).
 
-import { createHash } from "node:crypto";
+import { parseExtensions } from "@cocore/sdk/mda";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 import { resolveBearerKey, type ResolvedKey } from "@/lib/api-keys.server.ts";
-import { getAttestationChain, putAttestationChain } from "@/lib/mdm-chain-store.server.ts";
+import {
+  getAttestationChain,
+  getExpectedAttestation,
+  getExpectedAttestationKey,
+  putAttestationChain,
+  putExpectedAttestationKey,
+} from "@/lib/mdm-chain-store.server.ts";
+
+/** How long a DeviceInformation attestation request for a given key stays
+ *  "pending" before we'll enqueue a fresh command for that SAME key. NanoMDM's
+ *  queue is FIFO with no clear API, so re-enqueuing the same key just piles stale
+ *  commands ahead of the real one — and hammering Apple's rate-limited
+ *  DeviceAttestation makes it return a CACHED (old-key) chain. Within this window
+ *  a repeat request for the same key only RE-PUSHES the already-queued command
+ *  instead of adding another. A KEY CHANGE always enqueues immediately (bypasses
+ *  this). Comfortably under Apple's ~7-day attestation cadence. */
+const ATTEST_REQUEST_DEDUP_MS = 6 * 60 * 60_000;
+
+/** Apple's freshness-code OID — the leaf extension whose value equals the
+ *  `DeviceAttestationNonce` we set (= sha256(pubkey)). Same OID the SDK/Rust/Py
+ *  verifiers key on. */
+const OID_FRESHNESS_CODE = "1.2.840.113635.100.8.11.1";
+
+/** Does a raw freshness-code value bind `pubkeyB64`? Mirrors the agent's
+ *  `mda::freshness_binds`: freshness == sha256(64-byte raw pubkey), tolerating a
+ *  DER OCTET STRING wrapper (0x04 0x20). Pure — the security-critical comparison. */
+export function freshnessBindsPubkey(freshness: Uint8Array, pubkeyB64: string): boolean {
+  const inner =
+    freshness.length === 34 && freshness[0] === 0x04 && freshness[1] === 0x20
+      ? freshness.subarray(2)
+      : freshness;
+  let digest: Buffer;
+  try {
+    digest = createHash("sha256").update(Buffer.from(pubkeyB64, "base64")).digest();
+  } catch {
+    return false;
+  }
+  return inner.length === digest.length && timingSafeEqual(Buffer.from(inner), digest);
+}
+
+/** Does the captured chain's leaf freshness code bind `pubkeyB64`? Parse-only (no
+ *  Apple-root verification — the agent + client still verify that); we only need
+ *  to know WHICH key this chain was minted for, to reject a stale-key capture. */
+export function chainBindsPubkey(chain: string[], pubkeyB64: string): boolean {
+  if (chain.length === 0) return false;
+  let ext: Uint8Array | undefined;
+  try {
+    const leaf = new Uint8Array(Buffer.from(chain[0]!, "base64"));
+    ext = parseExtensions(leaf).find((e) => e.oid === OID_FRESHNESS_CODE)?.value;
+  } catch {
+    return false;
+  }
+  return ext ? freshnessBindsPubkey(ext, pubkeyB64) : false;
+}
 
 // ---------------------------------------------------------------------------
 // Auth — same bearer-API-key surface every other /api/agent/* route uses.
@@ -616,11 +670,31 @@ export interface AttestationChainResult {
   capturedAt?: string;
 }
 
-/** Persist a captured Apple attestation chain (the step-ca webhook calls
- *  this after a successful device-attest-01). `nowIso` is the caller's
- *  timestamp so this stays a pure persistence step. */
-export function ingestAttestationChain(serial: string, chain: string[], nowIso: string): void {
+/** Persist a captured Apple attestation chain (a DeviceInformation command
+ *  result, or step-ca's device-attest-01 webhook). `nowIso` is the caller's
+ *  timestamp so this stays a pure persistence step.
+ *
+ *  KEY-BINDING GUARD (signing-key-rotation fix): the device drains its MDM
+ *  command queue FIFO, and Apple rate-limits DeviceAttestation to ~one per push
+ *  cycle — so a STALE queued command (an old signing key's nonce) can be the one
+ *  that attests, producing a chain bound to a dead key. Serving that chain used
+ *  to leave the machine looping on `does not bind the current signing key`
+ *  forever. We now only store a chain whose freshness binds the CURRENTLY
+ *  requested key; a stale-key capture is discarded (the good chain, if any, is
+ *  kept). When no expected key is recorded (legacy / pre-fix), we store as before
+ *  so nothing regresses. Returns whether the chain was stored. */
+export function ingestAttestationChain(serial: string, chain: string[], nowIso: string): boolean {
+  const expected = getExpectedAttestationKey(serial);
+  if (expected && !chainBindsPubkey(chain, expected)) {
+    console.warn(
+      `[mdm] discarding captured attestation chain for serial=${serial}: freshness does not ` +
+        `bind the currently-requested key (a stale queued DeviceAttestation command attested an ` +
+        `old key). Keeping any prior bound chain; the device will re-attest for the current key.`,
+    );
+    return false;
+  }
   putAttestationChain(serial, chain, nowIso);
+  return true;
 }
 
 /** Return the captured Apple x5c attestation chain for `serial`.
@@ -798,6 +872,40 @@ export async function requestDeviceInformationAttestation(
   const root = base.replace(/\/$/, "");
   const authHeader = `Basic ${Buffer.from(`nanomdm:${apiKey}`).toString("base64")}`;
   const enc = encodeURIComponent(target);
+
+  // Idempotency: if we already requested attestation for THIS exact key recently,
+  // don't append another DeviceInformation command to NanoMDM's FIFO queue —
+  // that's what let stale old-key commands drain ahead of the real one and made
+  // Apple's rate-limited attestation return a cached (old-key) chain, so the
+  // capture was discarded forever. Instead just RE-PUSH so the device processes
+  // the command already queued for this key. A key change falls through and
+  // enqueues immediately (below).
+  const pending = getExpectedAttestation(serial);
+  const sameKeyPending =
+    pending?.pubkey === publicKeyB64 &&
+    Date.now() - Date.parse(pending.requestedAt) < ATTEST_REQUEST_DEDUP_MS;
+  if (sameKeyPending) {
+    let pushed = false;
+    try {
+      const rp = await fetch(`${root}/v1/push/${enc}`, {
+        method: "GET",
+        headers: { authorization: authHeader },
+      });
+      pushed = rp.ok;
+    } catch {
+      /* push is best-effort — the queued command is still there */
+    }
+    return {
+      queued: true,
+      commandUuid: null,
+      status: "queued",
+      stubbed: false,
+      detail: pushed
+        ? "attestation already requested for this key; re-pushed the queued command (no duplicate enqueue — avoids piling stale commands + Apple rate-limit)"
+        : "attestation already requested for this key; queued command awaits the device's next check-in",
+    };
+  }
+
   const commandUuid = crypto.randomUUID().toUpperCase();
   const enqueueBody = buildDeviceInformationAttestationCommand(
     commandUuid,
@@ -829,6 +937,11 @@ export async function requestDeviceInformationAttestation(
         detail: `NanoMDM enqueue failed (${enqueueResp.status}): ${text.slice(0, 200)}`,
       };
     }
+    // The command is now queued with nonce = sha256(publicKeyB64). Record it as
+    // the expected key so a capture that binds a STALE key (a leftover queued
+    // command draining ahead of this one) is discarded at ingest rather than
+    // served to the agent and rejected forever.
+    putExpectedAttestationKey(serial, publicKeyB64, new Date().toISOString());
     const pushResp = await fetch(`${root}/v1/push/${enc}`, {
       method: "GET",
       headers: { authorization: authHeader },

@@ -72,6 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func registerLoginItem() {
+        // Only the app installed in /Applications may register itself as a login
+        // item. Dev builds run from the build directory must NOT, otherwise every
+        // local build accumulates its own login item and they all launch at boot,
+        // each spawning a competing `agent serve` against the advisor.
+        guard Bundle.main.bundlePath.hasPrefix("/Applications/") else {
+            NSLog("cocore: skipping login-item registration (not installed in /Applications): %@", Bundle.main.bundlePath)
+            return
+        }
         do {
             if SMAppService.mainApp.status != .enabled {
                 try SMAppService.mainApp.register()
@@ -107,6 +115,28 @@ final class AppState: ObservableObject {
     /// than silently dropping back to self-attested. Refreshed from the marker
     /// on each status poll.
     @Published var secureModeDesired: Bool = false
+    /// The last time the advisor reported confidential as VERIFIED for this
+    /// machine — stamped locally whenever `confidential` is observed true (the
+    /// tray polls every 5s). Two uses: show "verified Xm ago", and distinguish a
+    /// routine background RE-verification (the periodic APNs code-attestation
+    /// refresh — the measured build + enclave-held keys are unchanged) from
+    /// genuinely turning on / a lapsed proof. Persisted so a quick relaunch keeps
+    /// the signal.
+    @Published var confidentialLastVerifiedAt: Date?
+    /// How long after the last VERIFIED reading a not-verified poll is still
+    /// treated as a routine re-verification ("protected, re-checking") rather
+    /// than "Applying…". Matched to the advisor's code-attestation TTL (~11 min)
+    /// plus slack, so the window closes only once the proof would truly be stale.
+    static let confidentialProofWindow: TimeInterval = 12 * 60
+    /// The last time this Mac was reported hardware-attested (Secure Mode).
+    /// Same idea as `confidentialLastVerifiedAt`: lets the UI show a routine
+    /// background MDA re-attestation as "attested, re-verifying" instead of the
+    /// alarming "Securing…". Persisted across relaunch.
+    @Published var hardwareAttestedLastAt: Date?
+    /// Secure Mode's re-attest window. Generous vs. confidential's: genuine
+    /// Apple hardware doesn't change, and the MDA chain refresh is infrequent,
+    /// so a recent attestation stays trustworthy across a longer refresh gap.
+    static let secureProofWindow: TimeInterval = 45 * 60
     @Published var attestationExpiresAt: Date?
     @Published var creditsLast24h: Int = 0
     @Published var balanceCredits: Int?
@@ -125,6 +155,8 @@ final class AppState: ObservableObject {
         static let balance = "cachedBalanceCredits"
         static let agentVersion = "cachedAgentVersion"
         static let confidentialDesired = "cachedConfidentialDesired"
+        static let confidentialLastVerifiedAt = "cachedConfidentialLastVerifiedAt"
+        static let hardwareAttestedLastAt = "cachedHardwareAttestedLastAt"
     }
 
     init() {
@@ -136,6 +168,12 @@ final class AppState: ObservableObject {
         // "Applying…" state) without waiting for the first status round-trip,
         // so a relaunch never momentarily reads as "Best-effort / off".
         confidentialDesired = d.bool(forKey: CacheKey.confidentialDesired)
+        if let ts = d.object(forKey: CacheKey.confidentialLastVerifiedAt) as? Double {
+            confidentialLastVerifiedAt = Date(timeIntervalSince1970: ts)
+        }
+        if let ts = d.object(forKey: CacheKey.hardwareAttestedLastAt) as? Double {
+            hardwareAttestedLastAt = Date(timeIntervalSince1970: ts)
+        }
         secureModeDesired = MenuBarController.secureModeDesired()
     }
 
@@ -143,14 +181,35 @@ final class AppState: ObservableObject {
     /// verified collapsed into one state machine so the view never shows a bare
     /// boolean that looks like the setting was forgotten mid-verify.
     enum ConfidentialPhase: Equatable {
-        case off                       // not desired
-        case applying(reason: String?) // desired, not yet verified (+ blocker)
-        case active                    // desired and advisor-verified
+        case off                             // not desired
+        case applying(reason: String?)       // desired, never verified yet (or proof lapsed past the window)
+        case reverifying(lastVerified: Date) // desired, momentarily unverified but within the proof window — a routine refresh, NOT a lapse
+        case active                          // desired and advisor-verified right now
     }
     var confidentialPhase: ConfidentialPhase {
         if confidential { return .active }
-        if confidentialDesired { return .applying(reason: confidentialBlockedReason) }
+        if confidentialDesired {
+            // Was verified recently → this is the periodic re-attestation, not a
+            // failure. The machine is running the same measured build with the
+            // same enclave-held keys; only the advisor's live routing proof is
+            // refreshing. Render it calmly so it doesn't read as an insecure blip.
+            if let last = confidentialLastVerifiedAt,
+               Date().timeIntervalSince(last) < Self.confidentialProofWindow {
+                return .reverifying(lastVerified: last)
+            }
+            return .applying(reason: confidentialBlockedReason)
+        }
         return .off
+    }
+
+    /// Compact "how long ago" for the last-verified signal. Coarse on purpose —
+    /// this is reassurance, not a stopwatch.
+    static func agoText(_ date: Date, now: Date = Date()) -> String {
+        let secs = max(0, Int(now.timeIntervalSince(date)))
+        if secs < 45 { return "just now" }
+        let mins = Int((Double(secs) / 60).rounded())
+        if mins < 60 { return "\(mins)m ago" }
+        return "\(mins / 60)h ago"
     }
 
     /// The honest Secure Mode posture: attested wins; otherwise desired-but-not
@@ -158,12 +217,21 @@ final class AppState: ObservableObject {
     /// "needs you to finish enrollment" from "re-attesting in the background".
     enum SecureModePhase: Equatable {
         case off
-        case securing(reason: String)
+        case securing(reason: String)          // desired, not attested — needs enrollment or first attest
+        case reattesting(lastAttested: Date)   // was attested recently; MDA chain refreshing — still genuine hardware
         case on
     }
     var secureModePhase: SecureModePhase {
         if trustLevel == .hardwareAttested { return .on }
         if secureModeDesired {
+            // Enrolled + attested recently → this is the periodic MDA chain
+            // refresh, not a loss of hardware trust. The Mac is still genuine
+            // Apple hardware; only the attestation proof is being renewed.
+            if EnrollmentProbe.isEnrolled(),
+               let last = hardwareAttestedLastAt,
+               Date().timeIntervalSince(last) < Self.secureProofWindow {
+                return .reattesting(lastAttested: last)
+            }
             return .securing(
                 reason: EnrollmentProbe.isEnrolled()
                     ? "Re-attesting this Mac in the background…"
@@ -223,9 +291,22 @@ final class AppState: ObservableObject {
             self.balanceCredits = e.balance
             if let bal = e.balance { d.set(bal, forKey: CacheKey.balance) }
             if let raw = e.trustLevel, let t = TrustLevel(rawValue: raw) { self.trustLevel = t }
+            if self.trustLevel == .hardwareAttested {
+                let now = Date()
+                self.hardwareAttestedLastAt = now
+                d.set(now.timeIntervalSince1970, forKey: CacheKey.hardwareAttestedLastAt)
+            }
             // Prefer the explicit verified field; fall back to the legacy
             // `confidential` so older services still light the badge.
             self.confidential = e.confidentialVerified ?? e.confidential ?? false
+            // Stamp the last-verified time whenever we see a verified reading, so
+            // the UI can show "verified Xm ago" and treat a subsequent momentary
+            // not-verified poll as a routine re-attestation (see confidentialPhase).
+            if self.confidential {
+                let now = Date()
+                self.confidentialLastVerifiedAt = now
+                d.set(now.timeIntervalSince1970, forKey: CacheKey.confidentialLastVerifiedAt)
+            }
             // Only overwrite desired from the server when it actually reports
             // it (older builds omit it) — otherwise keep the cached intent so a
             // transient old-service response can't wipe the "Applying…" state.

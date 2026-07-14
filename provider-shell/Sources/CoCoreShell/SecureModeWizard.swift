@@ -119,13 +119,21 @@ enum EnrollmentProbe {
     static func isEnrolled() -> Bool {
         let (status, out) = run("/usr/bin/profiles", ["status", "-type", "enrollment"])
         guard status == 0 else { return false }
-        let lower = out.lowercased()
-        // "Enrolled via DEP: No" / "MDM enrollment: Yes (...)" — treat any
-        // affirmative MDM-enrollment line as enrolled.
-        if lower.contains("mdm enrollment: yes") { return true }
-        // TODO: confirm exact phrasing on the target macOS; fall back to a
-        // looser match so a wording change doesn't silently block the flow.
-        if lower.contains("enrolled") && !lower.contains("not enrolled") { return true }
+        // Parse the "MDM enrollment:" line specifically (case-insensitive).
+        // The previous looser fallback (`contains("enrolled") && !contains("not
+        // enrolled")`) matched the "Enrolled via DEP: No" line that `profiles
+        // status` prints on EVERY Mac — so this probe returned true even on
+        // never-enrolled machines, and the Secure Mode UI told those users
+        // "Re-attesting in the background…" instead of "Finish enrollment"
+        // (ticket br_23e56917). Must stay in agreement with the agent's check
+        // (provider/src/mda_loader.rs `mdm_enrolled`), which drives the actual
+        // attestation flow.
+        for line in out.lowercased().split(separator: "\n") {
+            let l = line.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("mdm enrollment:") {
+                return l.contains("yes")
+            }
+        }
         return false
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "cocore-provider"
-version = "0.9.39"
+version = "0.9.50"
 edition = "2021"
 description = "co/core provider agent: runs hardened compute and publishes signed receipts to AT Protocol."
 license = "MIT OR Apache-2.0"
@@ -85,9 +85,15 @@ sha2 = "0.10"
 hex = "0.4"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
-# Real P-256 ECDSA for software-fallback signing identities and for
-# cross-language signature verification.
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+# `p256-ecies-se` sealed-box construction (see `crypto.rs::ecies`): P-256
+# ephemeral-static ECDH → HKDF-SHA256 → AES-256-GCM. The `ecdh` feature adds
+# the software key-agreement path used by senders + cross-language parity tests
+# (the SE recipient does the scalar-mult in the enclave and hands Rust the raw
+# shared secret). aes-gcm 0.10 / hkdf 0.12 share `aead 0.5` + `sha2 0.10` with
+# the crypto_box tree above, so no duplicate crypto stack is pulled in.
+p256 = { version = "0.13", features = ["ecdsa", "pem", "ecdh"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 # Apple Managed Device Attestation cert chain verification.
 # x509-parser handles DER parsing + ECDSA signature verification; we
@@ -126,9 +132,13 @@ secure_enclave = []
 native_mlx = []
 # APNs code-identity push host (confidential tier). Implies native_mlx because
 # the measured binary that receives the push is the same one that runs
-# in-process inference and holds K. macOS-only at the code level (the module is
+# in-process inference and holds K. ALSO implies secure_enclave: the shipped
+# confidential worker (built with `--features apns`) must hold its signing +
+# encryption keys in the Secure Enclave — otherwise a software `identity.pem`
+# key can be copied to a non-Apple box and replay the attestation (the
+# 2026-07-05 spoof; ADR-0005). macOS-only at the code level (the modules are
 # additionally cfg(target_os = "macos")). Off by default so Linux/CI stays green.
-apns = ["native_mlx"]
+apns = ["native_mlx", "secure_enclave"]
 
 [dev-dependencies]
 tempfile = "3"

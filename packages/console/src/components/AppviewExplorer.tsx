@@ -322,6 +322,7 @@ export function AppviewExplorer() {
   const [providerF, setProviderF] = useState("");
   const [requesterF, setRequesterF] = useState("");
   const [jobF, setJobF] = useState("");
+  const [versionF, setVersionF] = useState("");
 
   const receiptFilters = useMemo(
     () => ({
@@ -334,6 +335,21 @@ export function AppviewExplorer() {
 
   const providersQuery = useQuery(listProvidersAppviewQueryOptions);
   const receiptsQuery = useQuery(getReceiptsAppviewQueryOptions(receiptFilters));
+
+  // Client-side agent-version filter over the (≤100-row) providers table.
+  // Prefix match so "0.9" catches a whole minor series; the literal
+  // "none" surfaces records that predate the binaryVersion field.
+  const filteredProviders = useMemo(() => {
+    const rows = providersQuery.data?.providers ?? [];
+    const wanted = versionF.trim().toLowerCase();
+    if (!wanted) return rows;
+    return rows.filter((r) => {
+      const o = asRecord(r.body);
+      const v = o ? jsonString(o.binaryVersion) : null;
+      if (wanted === "none") return v == null;
+      return (v ?? "").toLowerCase().startsWith(wanted.replace(/^v/, ""));
+    });
+  }, [providersQuery.data, versionF]);
 
   const [settlementReceiptF, setSettlementReceiptF] = useState("");
   const [settlementRequesterF, setSettlementRequesterF] = useState("");
@@ -371,11 +387,23 @@ export function AppviewExplorer() {
           <div {...stylex.props(styles.sectionDescription)}>Loading providers…</div>
         ) : null}
         {providersQuery.data ? (
-          <IndexedTable
-            variant="provider"
-            rows={providersQuery.data.providers}
-            empty="No providers indexed yet."
-          />
+          <>
+            <Flex direction="row" style={styles.filters}>
+              <TextField
+                label="Agent version"
+                value={versionF}
+                onChange={setVersionF}
+                placeholder='0.9.40, 0.9, or "none"'
+              />
+            </Flex>
+            <IndexedTable
+              variant="provider"
+              rows={filteredProviders}
+              empty={
+                versionF.trim() ? "No providers match that version." : "No providers indexed yet."
+              }
+            />
+          </>
         ) : null}
       </AppviewSection>
 
@@ -608,6 +636,7 @@ function IndexedTable({
             <tr>
               <th {...stylex.props(styles.th)}>provider</th>
               <th {...stylex.props(styles.th)}>hardware</th>
+              <th {...stylex.props(styles.th)}>version</th>
               <th {...stylex.props(styles.th)}>status</th>
               <th {...stylex.props(styles.th)}>trust</th>
               <th {...stylex.props(styles.th)}>models</th>
@@ -799,6 +828,7 @@ function ProviderTableRow({ row }: { row: AppviewIndexedRecordEnriched }) {
   const ramGB = o ? jsonNumber(o.ramGB) : null;
   const models = o ? jsonStringArray(o.supportedModels) : [];
   const trustLevel = o ? jsonString(o.trustLevel) : null;
+  const binaryVersion = o ? jsonString(o.binaryVersion) : null;
 
   const hardwareParts: string[] = [];
   if (chip) hardwareParts.push(chip);
@@ -812,6 +842,7 @@ function ProviderTableRow({ row }: { row: AppviewIndexedRecordEnriched }) {
       <td {...stylex.props(styles.td, styles.bodyMeta)}>
         {hardwareParts.length > 0 ? hardwareParts.join(" · ") : "—"}
       </td>
+      <td {...stylex.props(styles.td, styles.mono)}>{binaryVersion ? `v${binaryVersion}` : "—"}</td>
       <td {...stylex.props(styles.td)}>
         <ProviderStatusBadges body={row.body} />
       </td>
