@@ -10,13 +10,18 @@
 #   ./build-podman.sh
 #
 # Environment overrides (set before running):
-#   COCORE_IMAGE   image tag                                (default: cocore-provider)
-#   COCORE_ROCM    bundle the AMD ROCm GPU backend at build  (default: auto-detected)
-#   COCORE_GPU     pass GPU devices through at run           (default: auto-detected)
+#   COCORE_IMAGE        image tag                                (default: cocore-provider)
+#   COCORE_ROCM         bundle the AMD ROCm GPU backend at build  (default: auto-detected)
+#   COCORE_GPU          pass GPU devices through at run           (default: auto-detected)
+#   COCORE_GPU_VENDOR   amd | nvidia — which passthrough flags to use (default: auto-detected)
 #
-# COCORE_ROCM/COCORE_GPU auto-detect an AMD GPU with a usable ROCm/KFD kernel
-# driver (see detect_amd_gpu() below) and enable themselves together — set
-# either explicitly to override the detection.
+# COCORE_ROCM/COCORE_GPU/COCORE_GPU_VENDOR auto-detect a GPU and enable
+# themselves together — set any of them explicitly to override detection.
+#   AMD:    /sys/class/drm + /dev/kfd (ROCm/KFD kernel driver).
+#   NVIDIA: /dev/nvidia0, plus an NVIDIA Container Toolkit CDI spec (podman
+#           has no docker-style `--gpus` flag — GPU passthrough goes through
+#           CDI instead). One-time host setup if you don't have this yet:
+#             sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -28,6 +33,7 @@ COCORE_ROCM_SET="${COCORE_ROCM+x}"
 COCORE_GPU_SET="${COCORE_GPU+x}"
 COCORE_ROCM="${COCORE_ROCM:-0}"
 COCORE_GPU="${COCORE_GPU:-0}"
+COCORE_GPU_VENDOR="${COCORE_GPU_VENDOR:-}"
 
 CONTAINER_NAME="cocore"
 STATE_VOLUME="cocore-state"
@@ -67,28 +73,77 @@ detect_amd_gpu() {
   return 1
 }
 
-if [[ -z "$COCORE_ROCM_SET" || -z "$COCORE_GPU_SET" ]]; then
+# Detects an NVIDIA GPU bound to the proprietary driver. /dev/nvidia0 is the
+# per-card device node; /proc/driver/nvidia/version is present as soon as the
+# kernel module loads, even on headless compute instances that create device
+# nodes lazily — checking both covers cloud GPU boxes that only have one.
+detect_nvidia_gpu() {
+  [[ -e /dev/nvidia0 || -e /proc/driver/nvidia/version ]]
+}
+
+# NVIDIA passthrough under podman goes through the Container Device
+# Interface rather than a `--gpus` flag (podman has no docker-compatible
+# equivalent). The CDI spec is generated once per host by the NVIDIA
+# Container Toolkit, separate from the driver itself.
+nvidia_cdi_ready() {
+  [[ -e /etc/cdi/nvidia.yaml || -e /var/run/cdi/nvidia.yaml ]]
+}
+
+if [[ -z "$COCORE_GPU_VENDOR" ]]; then
   if detect_amd_gpu; then
-    step "Detected an AMD GPU with ROCm/KFD support — enabling GPU passthrough"
-    [[ -z "$COCORE_ROCM_SET" ]] && COCORE_ROCM=1
-    [[ -z "$COCORE_GPU_SET" ]] && COCORE_GPU=1
-  else
-    warn "No AMD GPU with a usable ROCm/KFD driver detected — building CPU-only. Set COCORE_ROCM=1 COCORE_GPU=1 to force GPU support."
+    COCORE_GPU_VENDOR="amd"
+  elif detect_nvidia_gpu; then
+    COCORE_GPU_VENDOR="nvidia"
   fi
+fi
+
+if [[ -z "$COCORE_GPU_SET" ]]; then
+  case "$COCORE_GPU_VENDOR" in
+    amd)
+      step "Detected an AMD GPU with ROCm/KFD support — enabling GPU passthrough"
+      COCORE_GPU=1
+      ;;
+    nvidia)
+      if nvidia_cdi_ready; then
+        step "Detected an NVIDIA GPU with a CDI spec configured — enabling GPU passthrough"
+        COCORE_GPU=1
+      else
+        warn "Detected an NVIDIA GPU, but no CDI spec found — building CPU-only. Run 'sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml' then re-run this script to enable GPU passthrough."
+        COCORE_GPU_VENDOR=""
+      fi
+      ;;
+    *)
+      warn "No AMD or NVIDIA GPU detected — building CPU-only. Set COCORE_GPU=1 and COCORE_GPU_VENDOR=amd|nvidia to force GPU support."
+      ;;
+  esac
+fi
+
+if [[ -z "$COCORE_ROCM_SET" && "$COCORE_GPU_VENDOR" == "amd" && "$COCORE_GPU" == "1" ]]; then
+  COCORE_ROCM=1
 fi
 
 VOLUME_ARGS=(-v "$STATE_VOLUME:/root/.cocore" -v "$OLLAMA_VOLUME:/root/.ollama")
 
 GPU_ARGS=()
 if [[ "$COCORE_GPU" == "1" ]]; then
-  GPU_ARGS=(--device /dev/kfd --device /dev/dri --group-add keep-groups)
-  if [[ "$COCORE_ROCM" != "1" ]]; then
-    warn "COCORE_GPU=1 but COCORE_ROCM=0 — the image won't have the ROCm backend. Re-run with COCORE_ROCM=1 to rebuild it in."
-  fi
+  case "$COCORE_GPU_VENDOR" in
+    amd)
+      GPU_ARGS=(--device /dev/kfd --device /dev/dri --group-add keep-groups)
+      if [[ "$COCORE_ROCM" != "1" ]]; then
+        warn "COCORE_GPU=1 (amd) but COCORE_ROCM=0 — the image won't have the ROCm backend. Re-run with COCORE_ROCM=1 to rebuild it in."
+      fi
+      ;;
+    nvidia)
+      GPU_ARGS=(--device nvidia.com/gpu=all --security-opt=label=disable)
+      ;;
+    *)
+      die "COCORE_GPU=1 but COCORE_GPU_VENDOR is unset/unrecognized ('${COCORE_GPU_VENDOR}') — set it to amd or nvidia."
+      ;;
+  esac
 fi
 
 # ── build ──────────────────────────────────────────────────────────────────
-step "Building ${COCORE_IMAGE} (COCORE_ROCM=${COCORE_ROCM}, COCORE_GPU=${COCORE_GPU})"
+step "Building ${COCORE_IMAGE} (COCORE_ROCM=${COCORE_ROCM}, COCORE_GPU=${COCORE_GPU}${COCORE_GPU_VENDOR:+, vendor=$COCORE_GPU_VENDOR})"
 podman build \
   --build-arg "COCORE_ROCM=${COCORE_ROCM}" \
   -t "$COCORE_IMAGE" \
