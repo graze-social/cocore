@@ -214,6 +214,7 @@ export type DispatchErrorCode =
   | "no-providers-for-model"
   | "no-providers-for-country"
   | "no-providers-for-version"
+  | "no-providers-for-tool-calls"
   | "no-friends-available"
   | "no-friends-for-model"
   | "target-provider-not-connected"
@@ -456,6 +457,31 @@ export function filterByMinVersion<T extends { binaryVersion?: string }>(
   return candidates.filter((c) => meetsMinVersion(c.binaryVersion, minVersion));
 }
 
+/** True iff this machine passed the forced-tool canary for `model`. Mirrors
+ *  the advisor's `supportsToolCallsFor` (registry.ts): a machine that reports
+ *  the per-model `toolCallModels` set must include this model; a legacy
+ *  machine that predates the field falls back to the coarse `supportsToolCalls`
+ *  boolean. Fail-closed — neither present means "no tool-calling." */
+export function machineSupportsToolCallsFor<
+  T extends { toolCallModels?: string[]; supportsToolCalls?: boolean },
+>(row: T, model: string): boolean {
+  if (Array.isArray(row.toolCallModels)) return row.toolCallModels.includes(model);
+  return row.supportsToolCalls === true;
+}
+
+/** Pure filter for tool-calling routing. When the request carries no tools
+ *  (`wantsToolCalls` false) the list passes through verbatim. Otherwise keeps
+ *  only machines that passed the forced-tool canary for `model` — so the
+ *  candidate we pin is one the advisor will actually accept, instead of the
+ *  freshest model-matching machine that then 503s "no machine with verified
+ *  tool-calling." */
+export function filterByToolCalls<
+  T extends { toolCallModels?: string[]; supportsToolCalls?: boolean },
+>(candidates: T[], model: string, wantsToolCalls: boolean): T[] {
+  if (!wantsToolCalls) return candidates;
+  return candidates.filter((c) => machineSupportsToolCallsFor(c, model));
+}
+
 export class NoProvidersForVersionError extends Error {
   readonly minVersion: string;
   constructor(minVersion: string, detail: string) {
@@ -473,6 +499,15 @@ export class ProviderPayoutsNotEligibleError extends Error {
     );
     this.name = "ProviderPayoutsNotEligibleError";
     this.providerDid = providerDid;
+  }
+}
+
+export class NoProvidersForToolCallsError extends Error {
+  readonly model: string;
+  constructor(model: string, detail: string) {
+    super(`no provider with verified tool-calling for model '${model}': ${detail}`);
+    this.name = "NoProvidersForToolCallsError";
+    this.model = model;
   }
 }
 
@@ -495,6 +530,12 @@ async function pickProvider(
    *  pick: you can't send an image job to an old machine just because it's
    *  yours / pinned. Fail-closed: a machine reporting no version never passes. */
   minProviderVersion: string | undefined,
+  /** True when the request carries `tools`. Like `minProviderVersion` this is
+   *  a hard capability gate on EVERY path (including a pin): a machine that
+   *  didn't pass the forced-tool canary for this model will have the advisor
+   *  503 the pinned `/jobs`, so filter it out here and pin a machine the
+   *  advisor will actually accept. Fail-closed via {@link filterByToolCalls}. */
+  wantsToolCalls: boolean,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
    *  failed because they'd flapped out between the snapshot and the
    *  dispatch). Excluded from re-selection so failover lands on a
@@ -531,12 +572,25 @@ async function pickProvider(
         `pinned provider ${targetDid} reports ${hit.binaryVersion ?? "no version"}`,
       );
     }
+    // Tool-calling is a capability gate even on a pin: the advisor would 503
+    // this exact machine, so refuse up-front with the actionable reason
+    // instead of letting the dispatch fail opaquely.
+    if (filterByToolCalls([hit], model, wantsToolCalls).length === 0) {
+      throw new NoProvidersForToolCallsError(
+        model,
+        `pinned provider ${targetDid} has not passed the forced-tool canary for this model`,
+      );
+    }
     return hit;
   }
 
-  const own = filterByMinVersion(
-    ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set()),
-    minProviderVersion,
+  const own = filterByToolCalls(
+    filterByMinVersion(
+      ownMachineCandidates(attested, requesterDid, model, excludeDids ?? new Set()),
+      minProviderVersion,
+    ),
+    model,
+    wantsToolCalls,
   );
   if (own.length > 0) return own[0]!;
 
@@ -576,7 +630,14 @@ async function pickProvider(
         `${friendInCountry.length} friend provider(s) serve model '${model}' but none at that version`,
       );
     }
-    const eligible = filterByPayoutsEligibility(friendAtVersion, options);
+    const friendToolCapable = filterByToolCalls(friendAtVersion, model, wantsToolCalls);
+    if (friendToolCapable.length === 0) {
+      throw new NoProvidersForToolCallsError(
+        model,
+        `${friendAtVersion.length} friend provider(s) serve model '${model}' but none passed the forced-tool canary`,
+      );
+    }
+    const eligible = filterByPayoutsEligibility(friendToolCapable, options);
     if (eligible.length === 0) {
       // Surface a DID from the post-country-filter list so the diagnostic
       // points at a provider that's actually both model-fit and in-country,
@@ -600,7 +661,14 @@ async function pickProvider(
       `${inCountry.length} provider(s) serve model '${model}' but none at that version`,
     );
   }
-  const eligible = filterByPayoutsEligibility(atVersion, options);
+  const toolCapable = filterByToolCalls(atVersion, model, wantsToolCalls);
+  if (toolCapable.length === 0) {
+    throw new NoProvidersForToolCallsError(
+      model,
+      `${atVersion.length} provider(s) serve model '${model}' but none passed the forced-tool canary`,
+    );
+  }
+  const eligible = filterByPayoutsEligibility(toolCapable, options);
   if (eligible.length === 0) {
     // No payouts-eligible provider serves this model. Surface the
     // first model-fit, in-country provider's DID so the caller can
@@ -668,6 +736,7 @@ export function classifyDispatchError(e: unknown): DispatchErrorCode {
   if (e instanceof NoProvidersForModelError) return "no-providers-for-model";
   if (e instanceof NoProvidersForCountryError) return "no-providers-for-country";
   if (e instanceof NoProvidersForVersionError) return "no-providers-for-version";
+  if (e instanceof NoProvidersForToolCallsError) return "no-providers-for-tool-calls";
   if (e instanceof NoFriendsAvailableError) return "no-friends-available";
   if (e instanceof NoFriendsForModelError) return "no-friends-for-model";
   if (e instanceof TargetProviderNotConnectedError) return "target-provider-not-connected";
@@ -810,6 +879,9 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         // Version IS enforced even on a pin — a capability the machine either
         // has or doesn't, not a routing preference.
         input.minProviderVersion,
+        // Tools in the request → only pin a machine that passed the forced-tool
+        // canary for this model, so the advisor doesn't 503 the dispatch.
+        Array.isArray(input.tools) && input.tools.length > 0,
         excludeDids,
       );
     } catch (e) {
