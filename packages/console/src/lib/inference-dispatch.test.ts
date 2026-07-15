@@ -13,12 +13,15 @@ import {
   filterByCountry,
   filterByMinVersion,
   filterByPayoutsEligibility,
+  filterByToolCalls,
+  machineSupportsToolCallsFor,
   meetsMinVersion,
   NoFriendsAvailableError,
   NoFriendsForModelError,
   NoProvidersConnectedError,
   NoProvidersForCountryError,
   NoProvidersForModelError,
+  NoProvidersForToolCallsError,
   NoProvidersForVersionError,
   ProviderPayoutsNotEligibleError,
   TargetProviderNotConnectedError,
@@ -152,6 +155,10 @@ describe("classifyDispatchError", () => {
       classifyDispatchError(new ProviderPayoutsNotEligibleError("did:plc:alice")),
       "provider-payouts-not-eligible",
     );
+    assert.equal(
+      classifyDispatchError(new NoProvidersForToolCallsError("gemma-3", "detail")),
+      "no-providers-for-tool-calls",
+    );
   });
 
   test("unknown errors fall through to advisor-transport", () => {
@@ -243,5 +250,66 @@ describe("filterByMinVersion — version-gated routing", () => {
       classifyDispatchError(new NoProvidersForVersionError("0.9.32", "none at version")),
       "no-providers-for-version",
     );
+  });
+});
+
+describe("filterByToolCalls — tool-calling routing", () => {
+  const MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit";
+  const OTHER = "mlx-community/Qwen3.5-9B-MLX-4bit";
+  // Passed the per-model forced-tool canary for MODEL.
+  const CANARY = { did: "did:plc:canary", toolCallModels: [MODEL] };
+  // Serves MODEL but reports an empty canary set (didn't pass for any model) —
+  // this is the common fleet shape that used to get pinned and then 503'd.
+  const NOCANARY = { did: "did:plc:nocanary", toolCallModels: [] as string[] };
+  // Passed the canary, but for a DIFFERENT model than the one requested.
+  const CANARY_OTHER = { did: "did:plc:other", toolCallModels: [OTHER] };
+  // Legacy machine that predates toolCallModels — falls back to the boolean.
+  const LEGACY_ON: { did: string; toolCallModels?: string[]; supportsToolCalls?: boolean } = {
+    did: "did:plc:legacy-on",
+    supportsToolCalls: true,
+  };
+  const LEGACY_OFF: { did: string; toolCallModels?: string[]; supportsToolCalls?: boolean } = {
+    did: "did:plc:legacy-off",
+  };
+
+  test("wantsToolCalls=false passes the list through verbatim", () => {
+    assert.deepEqual(filterByToolCalls([CANARY, NOCANARY, LEGACY_OFF], MODEL, false), [
+      CANARY,
+      NOCANARY,
+      LEGACY_OFF,
+    ]);
+  });
+
+  test("keeps only machines that passed the canary for the requested model", () => {
+    assert.deepEqual(filterByToolCalls([CANARY, NOCANARY, CANARY_OTHER], MODEL, true), [CANARY]);
+  });
+
+  test("a machine whose canary set omits the model is excluded (the 503 bug)", () => {
+    // NOCANARY serves MODEL but never passed the forced-tool canary; pinning it
+    // is exactly what produced the advisor's "no machine with verified
+    // tool-calling" 503. It must not survive the filter.
+    assert.deepEqual(filterByToolCalls([NOCANARY], MODEL, true), []);
+  });
+
+  test("legacy machines fall back to the supportsToolCalls boolean", () => {
+    assert.deepEqual(filterByToolCalls([LEGACY_ON, LEGACY_OFF], MODEL, true), [LEGACY_ON]);
+  });
+
+  test("machineSupportsToolCallsFor mirrors the advisor's per-model semantics", () => {
+    assert.equal(machineSupportsToolCallsFor(CANARY, MODEL), true);
+    assert.equal(machineSupportsToolCallsFor(CANARY, OTHER), false);
+    assert.equal(machineSupportsToolCallsFor(NOCANARY, MODEL), false);
+    assert.equal(machineSupportsToolCallsFor(LEGACY_ON, MODEL), true);
+    assert.equal(machineSupportsToolCallsFor(LEGACY_OFF, MODEL), false);
+  });
+
+  test("NoProvidersForToolCallsError carries model + code", () => {
+    const e = new NoProvidersForToolCallsError(
+      MODEL,
+      "3 serve the model but none passed the canary",
+    );
+    assert.match(e.message, /Qwen3\.5-4B/);
+    assert.match(e.message, /verified tool-calling/);
+    assert.equal(classifyDispatchError(e), "no-providers-for-tool-calls");
   });
 });

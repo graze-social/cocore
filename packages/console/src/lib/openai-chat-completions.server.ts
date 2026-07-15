@@ -623,6 +623,16 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
         type: "service_unavailable_error",
         code: "no_providers_for_version",
       };
+    case "no-providers-for-tool-calls":
+      // The model exists but no connected provider passed the forced-tool
+      // canary for it. 400 (matches the up-front `tool_calls_not_supported`
+      // gate): tool-calling isn't a transient-capacity issue the client should
+      // blindly retry — the request needs a tool-capable model/provider.
+      return {
+        status: 400,
+        type: "invalid_request_error",
+        code: "tool_calls_not_supported",
+      };
     case "no-friends-available":
       return {
         status: 503,
