@@ -145,6 +145,7 @@ const MODEL_RAM_FLOORS: Readonly<Record<string, ModelFloor>> = {
   "mlx-community/Qwen3.5-4B-MLX-4bit": { minRamGB: 8, label: "Qwen3.5-4B" },
   "mlx-community/Qwen3.5-9B-MLX-4bit": { minRamGB: 16, label: "Qwen3.5-9B" },
   "mlx-community/Qwen3.5-27B-4bit": { minRamGB: 24, label: "Qwen3.5-27B" },
+  "prism-ml/Ternary-Bonsai-27B-mlx-2bit": { minRamGB: 24, label: "Ternary Bonsai 27B" },
   "mlx-community/Qwen3.6-27B-4bit": { minRamGB: 24, label: "Qwen3.6-27B" },
   "mlx-community/Qwen3.5-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.5-35B-A3B" },
   "mlx-community/Qwen3.6-35B-A3B-4bit": { minRamGB: 32, label: "Qwen3.6-35B-A3B" },

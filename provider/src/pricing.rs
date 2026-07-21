@@ -150,6 +150,21 @@ pub const RATES: &[ModelRate] = &[
         recommended: true,
         tool_call_parser: Some("qwen3_xml"),
     },
+    // Ternary Qwen 3.6-derived model. Its bundled template emits the Qwen
+    // XML tool format, which vllm-mlx exposes as `qwen3_xml`; it is not
+    // compatible with the legacy Hermes parser used by the Qwen rotation.
+    // The 24GB floor leaves room for macOS and a useful KV cache; the model
+    // itself advertises a 262K context window.
+    ModelRate {
+        model_id: "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 24,
+        description: "Ternary Bonsai 27B — 262K context; 24GB+ recommended",
+        recommended: false,
+        tool_call_parser: Some("qwen3_xml"),
+    },
     ModelRate {
         model_id: "mlx-community/Qwen3.6-27B-4bit",
         input_per_mtok: 1_000_000,

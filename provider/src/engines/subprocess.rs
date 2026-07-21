@@ -1784,6 +1784,9 @@ mod tests {
         let top = on.for_model("mlx-community/Qwen3.5-4B-MLX-4bit");
         assert!(top.enabled);
         assert_eq!(top.tool_call_parser.as_deref(), Some("qwen3_xml"));
+        let bonsai = on.for_model("prism-ml/Ternary-Bonsai-27B-mlx-2bit");
+        assert!(bonsai.enabled);
+        assert_eq!(bonsai.tool_call_parser.as_deref(), Some("qwen3_xml"));
         let llama = on.for_model("mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit");
         assert!(llama.enabled);
         assert_eq!(llama.tool_call_parser.as_deref(), Some("llama4_pythonic"));
