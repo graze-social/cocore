@@ -1073,7 +1073,12 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         return;
       }
     }
+    yield {
+      kind: "error",
+      reason: "advisor stream ended before completion",
+      code: "advisor-transport",
+    };
   } catch (e) {
-    yield { kind: "error", reason: (e as Error).message, code: "unknown" };
+    yield { kind: "error", reason: (e as Error).message, code: "advisor-transport" };
   }
 }

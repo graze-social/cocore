@@ -674,12 +674,6 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
     case "unknown":
       return { status: 502, type: "server_error", code: "unknown" };
   }
-  // Exhaustiveness check — TypeScript narrows the switch above so
-  // this is unreachable; the fallback is for runtime safety if a
-  // new code is added without updating this switch.
-  const _exhaustive: never = errorCode;
-  void _exhaustive;
-  return { status: 502, type: "server_error", code: "unknown" };
 }
 
 export function streamingResponse(
@@ -760,6 +754,19 @@ export function streamingResponse(
           }
           // `meta` is internal — not surfaced to OpenAI clients.
         }
+        // An iterator EOF without complete/error is transport truncation, not
+        // a successful OpenAI response. Emit one terminal error and no [DONE].
+        const mapped = dispatchErrorToHttpResponse("advisor-transport");
+        send(
+          JSON.stringify({
+            error: {
+              message: "Inference stream ended before completion.",
+              type: mapped.type,
+              code: mapped.code,
+              param: null,
+            },
+          }),
+        );
       } finally {
         controller.close();
       }
@@ -788,6 +795,7 @@ export async function bufferedResponse(
   let tokensOut = 0;
   let providerCredit: ProviderCredit | undefined;
   let receiptUri: string | null = null;
+  let completed = false;
   let errored: { reason: string; code: DispatchErrorCode } | null = null;
 
   for await (const ev of events) {
@@ -800,6 +808,7 @@ export async function bufferedResponse(
       tokensOut = ev.tokensOut;
       providerCredit = ev.providerCredit;
       receiptUri = ev.receiptUri;
+      completed = true;
     } else if (ev.kind === "error") {
       errored = { reason: ev.reason, code: ev.code };
       break;
@@ -809,6 +818,15 @@ export async function bufferedResponse(
   if (errored !== null) {
     const mapped = dispatchErrorToHttpResponse(errored.code);
     return jsonError(mapped.status, errored.reason, mapped.type, mapped.code);
+  }
+  if (!completed) {
+    const mapped = dispatchErrorToHttpResponse("advisor-transport");
+    return jsonError(
+      mapped.status,
+      "Inference stream ended before completion.",
+      mapped.type,
+      mapped.code,
+    );
   }
 
   // Reassemble tool-call deltas into the OpenAI tool_calls array.

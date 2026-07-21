@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cocore_provider::{
-    advisor::AdvisorClient,
+    advisor::{AdvisorClient, InvocationManager, STREAM_RESUME_VERSION},
     attestation, oauth,
     pds::{
         effective_tool_calls, parse_tool_calls_env_override, AttestationFault, EngineFault,
@@ -1651,7 +1651,8 @@ async fn cmd_serve(
     // enclave; otherwise the software X25519 key (`x25519-xsalsa20-poly1305`).
     // The advertised `encScheme` tells requesters + the advisor which codec to
     // seal with, so old peers keep using X25519 against best-effort machines.
-    let enc = cocore_provider::crypto::load_or_create_encryption_key();
+    let enc: Arc<dyn cocore_provider::crypto::EncryptionKey> =
+        Arc::from(cocore_provider::crypto::load_or_create_encryption_key());
     let enc_scheme = enc.enc_scheme().to_string();
 
     // Publish a `dev.cocore.compute.provider` record so the user's
@@ -2253,6 +2254,7 @@ async fn cmd_serve(
         // Old software-key agents report false/x25519 and stay best-effort.
         secure_enclave_available: Some(signer.is_hardware_bound()),
         enc_scheme: Some(enc_scheme.clone()),
+        stream_resume_version: Some(STREAM_RESUME_VERSION),
     };
 
     // Periodic re-attestation. Attestations expire after 24h; without this the
@@ -2313,6 +2315,10 @@ async fn cmd_serve(
         })
     };
 
+    // Inference invocations outlive individual advisor WebSockets. Every
+    // reconnecting AdvisorClient attaches to this same bounded replay manager.
+    let invocations = InvocationManager::new();
+
     // The serve future below loops forever. Race it against a graceful
     // shutdown signal (SIGTERM from launchd / the macOS app supervisor on
     // quit / pause / bounce, or Ctrl-C in a terminal) so that when the
@@ -2353,8 +2359,8 @@ async fn cmd_serve(
                     let result = AdvisorClient::new(advisor_url)
                         .run(
                             register.clone(),
-                            &*signer,
-                            &*enc,
+                            &signer,
+                            &enc,
                             &pds,
                             attestation.clone(),
                             &engines,
@@ -2367,6 +2373,7 @@ async fn cmd_serve(
                             &pro_bono_at_start,
                             tool_calls_at_start,
                             tool_calls_env_override,
+                            &invocations,
                         )
                         .await;
                     let lived = connected_at.elapsed();
@@ -2391,7 +2398,14 @@ async fn cmd_serve(
                             advisor_fault
                                 .on_serve_error(&e, &pds, provider_rkey.as_deref(), advisor_url)
                                 .await;
-                            tokio::time::sleep(backoff).await;
+                            // An in-flight invocation has only a bounded advisor
+                            // grace; never let generic connect backoff consume it.
+                            let retry_after = if invocations.has_active() {
+                                std::time::Duration::from_secs(1)
+                            } else {
+                                backoff
+                            };
+                            tokio::time::sleep(retry_after).await;
                             backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
                         }
                     }
@@ -2436,7 +2450,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &*signer, &*enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start, tool_calls_at_start, tool_calls_env_override) => {
+                            res = client.run(register.clone(), &signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start, tool_calls_at_start, tool_calls_env_override, &invocations) => {
                                 match &res {
                                     Ok(()) => advisor_fault.reset(),
                                     Err(e) => {

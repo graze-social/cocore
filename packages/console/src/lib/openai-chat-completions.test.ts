@@ -215,6 +215,14 @@ async function* yieldEvents(events: DispatchEvent[]): AsyncIterable<DispatchEven
   for (const ev of events) yield ev;
 }
 
+function parseJson<T>(value: string): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    assert.fail(`invalid JSON fixture: ${String(error)}`);
+  }
+}
+
 describe("bufferedResponse error mapping", () => {
   test("happy path: aggregates chunks into a single OpenAI chat completion body", async () => {
     const res = await bufferedResponse(
@@ -235,6 +243,18 @@ describe("bufferedResponse error mapping", () => {
     assert.equal(body.usage.prompt_tokens, 3);
     assert.equal(body.usage.completion_tokens, 2);
     assert.equal(body.usage.total_tokens, 5);
+  });
+
+  test("EOF without completion is an error, never finish_reason=stop", async () => {
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([{ kind: "chunk", seq: 0, channel: "content", text: "truncated" }]),
+    );
+    assert.equal(res.status, 502);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "advisor_transport");
+    assert.match(body.error.message, /before completion/i);
   });
 
   test("reasoning chunks surface as message.reasoning_content, separate from content", async () => {
@@ -430,20 +450,33 @@ describe("streamingResponse is an SSE stream", () => {
     assert.equal(data.at(-1), "[DONE]");
 
     // First frame is the role-only delta OpenAI clients expect.
-    const first = JSON.parse(data[0]!) as {
+    const first = parseJson<{
       object: string;
       choices: Array<{ delta: { role?: string; content?: string }; finish_reason: string | null }>;
-    };
+    }>(data[0]!);
     assert.equal(first.object, "chat.completion.chunk");
     assert.equal(first.choices[0]!.delta.role, "assistant");
 
     // The content chunk carries the streamed text.
     const contents = data
       .slice(0, -1)
-      .map((d) => JSON.parse(d) as { choices: Array<{ delta: { content?: string } }> })
+      .map((d) => parseJson<{ choices: Array<{ delta: { content?: string } }> }>(d))
       .map((c) => c.choices[0]!.delta.content ?? "")
       .join("");
     assert.equal(contents, "hello world");
+  });
+
+  test("EOF without completion emits one error and no [DONE]", async () => {
+    const res = streamingResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([{ kind: "chunk", seq: 0, channel: "content", text: "truncated" }]),
+    );
+    const data = await readSseData(res);
+    assert.equal(data.includes("[DONE]"), false);
+    const terminal = parseJson<{ error: { code: string; message: string } }>(data.at(-1)!);
+    assert.equal(terminal.error.code, "advisor_transport");
+    assert.match(terminal.error.message, /before completion/i);
   });
 
   test("reasoning chunks ride delta.reasoning_content, content rides delta.content", async () => {
@@ -459,7 +492,7 @@ describe("streamingResponse is an SSE stream", () => {
     const data = await readSseData(res);
     const deltas = data
       .slice(0, -1)
-      .map((d) => JSON.parse(d) as { choices: Array<{ delta: Record<string, unknown> }> })
+      .map((d) => parseJson<{ choices: Array<{ delta: Record<string, unknown> }> }>(d))
       .map((c) => c.choices[0]!.delta);
     const reasoning = deltas.map((d) => (d.reasoning_content as string) ?? "").join("");
     const content = deltas.map((d) => (d.content as string) ?? "").join("");
@@ -502,7 +535,7 @@ describe("streamingResponse is an SSE stream", () => {
       }
     }
     const errFrame = data.find((d) => d.includes('"error"'))!;
-    const parsed = JSON.parse(errFrame) as { error: { code: string; type: string } };
+    const parsed = parseJson<{ error: { code: string; type: string } }>(errFrame);
     assert.equal(parsed.error.code, "model_not_found");
     assert.equal(parsed.error.type, "invalid_request_error");
   });
@@ -764,14 +797,13 @@ describe("streamingResponse with tool calls", () => {
 
     const chunks = data
       .filter((d) => d !== "[DONE]")
-      .map(
-        (d) =>
-          JSON.parse(d) as {
-            choices: Array<{
-              delta: { tool_calls?: unknown[] };
-              finish_reason: string | null;
-            }>;
-          },
+      .map((d) =>
+        parseJson<{
+          choices: Array<{
+            delta: { tool_calls?: unknown[] };
+            finish_reason: string | null;
+          }>;
+        }>(d),
       );
 
     // Find the chunk that carries tool_calls (skip [DONE] terminator).
@@ -815,11 +847,10 @@ describe("streamingResponse with tool calls", () => {
     const data = await readSseData(res);
     const chunks = data
       .slice(0, -1) // drop [DONE]
-      .map(
-        (d) =>
-          JSON.parse(d) as {
-            choices: Array<{ delta: Record<string, unknown>; finish_reason: string | null }>;
-          },
+      .map((d) =>
+        parseJson<{
+          choices: Array<{ delta: Record<string, unknown>; finish_reason: string | null }>;
+        }>(d),
       );
 
     const contentChunks = chunks.filter((c) => c.choices[0]?.delta.content);

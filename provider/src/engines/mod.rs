@@ -56,6 +56,7 @@ pub mod subprocess;
 /// `subprocess::SubprocessEngine` — each engine instance owns a
 /// Python child process that hosts vllm-mlx on a per-model Unix
 /// domain socket.
+#[derive(Clone)]
 pub struct EngineRegistry {
     by_model: BTreeMap<String, Arc<dyn Engine>>,
 }

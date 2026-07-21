@@ -20,6 +20,7 @@ interface Harness {
   server: Server;
   url: string;
   registry: ProviderRegistry;
+  sessions: SessionManager;
   onUnanswered: (did: string) => void;
   unansweredFires: string[];
 }
@@ -54,6 +55,7 @@ async function startHarness(): Promise<Harness> {
     server,
     url: `ws://127.0.0.1:${addr.port}/v1/agent`,
     registry,
+    sessions,
     onUnanswered,
     unansweredFires,
   };
@@ -323,7 +325,7 @@ function fakeSseRes() {
   };
 }
 
-async function registerProvider(url: string, did: string): Promise<WebSocket> {
+async function registerProvider(url: string, did: string, resumable = false): Promise<WebSocket> {
   const ws = new WebSocket(url);
   await new Promise<void>((r) => ws.once("open", () => r()));
   const inbound: string[] = [];
@@ -339,6 +341,7 @@ async function registerProvider(url: string, did: string): Promise<WebSocket> {
       encryption_pub_key: "k",
       attestation_pub_key: "a", // no machine_id → machineId falls back to this
       attestation_uri: "",
+      ...(resumable ? { stream_resume_version: 1 } : {}),
     }),
   );
   // Wait for the challenge so we know the register frame was processed.
@@ -379,30 +382,251 @@ describe("provider mid-job socket drop", () => {
     }
   }, 5_000);
 
-  it("does NOT drain or record a failure on an advisor-initiated recycle", async () => {
-    // maxConnectionMs tiny → the advisor cleanly recycles the connection.
-    const h = await startDropHarness({ maxConnectionMs: 150 });
+  it("reattaches one invocation after an abnormal reset without duplicate chunks or completion", async () => {
+    const h = await startDropHarness();
     try {
-      const ws = await registerProvider(h.url, "did:plc:recycle");
+      const ws1 = await registerProvider(h.url, "did:plc:resume", true);
       const res = fakeSseRes();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      h.sessions.open("sess-2", "did:plc:recycle", "a", "did:plc:req", res as any);
+      h.sessions.open(
+        "sess-r",
+        "did:plc:resume",
+        "a",
+        "did:plc:req",
+        res as any,
+        undefined,
+        "token-r",
+      );
+      ws1.send(
+        JSON.stringify({
+          type: "inference_chunk",
+          session_id: "sess-r",
+          seq: 0,
+          ciphertext: [1],
+        }),
+      );
+      await vi.waitFor(() => expect(res.chunks.join("")).toContain('"seq":0'));
+
+      ws1.terminate();
+      await vi.waitFor(() => expect(h.registry.get("did:plc:resume", "a")).toBeUndefined());
+      expect(h.sessions.has("sess-r")).toBe(true);
+      expect(res.writableEnded).toBe(false);
+
+      const ws2 = await registerProvider(h.url, "did:plc:resume", true);
+      const inbound: Record<string, unknown>[] = [];
+      ws2.on("message", (data) => {
+        inbound.push(JSON.parse(data.toString("utf-8")) as Record<string, unknown>);
+      });
+      ws2.send(
+        JSON.stringify({
+          type: "inference_resume",
+          session_id: "sess-r",
+          resume_token: "token-r",
+          produced_seq: 2,
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(
+          inbound.some((m) => m["type"] === "inference_resume_result" && m["next_seq"] === 1),
+        ).toBe(true),
+      );
+
+      // Ambiguous seq=0 is replayed but suppressed; seq=1 and completion land once.
+      ws2.send(
+        JSON.stringify({
+          type: "inference_chunk",
+          session_id: "sess-r",
+          seq: 0,
+          ciphertext: [1],
+        }),
+      );
+      ws2.send(
+        JSON.stringify({
+          type: "inference_chunk",
+          session_id: "sess-r",
+          seq: 1,
+          ciphertext: [2],
+        }),
+      );
+      ws2.send(
+        JSON.stringify({
+          type: "inference_complete",
+          session_id: "sess-r",
+          tokens_in: 1,
+          tokens_out: 2,
+          receipt_uri: "at://receipt/one",
+          final_seq: 2,
+        }),
+      );
+      await vi.waitFor(() => expect(res.writableEnded).toBe(true));
+      const sse = res.chunks.join("");
+      expect(sse.match(/"seq":0/g)).toHaveLength(1);
+      expect(sse.match(/"seq":1/g)).toHaveLength(1);
+      expect(sse.match(/"type":"complete"/g)).toHaveLength(1);
+      await vi.waitFor(() =>
+        expect(inbound.some((m) => m["type"] === "inference_ack" && m["completed"] === true)).toBe(
+          true,
+        ),
+      );
+      ws2.close();
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("drops session frames from a replaced-but-still-open stale socket", async () => {
+    // The exact race ownsCurrentRegistration exists for: ws1 is replaced by
+    // ws2 for the same (did, machine) but hasn't died yet and keeps sending.
+    // Its frames — even with the correct session_id AND resume token — must
+    // not reach the session or the resume handshake.
+    const h = await startDropHarness();
+    try {
+      const ws1 = await registerProvider(h.url, "did:plc:stale", true);
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-s", "did:plc:stale", "a", "did:plc:req", res as any, undefined, "tok");
+      ws1.send(
+        JSON.stringify({ type: "inference_chunk", session_id: "sess-s", seq: 0, ciphertext: [1] }),
+      );
+      await vi.waitFor(() => expect(res.chunks.join("")).toContain('"seq":0'));
+
+      // Stop ws1's receive side so it never processes the advisor's
+      // close(1000, "replaced") and stays OPEN from its own point of view —
+      // the deterministic version of the replaced-but-not-yet-dead window.
+      ws1.pause();
+      const errSpy = vi.spyOn(console, "error");
+      const ws2 = await registerProvider(h.url, "did:plc:stale", true);
+
+      // The stale socket injects a chunk, a resume claim, and a completion.
+      ws1.send(
+        JSON.stringify({ type: "inference_chunk", session_id: "sess-s", seq: 1, ciphertext: [9] }),
+      );
+      ws1.send(
+        JSON.stringify({
+          type: "inference_resume",
+          session_id: "sess-s",
+          resume_token: "tok",
+          produced_seq: 2,
+        }),
+      );
+      ws1.send(
+        JSON.stringify({
+          type: "inference_complete",
+          session_id: "sess-s",
+          tokens_in: 1,
+          tokens_out: 1,
+          receipt_uri: "at://evil",
+          final_seq: 2,
+        }),
+      );
+      // The drop log proves the frames were processed AND fenced (a silently
+      // lost frame would make the assertions below vacuous).
+      await vi.waitFor(() =>
+        expect(
+          errSpy.mock.calls.some((c) => String(c[0]).includes("drop inference_complete")),
+        ).toBe(true),
+      );
+      expect(res.chunks.join("")).not.toContain('"seq":1');
+      expect(res.chunks.join("")).not.toContain("at://evil");
+      expect(res.writableEnded).toBe(false);
+      expect(h.sessions.has("sess-s")).toBe(true);
+
+      // The successor socket resumes and completes the session normally —
+      // the stale frames advanced nothing.
+      const inbound: Record<string, unknown>[] = [];
+      ws2.on("message", (data) => {
+        inbound.push(JSON.parse(data.toString("utf-8")) as Record<string, unknown>);
+      });
+      ws2.send(
+        JSON.stringify({
+          type: "inference_resume",
+          session_id: "sess-s",
+          resume_token: "tok",
+          produced_seq: 2,
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(
+          inbound.some((m) => m["type"] === "inference_resume_result" && m["next_seq"] === 1),
+        ).toBe(true),
+      );
+      ws2.send(
+        JSON.stringify({ type: "inference_chunk", session_id: "sess-s", seq: 1, ciphertext: [2] }),
+      );
+      ws2.send(
+        JSON.stringify({
+          type: "inference_complete",
+          session_id: "sess-s",
+          tokens_in: 1,
+          tokens_out: 2,
+          receipt_uri: "at://receipt/good",
+          final_seq: 2,
+        }),
+      );
+      await vi.waitFor(() => expect(res.writableEnded).toBe(true));
+      expect(res.chunks.join("")).toContain("at://receipt/good");
+      errSpy.mockRestore();
+      ws1.terminate();
+      ws2.close();
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("fails legacy sessions but preserves resumable sessions on advisor recycle", async () => {
+    const h = await startDropHarness({ maxConnectionMs: 150 });
+    try {
+      const ws = await registerProvider(h.url, "did:plc:recycle", true);
+      const legacyRes = fakeSseRes();
+      const resumableRes = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-legacy", "did:plc:recycle", "a", "did:plc:req", legacyRes as any);
+      h.sessions.open(
+        "sess-resume",
+        "did:plc:recycle",
+        "a",
+        "did:plc:req",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        resumableRes as any,
+        undefined,
+        "token-recycle",
+      );
       const failSpy = vi.spyOn(h.registry, "recordFailure");
 
-      // Wait for the advisor's clean recycle close.
       const reason = await new Promise<string>((resolve) => {
         ws.once("close", (_c, r) => resolve(r.toString("utf-8")));
       });
       expect(reason).toBe("recycle");
-      // Give the server-side close handler a tick to run.
-      await new Promise<void>((r) => setTimeout(r, 50));
+      await vi.waitFor(() => expect(legacyRes.writableEnded).toBe(true));
 
-      // The session is untouched (the machine is expected to reconnect and keep
-      // serving it) and no failure was counted.
-      expect(h.sessions.has("sess-2")).toBe(true);
-      expect(res.writableEnded).toBe(false);
+      expect(h.sessions.has("sess-legacy")).toBe(false);
+      expect(h.sessions.has("sess-resume")).toBe(true);
+      expect(resumableRes.writableEnded).toBe(false);
       expect(failSpy).not.toHaveBeenCalled();
-      h.sessions.close("sess-2");
+      h.sessions.close("sess-resume");
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("fails legacy sessions before replacing a provider socket", async () => {
+    const h = await startDropHarness();
+    try {
+      const ws1 = await registerProvider(h.url, "did:plc:replace");
+      const legacyRes = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-replaced", "did:plc:replace", "a", "did:plc:req", legacyRes as any);
+      const failSpy = vi.spyOn(h.registry, "recordFailure");
+      const closed = new Promise<string>((resolve) => {
+        ws1.once("close", (_c, r) => resolve(r.toString("utf-8")));
+      });
+
+      const ws2 = await registerProvider(h.url, "did:plc:replace");
+      expect(await closed).toBe("replaced");
+      await vi.waitFor(() => expect(legacyRes.writableEnded).toBe(true));
+      expect(h.sessions.has("sess-replaced")).toBe(false);
+      expect(failSpy).not.toHaveBeenCalled();
+      ws2.close();
     } finally {
       await new Promise<void>((r) => h.server.close(() => r()));
     }

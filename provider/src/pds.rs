@@ -1258,6 +1258,7 @@ mod tests {
         assert_eq!(parse_tool_calls_env_override(Some("flase")), None);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rec(
         rkey: &str,
         created: &str,

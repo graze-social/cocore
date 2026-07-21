@@ -130,6 +130,9 @@ apns = ["native_mlx", "secure_enclave"]
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` enables `tokio::time::pause`/`advance` + `start_paused` for the
+# detach-generation retention test; `full` is already on the main dependency.
+tokio = { version = "1", features = ["test-util"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Generate self-signed cert chains in MDA tests so we don't have
 # to ship a real Apple-attested device chain in the repo.

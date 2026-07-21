@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node --experimental-strip-types src/main.ts",
     "test": "vitest run",
+    "test:resume": "cargo build --locked --manifest-path ../../provider/Cargo.toml --example resume_fault_provider && node --experimental-strip-types scripts/provider-resume-e2e.ts",
     "typecheck": "tsc -p . --noEmit"
   },
   "dependencies": {

@@ -22,6 +22,14 @@ interface Harness {
   sessions: SessionManager;
 }
 
+function parseAdvisorMessage(data: Buffer): AdvisorMessage | null {
+  try {
+    return JSON.parse(data.toString("utf8")) as AdvisorMessage;
+  } catch {
+    return null;
+  }
+}
+
 async function startHarness(
   opts: { attestationMaxAgeMs?: number; onDispatched?: (ms: number) => void } = {},
 ): Promise<Harness> {
@@ -260,6 +268,7 @@ describe("POST /jobs", () => {
     if (!sent || sent.type !== "inference_request") throw new Error("unreachable");
     expect(sent.session_id).toBe("test-session");
     expect(sent.requester_did).toBe("did:plc:requester");
+    expect(sent.resume_token).toBeUndefined();
 
     // Synthesize the provider's replies by writing to the session
     // through the SessionManager (the WS message handler in main.ts
@@ -282,6 +291,55 @@ describe("POST /jobs", () => {
     expect(lines[1]).toContain('"seq":0');
     expect(lines[2]).toContain("event: complete");
     expect(lines[2]).toContain('"receiptUri":"at://receipt"');
+  });
+
+  it("adds a fresh resume token only for a v1 provider", async () => {
+    const fp = fakeProvider(h.registry, "did:plc:resume", "pub-resume", true, undefined, {
+      stream_resume_version: 1,
+    });
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1],
+    });
+    await vi.waitFor(() => expect(fp.sent.length).toBeGreaterThan(0));
+    const sent = fp.sent[0];
+    if (!sent || sent.type !== "inference_request") throw new Error("unreachable");
+    expect(sent.resume_token).toBe("test-session");
+    h.sessions.close("test-session", "test-done");
+    await linesP;
+  });
+
+  it("409s a duplicate client-supplied sessionId instead of crashing", async () => {
+    const fp = fakeProvider(h.registry, "did:plc:dup", "pub-dup");
+    const job = {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1],
+      sessionId: "dup-session",
+    };
+    const linesP = readSseLines(`${h.url}/jobs`, job);
+    await vi.waitFor(() => expect(fp.sent.length).toBeGreaterThan(0));
+
+    // The same sessionId while the first is live must become a structured
+    // 409 (sessions.open would throw uncaught otherwise) — and must not
+    // disturb the live session.
+    const resp = await fetch(`${h.url}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...job, jobUri: "at://job2" }),
+    });
+    expect(resp.status).toBe(409);
+    expect(h.sessions.has("dup-session")).toBe(true);
+
+    h.sessions.close("dup-session", "test-done");
+    await linesP;
   });
 
   it("fires onDispatched (time-to-ack) once the inference_request is handed off", async () => {
@@ -662,8 +720,8 @@ describe("WebSocket round-trip (smoke)", () => {
 
     wss.on("connection", (sock) => {
       sock.on("message", (data) => {
-        const m = JSON.parse(data.toString("utf8")) as AdvisorMessage;
-        if (m.type === "register") {
+        const m = parseAdvisorMessage(data as Buffer);
+        if (m?.type === "register") {
           registry.upsert(
             m,
             () => sock.close(),
@@ -682,7 +740,8 @@ describe("WebSocket round-trip (smoke)", () => {
     const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/v1/agent`);
     await new Promise<void>((r) => ws.once("open", () => r()));
     ws.on("message", (data) => {
-      inbound.push(JSON.parse(data.toString("utf8")) as AdvisorMessage);
+      const message = parseAdvisorMessage(data as Buffer);
+      if (message) inbound.push(message);
     });
 
     ws.send(

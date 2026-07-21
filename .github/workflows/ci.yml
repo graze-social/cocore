@@ -61,7 +61,7 @@ jobs:
           cd provider && cargo fmt --check 2>&1 | tee -a /tmp/ci.log
 
       # v0.6.0 removed PyO3 + the `inference` feature flag — the agent
-       # spawns inference as a Python subprocess instead of linking
+      # spawns inference as a Python subprocess instead of linking
       # libpython in-process. No more libpython-dev install, no more
       # second test run with --features inference.
       - name: Rust unit + integration tests
@@ -126,6 +126,19 @@ jobs:
         run: |
           set -o pipefail
           aube run test 2>&1 | tee -a /tmp/ci.log
+
+      # Process-level resume fault matrix: drives a real provider binary +
+      # advisor through a fault-injecting WS proxy. Blocking: the harness's
+      # known non-determinism is contained (the terminal-ACK-loss window is a
+      # soft wait inside the script, the advisor binds an ephemeral port it
+      # logs rather than a racy reserved one, and the expiry block window has
+      # a wide margin), so a red run here means resume actually broke.
+      - name: Provider resume fault matrix
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cd infra/advisor
+          aube run test:resume 2>&1 | tee -a /tmp/ci.log
 
       # Playwright smoke tests on the console. Build + `vite preview`
       # is started by playwright.config.ts's webServer; we just need
