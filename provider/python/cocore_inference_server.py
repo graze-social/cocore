@@ -95,6 +95,11 @@ except Exception:
 
 import uvicorn  # noqa: E402  (after logging config — intentional)
 import vllm_mlx.server as srv  # noqa: E402
+# LFM is not present in every installed vllm-mlx release. Importing the
+# bundled parser registers it with the same ToolParserManager used by the
+# server before request handling starts.
+import cocore_lfm_tool_parser as _lfm_tool_parser  # noqa: E402,F401
+_lfm_tool_parser.LFMToolParser.register_streaming_markers(srv)
 
 
 def _unlink_if_owned(socket_path: Path, owned_ino: "int | None") -> None:
@@ -356,7 +361,7 @@ def main() -> None:
             _known_parsers = {
                 "auto", "hermes", "nous", "mistral", "qwen", "qwen3_xml",
                 "llama", "deepseek", "kimi", "granite", "harmony", "nemotron",
-                "xlam", "functionary", "glm47", "gemma4", "minimax",
+                "xlam", "functionary", "glm47", "gemma4", "minimax", "lfm",
             }
             _parser = srv._tool_call_parser
             if _parser not in _known_parsers:

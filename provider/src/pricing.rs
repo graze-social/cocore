@@ -240,6 +240,40 @@ pub const RATES: &[ModelRate] = &[
         recommended: true,
         tool_call_parser: Some("qwen3_xml"),
     },
+    // Liquid AI LFM2.5 uses a Pythonic list-of-calls format that is handled by
+    // Cocore's bundled `lfm` parser. Keep the quantized variants separate so
+    // their RAM floors remain honest and unsupported future checkpoints do not
+    // silently inherit a parser pairing.
+    ModelRate {
+        model_id: "LiquidAI/LFM2.5-2.6B-MLX-4bit",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 8,
+        description: "LFM2.5 2.6B 4-bit — compact 131K-context model",
+        recommended: false,
+        tool_call_parser: Some("lfm"),
+    },
+    ModelRate {
+        model_id: "LiquidAI/LFM2.5-2.6B-MLX-8bit",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 12,
+        description: "LFM2.5 2.6B 8-bit — 131K context; 12GB+",
+        recommended: false,
+        tool_call_parser: Some("lfm"),
+    },
+    ModelRate {
+        model_id: "LiquidAI/LFM2.5-2.6B-MLX-bf16",
+        input_per_mtok: 1_000_000,
+        output_per_mtok: 1_000_000,
+        currency: "CC",
+        min_ram_gb: 16,
+        description: "LFM2.5 2.6B BF16 — 131K context; 16GB+",
+        recommended: false,
+        tool_call_parser: Some("lfm"),
+    },
     // ---- Legacy catalog (still servable; not recommended) -------------
     // Kept so a machine that already pinned one of these keeps its RAM
     // floor + price entry. The Secure Mode dialog nudges providers off
@@ -774,6 +808,18 @@ mod tests {
         assert!(!rec.contains(&"mlx-community/Qwen3.6-35B-A3B-4bit-DWQ"));
         // Unknown ids still resolve to "no vetted pairing".
         assert_eq!(tool_call_parser("custom/whatever-4bit"), None);
+    }
+
+    #[test]
+    fn lfm25_variants_pair_with_lfm_parser() {
+        for model_id in [
+            "LiquidAI/LFM2.5-2.6B-MLX-4bit",
+            "LiquidAI/LFM2.5-2.6B-MLX-8bit",
+            "LiquidAI/LFM2.5-2.6B-MLX-bf16",
+        ] {
+            assert_eq!(tool_call_parser(model_id), Some("lfm"), "{model_id}");
+        }
+        assert_eq!(tool_call_parser("LiquidAI/LFM2.5-3B-MLX-bf16"), None);
     }
 
     #[test]
