@@ -130,6 +130,47 @@ class LFMToolParserTests(unittest.TestCase):
         self.assertEqual(emitted["content"], "before  after")
         self.assertEqual(emitted["tool_calls"][0]["function"]["name"], "search")
 
+    def test_streaming_preserves_reasoning_text_without_think_or_tool_tags(self) -> None:
+        parser = LFMToolParser()
+        current = (
+            "I should search first.</think>"
+            "<|tool_call_start|>[search(query='LFM streaming')]<|tool_call_end|>"
+        )
+        emitted = parser.extract_tool_calls_streaming("", current, current, request=TOOLS)
+        self.assertIsNotNone(emitted)
+        assert emitted is not None
+        self.assertEqual(emitted["content"], "I should search first.")
+        self.assertNotIn("think", emitted["content"])
+        self.assertNotIn("tool_call", emitted["content"])
+        self.assertEqual(emitted["tool_calls"][0]["function"]["name"], "search")
+
+    def test_streaming_withholds_split_think_close_until_it_can_be_removed(self) -> None:
+        parser = LFMToolParser()
+        partial = "I should search first.</thi"
+        self.assertEqual(
+            parser.extract_tool_calls_streaming("", partial, partial, request=TOOLS),
+            {"content": "I should search first."},
+        )
+
+        complete = (
+            partial
+            + "nk><|tool_call_start|>[search(query='LFM streaming')]<|tool_call_end|>"
+        )
+        emitted = parser.extract_tool_calls_streaming(
+            partial, complete, complete[len(partial) :], request=TOOLS
+        )
+        self.assertIsNotNone(emitted)
+        assert emitted is not None
+        self.assertNotIn("content", emitted)
+        self.assertEqual(emitted["tool_calls"][0]["function"]["name"], "search")
+
+    def test_streaming_sanitizes_think_tags_in_nonprefix_fallback_delta(self) -> None:
+        parser = LFMToolParser()
+        emitted = parser.extract_tool_calls_streaming(
+            "earlier text", "replacement text", "new reasoning</think>", request=TOOLS
+        )
+        self.assertEqual(emitted, {"content": "new reasoning"})
+
     def test_streaming_emits_all_calls_in_one_block(self) -> None:
         parser = LFMToolParser()
         previous = "<|tool_call_start|>["
@@ -157,13 +198,13 @@ class LFMToolParserTests(unittest.TestCase):
         self.assertEqual(second_result["content"], "after")  # type: ignore[index]
         self.assertEqual(second_result["tool_calls"][0]["index"], 1)  # type: ignore[index]
 
-    def test_streaming_preserves_completed_malformed_block(self) -> None:
+    def test_streaming_suppresses_completed_malformed_block(self) -> None:
         parser = LFMToolParser()
         incomplete = "before <|tool_call_start|>[delete_everything()]"
         parser.extract_tool_calls_streaming("", incomplete, incomplete, request=TOOLS)
         complete = incomplete + "<|tool_call_end|>after"
         emitted = parser.extract_tool_calls_streaming(incomplete, complete, complete[len(incomplete) :], request=TOOLS)
-        self.assertEqual(emitted, {"content": "<|tool_call_start|>[delete_everything()]<|tool_call_end|>after"})
+        self.assertEqual(emitted, {"content": "after"})
 
 
 if __name__ == "__main__":

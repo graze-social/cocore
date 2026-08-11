@@ -31,6 +31,10 @@ _START = "<|tool_call_start|>"
 _END = "<|tool_call_end|>"
 _BLOCK_RE = re.compile(re.escape(_START) + r"(.*?)" + re.escape(_END), re.DOTALL)
 _START_PREFIXES = tuple(_START[:index] for index in range(2, len(_START)))
+_THINK_MARKERS = ("<think>", "</think>")
+_THINK_PREFIXES = tuple(
+    marker[:index] for marker in _THINK_MARKERS for index in range(2, len(marker))
+)
 
 
 class LFMToolParser(ToolParser):
@@ -156,16 +160,27 @@ class LFMToolParser(ToolParser):
     def _clean_text(text: str) -> str | None:
         return text.strip() or None
 
+    @staticmethod
+    def _strip_streaming_think_tags(text: str) -> str:
+        """Remove complete think tags and withhold an incomplete tag suffix."""
+        for marker in _THINK_MARKERS:
+            text = text.replace(marker, "")
+        for prefix in sorted(_THINK_PREFIXES, key=len, reverse=True):
+            if text.endswith(prefix):
+                return text[: -len(prefix)]
+        return text
+
     @classmethod
     def _stream_visible_text(cls, text: str, request: dict[str, Any] | None) -> str:
         """Return text that is safe to emit while a response is still streaming."""
+        del request
         pieces: list[str] = []
         cursor = 0
         for match in _BLOCK_RE.finditer(text):
-            block_calls = cls._parse_block(match.group(1), request)
+            # Tool markers delimit protocol control output, not assistant text.
+            # Drop every completed block, including malformed or unapproved ones:
+            # parsing failures must not become rendered Pythonic-call syntax.
             pieces.append(text[cursor : match.start()])
-            if not block_calls:
-                pieces.append(text[match.start() : match.end()])
             cursor = match.end()
 
         trailing = text[cursor:]
@@ -178,7 +193,7 @@ class LFMToolParser(ToolParser):
             if incomplete_start >= 0:
                 trailing = trailing[:incomplete_start]
         pieces.append(trailing)
-        return "".join(pieces)
+        return cls._strip_streaming_think_tags("".join(pieces))
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -240,7 +255,7 @@ class LFMToolParser(ToolParser):
         if current_visible.startswith(previous_visible):
             visible_delta = current_visible[len(previous_visible) :]
         elif not (_START in delta_text or _END in delta_text):
-            visible_delta = delta_text
+            visible_delta = self._strip_streaming_think_tags(delta_text)
         else:
             visible_delta = ""
 

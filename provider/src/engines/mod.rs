@@ -433,14 +433,14 @@ const THINK_CLOSE: &str = "</think>";
 
 /// Heuristic: does this model's chat template prefill the opening `<think>`, so
 /// generation begins inside the reasoning block and the stream carries only the
-/// closing `</think>`? True for the Qwen3-*-Thinking-2507 family and similarly
-/// named dedicated thinking models. Drives whether the [`ThinkTagSplitter`]
+/// closing `</think>`? True for the Qwen3-*-Thinking-2507 family, LFM2.5, and
+/// similarly named dedicated thinking models. Drives whether the [`ThinkTagSplitter`]
 /// starts in reasoning mode ([`ThinkTagSplitter::new_in_reasoning`]). Unlabelled
 /// thinking models can be opted in via `COCORE_THINKING_PREFILL_MODELS` (a
 /// comma-separated list of substrings matched case-insensitively against the id).
 pub fn model_prefills_think(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    if m.contains("thinking") {
+    if m.contains("thinking") || m.contains("lfm2.5") {
         return true;
     }
     std::env::var("COCORE_THINKING_PREFILL_MODELS")
@@ -897,6 +897,7 @@ mod tests {
         assert!(model_prefills_think(
             "lmstudio-community/Qwen3-4B-Thinking-2507-MLX-4bit"
         ));
+        assert!(model_prefills_think("LiquidAI/LFM2.5-2.6B-MLX-4bit"));
         assert!(!model_prefills_think(
             "mlx-community/Qwen2.5-3B-Instruct-4bit"
         ));
