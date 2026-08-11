@@ -344,6 +344,9 @@ fn ready_stall_timeout() -> Duration {
 /// agent ships as a single static binary, no separate file to install
 /// alongside it.
 const WRAPPER_SCRIPT: &str = include_str!("../../python/cocore_inference_server.py");
+/// Embedded LFM parser module. The wrapper imports this alongside the
+/// embedded script, so packaged providers do not depend on a source checkout.
+const LFM_PARSER_SCRIPT: &str = include_str!("../../python/cocore_lfm_tool_parser.py");
 
 /// Where on disk we write the wrapper + sockets. Lives under
 /// `~/.cocore/` next to the venv so a `rm -rf ~/.cocore` cleans
@@ -627,6 +630,22 @@ impl SubprocessEngine {
         Ok(path)
     }
 
+    /// Write the embedded LFM parser next to the wrapper. Python puts the
+    /// script directory on `sys.path`, so the wrapper can import this module
+    /// in both source checkouts and installed single-binary providers.
+    fn ensure_lfm_parser_on_disk() -> Result<PathBuf> {
+        let path = state_dir()?.join("cocore_lfm_tool_parser.py");
+        let needs_write = !matches!(
+            std::fs::read_to_string(&path),
+            Ok(existing) if existing == LFM_PARSER_SCRIPT
+        );
+        if needs_write {
+            std::fs::write(&path, LFM_PARSER_SCRIPT)
+                .with_context(|| format!("writing LFM parser to {}", path.display()))?;
+        }
+        Ok(path)
+    }
+
     /// Remove orphaned engine sockets under `sockets_dir` that no
     /// longer have a listener.
     ///
@@ -722,6 +741,7 @@ impl SubprocessEngine {
         let _ = std::fs::remove_file(&self.socket_path);
 
         let wrapper = Self::ensure_wrapper_on_disk().context("writing embedded wrapper to disk")?;
+        Self::ensure_lfm_parser_on_disk().context("writing embedded LFM parser to disk")?;
 
         if !self.venv_python.exists() {
             bail!(
@@ -1816,6 +1836,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.parser_label(), "hermes");
+    }
+
+    #[test]
+    fn packaged_wrapper_embeds_lfm_parser_registration() {
+        assert!(WRAPPER_SCRIPT.contains("cocore_lfm_tool_parser"));
+        assert!(LFM_PARSER_SCRIPT.contains("ToolParserManager.register_module(\"lfm\""));
+        assert!(LFM_PARSER_SCRIPT.contains("<|tool_call_start|>"));
     }
 
     #[test]
