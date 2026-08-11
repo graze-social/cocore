@@ -22,6 +22,15 @@ class LFMToolParserTests(unittest.TestCase):
     def test_registers_with_vllm_parser_manager(self) -> None:
         self.assertIs(ToolParserManager.get_tool_parser("lfm"), LFMToolParser)
 
+    def test_registers_lfm_marker_prefixes_with_streaming_gate(self) -> None:
+        class FakeServer:
+            _STREAMING_TOOL_MARKERS = ("<tool_call>",)
+
+        LFMToolParser.register_streaming_markers(FakeServer)
+        self.assertIn("<|tool_call_", FakeServer._STREAMING_TOOL_MARKERS)
+        self.assertIn("<|tool_call_start|>", FakeServer._STREAMING_TOOL_MARKERS)
+        self.assertIn("<|tool_call_end|>", FakeServer._STREAMING_TOOL_MARKERS)
+
     def test_extracts_single_call_and_preserves_prefix(self) -> None:
         result = LFMToolParser().extract_tool_calls(
             "I will check. <|tool_call_start|>[get_weather(city='Rotterdam')]<|tool_call_end|>",
@@ -130,6 +139,31 @@ class LFMToolParserTests(unittest.TestCase):
         assert emitted is not None
         self.assertEqual([c["function"]["name"] for c in emitted["tool_calls"]], ["search", "get_weather"])
         self.assertEqual([c["index"] for c in emitted["tool_calls"]], [0, 1])
+
+    def test_streaming_handles_split_markers_and_multiple_blocks(self) -> None:
+        parser = LFMToolParser()
+        partial = "before <|tool_call_"
+        self.assertEqual(
+            parser.extract_tool_calls_streaming("", partial, partial, request=TOOLS),
+            {"content": "before "},
+        )
+
+        first = partial + "start|>[search(query='x')]<|tool_call_end|>middle "
+        first_result = parser.extract_tool_calls_streaming(partial, first, first[len(partial) :], request=TOOLS)
+        self.assertEqual(first_result["content"], "middle ")  # type: ignore[index]
+
+        second = first + "<|tool_call_start|>[get_weather(city='Tokyo')]<|tool_call_end|>after"
+        second_result = parser.extract_tool_calls_streaming(first, second, second[len(first) :], request=TOOLS)
+        self.assertEqual(second_result["content"], "after")  # type: ignore[index]
+        self.assertEqual(second_result["tool_calls"][0]["index"], 1)  # type: ignore[index]
+
+    def test_streaming_preserves_completed_malformed_block(self) -> None:
+        parser = LFMToolParser()
+        incomplete = "before <|tool_call_start|>[delete_everything()]"
+        parser.extract_tool_calls_streaming("", incomplete, incomplete, request=TOOLS)
+        complete = incomplete + "<|tool_call_end|>after"
+        emitted = parser.extract_tool_calls_streaming(incomplete, complete, complete[len(incomplete) :], request=TOOLS)
+        self.assertEqual(emitted, {"content": "<|tool_call_start|>[delete_everything()]<|tool_call_end|>after"})
 
 
 if __name__ == "__main__":

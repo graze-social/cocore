@@ -30,6 +30,7 @@ from vllm_mlx.tool_parsers.abstract_tool_parser import (
 _START = "<|tool_call_start|>"
 _END = "<|tool_call_end|>"
 _BLOCK_RE = re.compile(re.escape(_START) + r"(.*?)" + re.escape(_END), re.DOTALL)
+_START_PREFIXES = tuple(_START[:index] for index in range(2, len(_START)))
 
 
 class LFMToolParser(ToolParser):
@@ -37,6 +38,13 @@ class LFMToolParser(ToolParser):
 
     # LFM's chat template handles role=tool messages and assistant tool_calls.
     SUPPORTS_NATIVE_TOOL_FORMAT = True
+
+    @staticmethod
+    def register_streaming_markers(server_module: Any) -> None:
+        """Teach vllm-mlx's streaming fast path about LFM marker prefixes."""
+        existing = tuple(getattr(server_module, "_STREAMING_TOOL_MARKERS", ()))
+        markers = (*existing, *_START_PREFIXES, _START, _END)
+        server_module._STREAMING_TOOL_MARKERS = tuple(dict.fromkeys(markers))
 
     @staticmethod
     def _literal(node: ast.AST) -> Any:
@@ -148,6 +156,30 @@ class LFMToolParser(ToolParser):
     def _clean_text(text: str) -> str | None:
         return text.strip() or None
 
+    @classmethod
+    def _stream_visible_text(cls, text: str, request: dict[str, Any] | None) -> str:
+        """Return text that is safe to emit while a response is still streaming."""
+        pieces: list[str] = []
+        cursor = 0
+        for match in _BLOCK_RE.finditer(text):
+            block_calls = cls._parse_block(match.group(1), request)
+            pieces.append(text[cursor : match.start()])
+            if not block_calls:
+                pieces.append(text[match.start() : match.end()])
+            cursor = match.end()
+
+        trailing = text[cursor:]
+        for prefix in reversed(_START_PREFIXES):
+            if trailing.endswith(prefix):
+                trailing = trailing[: -len(prefix)]
+                break
+        else:
+            incomplete_start = trailing.find(_START)
+            if incomplete_start >= 0:
+                trailing = trailing[:incomplete_start]
+        pieces.append(trailing)
+        return "".join(pieces)
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
@@ -203,35 +235,21 @@ class LFMToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         del previous_token_ids, current_token_ids, delta_token_ids
 
-        start = current_text.find(_START)
-        if start < 0:
-            return {"content": delta_text}
-
-        # A tokenizer chunk can contain ordinary text immediately before the
-        # marker or immediately after the closing marker. Keep those visible
-        # fragments while suppressing the control syntax and incomplete call.
-        prefix = ""
-        if start >= len(previous_text):
-            prefix = current_text[len(previous_text) : start]
-
-        def visible_suffix() -> str:
-            end = current_text.rfind(_END)
-            if end < 0 or current_text.count(_END) <= previous_text.count(_END):
-                return ""
-            return current_text[end + len(_END) :]
-
-        def visible_content() -> str:
-            return prefix + visible_suffix()
+        previous_visible = self._stream_visible_text(previous_text, request)
+        current_visible = self._stream_visible_text(current_text, request)
+        if current_visible.startswith(previous_visible):
+            visible_delta = current_visible[len(previous_visible) :]
+        elif not (_START in delta_text or _END in delta_text):
+            visible_delta = delta_text
+        else:
+            visible_delta = ""
 
         previous_end_count = previous_text.count(_END)
         current_end_count = current_text.count(_END)
         if current_end_count <= previous_end_count:
             # Do not stream the control marker or an incomplete Python list as
             # assistant content. The completed block is emitted below.
-            if current_text.count(_START) > current_end_count:
-                content = visible_content()
-                return {"content": content} if content else None
-            return {"content": delta_text}
+            return {"content": visible_delta} if visible_delta else None
 
         result = self.extract_tool_calls(current_text, request)
         # A single completed block may contain multiple calls, and a malformed
@@ -240,13 +258,11 @@ class LFMToolParser(ToolParser):
         emitted_count = len(self.prev_tool_call_arr)
         new_calls = result.tool_calls[emitted_count:]
         if not new_calls:
-            content = visible_content()
-            return {"content": content} if content else {"content": delta_text}
+            return {"content": visible_delta} if visible_delta else None
         self.prev_tool_call_arr = result.tool_calls
         response = self._format_streaming_tool_calls(new_calls, emitted_count)
-        content = visible_content()
-        if content:
-            response["content"] = content
+        if visible_delta:
+            response["content"] = visible_delta
         return response
 
 

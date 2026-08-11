@@ -1841,6 +1841,7 @@ mod tests {
     #[test]
     fn packaged_wrapper_embeds_lfm_parser_registration() {
         assert!(WRAPPER_SCRIPT.contains("cocore_lfm_tool_parser"));
+        assert!(WRAPPER_SCRIPT.contains("register_streaming_markers"));
         assert!(LFM_PARSER_SCRIPT.contains("ToolParserManager.register_module(\"lfm\""));
         assert!(LFM_PARSER_SCRIPT.contains("<|tool_call_start|>"));
     }
