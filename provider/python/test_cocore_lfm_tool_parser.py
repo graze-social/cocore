@@ -68,6 +68,26 @@ class LFMToolParserTests(unittest.TestCase):
             "<|tool_call_start|>[delete_everything()]<|tool_call_end|>", TOOLS
         )
         self.assertFalse(unknown.tools_called)
+        self.assertIn("delete_everything", unknown.content or "")
+
+        mixed = LFMToolParser().extract_tool_calls(
+            "<|tool_call_start|>[search(query='ok'), __import__('os').system('x')]<|tool_call_end|>",
+            TOOLS,
+        )
+        self.assertFalse(mixed.tools_called)
+        self.assertIn("__import__", mixed.content or "")
+
+        duplicate = LFMToolParser().extract_tool_calls(
+            "<|tool_call_start|>[search(query='first', query='second')]<|tool_call_end|>",
+            TOOLS,
+        )
+        self.assertFalse(duplicate.tools_called)
+        self.assertIn("query='first'", duplicate.content or "")
+
+        deep = "<|tool_call_start|>[search(filters=" + ("[" * 400) + "0" + ("]" * 400)
+        deep += ")]<|tool_call_end|>"
+        result = LFMToolParser().extract_tool_calls(deep, TOOLS)
+        self.assertFalse(result.tools_called)
 
     def test_strips_thinking_tags(self) -> None:
         result = LFMToolParser().extract_tool_calls(

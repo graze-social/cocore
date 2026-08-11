@@ -91,7 +91,7 @@ class LFMToolParser(ToolParser):
     def _parse_block(cls, block: str, request: dict[str, Any] | None) -> list[dict[str, str]]:
         try:
             expression = ast.parse(block.strip(), mode="eval").body
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError):
             return []
         if not isinstance(expression, ast.List):
             return []
@@ -107,16 +107,20 @@ class LFMToolParser(ToolParser):
         calls: list[dict[str, str]] = []
         for item in expression.elts:
             if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Name):
-                continue
+                return []
             name = item.func.id
             if not name.isidentifier() or keyword.iskeyword(name):
-                continue
+                return []
             if allowed_names is not None and name not in allowed_names:
-                continue
+                return []
             if item.args or any(argument.arg is None for argument in item.keywords):
                 # The wire format has named function arguments. Rejecting
                 # positional args avoids inventing parameter names.
-                continue
+                return []
+            argument_names = [argument.arg for argument in item.keywords]
+            if len(argument_names) != len(set(argument_names)):
+                # Duplicate keyword names have ambiguous wire semantics.
+                return []
             try:
                 arguments = {
                     argument.arg: cls._literal(argument.value)
@@ -129,8 +133,8 @@ class LFMToolParser(ToolParser):
                     separators=(",", ":"),
                     allow_nan=False,
                 )
-            except (TypeError, ValueError, OverflowError):
-                continue
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                return []
             calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex}",
