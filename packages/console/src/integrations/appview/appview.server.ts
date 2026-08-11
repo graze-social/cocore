@@ -205,57 +205,82 @@ const appviewRetrySchedule = Schedule.intersect(
 
 const APPVIEW_STALE_MAX_MS = 10 * 60_000;
 
+/** Transport-level failure (no usable HTTP response, or a response whose body
+ *  never finished arriving). Undici hides the useful part ("fetch failed")
+ *  behind `cause`; surface the syscall code (ENOTFOUND, ECONNREFUSED,
+ *  ETIMEDOUT, …) and the target URL so a Railway private-networking outage is
+ *  diagnosable from the log line alone. `status: 0` marks it transient, so
+ *  `isTransient` retries it and the stale-cache fallback can absorb it. */
+function appviewTransportError(e: unknown, url: string): AppviewFetchError {
+  const message = e instanceof Error ? e.message : String(e);
+  const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+  const detail = cause?.code ?? cause?.message;
+  return new AppviewFetchError({
+    status: 0,
+    message: `${message}${detail ? ` (${detail})` : ""} — GET ${url}`,
+  });
+}
+
 function appviewFetchOnceEffect<T>(url: string): Effect.Effect<T, AppviewFetchError> {
   return Effect.async((resume) => {
-    void fetch(url, {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(APPVIEW_FETCH_TIMEOUT_MS),
-    }).then(
-      async (res) => {
-        const text = await res.text();
-        if (!res.ok) {
-          resume(
-            Effect.fail(
-              new AppviewFetchError({
-                status: res.status,
-                message: text.slice(0, 500) || `HTTP ${res.status}`,
-              }),
-            ),
-          );
-          return;
-        }
-        try {
-          resume(Effect.succeed(JSON.parse(text) as T));
-        } catch (e) {
-          resume(
-            Effect.fail(
-              new AppviewFetchError({
-                status: 500,
-                message: `invalid JSON from AppView: ${(e as Error).message}`,
-              }),
-            ),
-          );
-        }
-      },
-      (e: unknown) => {
-        // Network-level failure (no HTTP response). Undici hides the
-        // useful part ("fetch failed") behind `cause`; surface the
-        // syscall code (ENOTFOUND, ECONNREFUSED, ETIMEDOUT, …) and
-        // the target URL so a Railway private-networking outage is
-        // diagnosable from the log line alone.
-        const message = e instanceof Error ? e.message : String(e);
-        const cause = (e as { cause?: { code?: string; message?: string } }).cause;
-        const detail = cause?.code ?? cause?.message;
+    // Every await below is individually guarded, and the whole body runs
+    // inside one async function whose rejection can't escape.
+    //
+    // The body read is the subtle one. `AbortSignal.timeout` can fire AFTER
+    // the response headers arrive but BEFORE the body finishes streaming, so
+    // `res.text()` rejects with a DOMException TimeoutError. This used to be
+    // written as `.then(onFulfilled, onRejected)`, where the reject arm sees
+    // rejections of the *fetch* promise only — never a throw from inside the
+    // fulfilled handler. That rejection escaped unhandled and took the whole
+    // console process down (Node kills the process on an unhandled rejection),
+    // and `resume` was never called, so the fiber hung too.
+    void (async () => {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(APPVIEW_FETCH_TIMEOUT_MS),
+        });
+      } catch (e) {
+        resume(Effect.fail(appviewTransportError(e, url)));
+        return;
+      }
+
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (e) {
+        // Aborted or truncated mid-body — we have headers but no usable
+        // payload. Same transient class as a failed connect.
+        resume(Effect.fail(appviewTransportError(e, url)));
+        return;
+      }
+
+      if (!res.ok) {
         resume(
           Effect.fail(
             new AppviewFetchError({
-              status: 0,
-              message: `${message}${detail ? ` (${detail})` : ""} — GET ${url}`,
+              status: res.status,
+              message: text.slice(0, 500) || `HTTP ${res.status}`,
             }),
           ),
         );
-      },
-    );
+        return;
+      }
+
+      try {
+        resume(Effect.succeed(JSON.parse(text) as T));
+      } catch (e) {
+        resume(
+          Effect.fail(
+            new AppviewFetchError({
+              status: 500,
+              message: `invalid JSON from AppView: ${(e as Error).message}`,
+            }),
+          ),
+        );
+      }
+    })();
   });
 }
 

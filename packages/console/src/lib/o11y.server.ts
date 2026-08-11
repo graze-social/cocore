@@ -30,6 +30,36 @@ const runtime = makeRuntime(
   AppLayer,
 );
 
+// Don't let one stray promise take the site down. Node's default for an
+// unhandled rejection is to kill the process, so a single unguarded `await`
+// anywhere in the server — in our code or a dependency's — turns into a
+// site-wide outage plus a crash loop. The advisor and the services process
+// have had this guard since their first deploy (infra/advisor/src/main.ts,
+// infra/services/src/main.ts); the console never got one, and on 2026-08-11 a
+// mid-body fetch abort in appview.server.ts crash-looped cocore.dev for it.
+//
+// Log loudly and keep serving: a genuinely wedged process is caught by the
+// Railway healthcheck, and the console is a read-mostly cache over the PDS —
+// staying up degraded beats a restart loop that 500s every request in flight.
+// This module hosts it because it's server-only and every server I/O path
+// imports it, so the handler is installed once, early, without a custom entry.
+//
+// Registered under a symbol so a double module-eval (dev HMR, or the same
+// module loaded through two specifiers) doesn't stack duplicate listeners and
+// trip Node's MaxListenersExceededWarning.
+const GUARDS_INSTALLED = Symbol.for("cocore.console.processGuards");
+
+if (typeof process !== "undefined" && !(GUARDS_INSTALLED in globalThis)) {
+  Object.defineProperty(globalThis, GUARDS_INSTALLED, { value: true });
+  process.on("unhandledRejection", (reason) => {
+    const e = reason instanceof Error ? reason : new Error(String(reason));
+    console.error(`console: unhandledRejection — ${e.message}\n${e.stack ?? ""}`);
+  });
+  process.on("uncaughtException", (e) => {
+    console.error(`console: uncaughtException — ${e.message}\n${e.stack ?? ""}`);
+  });
+}
+
 /** Run a server-side effect wrapped in a root span named for the
  *  operation. Drop-in replacement for `Effect.runPromise(effect)`; the
  *  effect may require any service the runtime provides ({@link AppEnv}). */
