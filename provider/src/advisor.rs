@@ -28,24 +28,506 @@ use crate::pds::{effective_tool_calls, PdsClient, ProBonoPolicy};
 use crate::pricing;
 use crate::protocol::{
     AdvisorMessage, AttestationChallenge, AttestationResponse, ChunkChannel,
-    CodeAttestationResponse, HealthStanding, Heartbeat, InferenceChunk, InferenceComplete,
-    InferenceKeepalive, InferenceRequest, Pong, Register, SessionKey,
+    CodeAttestationResponse, HealthStanding, Heartbeat, InferenceAck, InferenceChunk,
+    InferenceComplete, InferenceKeepalive, InferenceRequest, InferenceResume,
+    InferenceResumeResult, Pong, Register, ResumeStatus, SessionKey,
 };
 use crate::receipt::{self, Money, ReceiptInputs, StrongRef};
 use crate::secure_enclave::SigningIdentity;
 use chrono::Utc;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zeroize::Zeroizing;
 
 pub struct AdvisorClient {
     pub url: String,
+}
+
+pub const STREAM_RESUME_VERSION: u32 = 1;
+const INVOCATION_MAX_COUNT: usize = 64;
+const REPLAY_MAX_FRAMES: usize = 512;
+const REPLAY_MAX_BYTES: usize = 8 * 1024 * 1024;
+const REPLAY_TOTAL_MAX_BYTES: usize = 32 * 1024 * 1024;
+// Slightly longer than the advisor's 30s grace so a late reconnect receives a
+// terminal rejection instead of provider state disappearing first.
+const REPLAY_RETENTION: Duration = Duration::from_secs(45);
+
+#[derive(Clone)]
+pub struct InvocationManager {
+    inner: Arc<InvocationManagerInner>,
+}
+
+struct InvocationManagerInner {
+    jobs: Mutex<HashMap<String, BufferedInvocation>>,
+    changed: broadcast::Sender<()>,
+}
+
+struct BufferedInvocation {
+    resume_token: String,
+    produced_seq: u32,
+    acked_seq: u32,
+    send_seq: u32,
+    chunks: BTreeMap<u32, String>,
+    controls: Option<String>,
+    completion: Option<String>,
+    completion_sent: bool,
+    attached: bool,
+    bytes: usize,
+    task: Option<tokio::task::AbortHandle>,
+    // Monotonic per-detach generation. A retention timer captures the gen it
+    // was armed with and only fires when the job is STILL detached AND the gen
+    // matches — so a second detach (which sets `attached = false` again) can't
+    // let a stale first timer expire the invocation mid-grace. This is NOT
+    // replaceable by storing the timer's `AbortHandle` and aborting on
+    // re-arm (the TS side's `clearTimeout` shape): `abort()` can't stop a
+    // timer that has already woken and is waiting on the jobs lock, so a
+    // reattach→re-detach interleave in that window would still expire the
+    // job early. The generation check is what makes cancellation atomic
+    // under the lock.
+    detach_gen: u64,
+}
+
+#[derive(Clone)]
+struct OwnedServeContext {
+    signer: Arc<dyn SigningIdentity>,
+    encryption: Arc<dyn EncryptionKey>,
+    pds: PdsClient,
+    attestation: Arc<RwLock<Option<StrongRef>>>,
+    engines: EngineRegistry,
+    pro_bono: ProBonoPolicy,
+}
+
+impl OwnedServeContext {
+    fn borrowed(&self) -> ServeContext<'_> {
+        ServeContext {
+            signer: &*self.signer,
+            encryption: &*self.encryption,
+            pds: &self.pds,
+            attestation: self.attestation.clone(),
+            engines: &self.engines,
+            pro_bono: &self.pro_bono,
+        }
+    }
+}
+
+impl Default for InvocationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InvocationManager {
+    pub fn new() -> Self {
+        let (changed, _) = broadcast::channel(32);
+        Self {
+            inner: Arc::new(InvocationManagerInner {
+                jobs: Mutex::new(HashMap::new()),
+                changed,
+            }),
+        }
+    }
+
+    fn jobs(&self) -> MutexGuard<'_, HashMap<String, BufferedInvocation>> {
+        match self.inner.jobs.lock() {
+            Ok(jobs) => jobs,
+            Err(poisoned) => {
+                // A panic while the lock was held may have left a job's
+                // accounting half-updated. Recovery keeps the agent serving,
+                // but must not be silent: the drift is otherwise invisible.
+                tracing::error!(
+                    "invocation manager lock poisoned; continuing with recovered state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn notify(&self) {
+        let _ = self.inner.changed.send(());
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.inner.changed.subscribe()
+    }
+
+    pub fn has_active(&self) -> bool {
+        !self.jobs().is_empty()
+    }
+
+    /// Accepts a resumable request, or returns it back to the caller when it
+    /// was refused at the invocation cap so the serve loop can answer the
+    /// requester with a sealed error instead of leaving the job to hang. A
+    /// duplicate `session_id` is ignored WITHOUT a reply on purpose: an error
+    /// completion for that id would terminate the live original on the
+    /// advisor.
+    fn start(&self, req: InferenceRequest, ctx: OwnedServeContext) -> Option<InferenceRequest> {
+        let resume_token = req.resume_token.clone()?;
+        let session_id = req.session_id.clone();
+        {
+            let mut jobs = self.jobs();
+            if jobs.contains_key(&session_id) {
+                tracing::warn!(session = %session_id, "ignored duplicate resumable inference request");
+                return None;
+            }
+            if jobs.len() >= INVOCATION_MAX_COUNT {
+                tracing::error!(session = %session_id, "resumable invocation limit reached; refusing job");
+                return Some(req);
+            }
+            jobs.insert(
+                session_id.clone(),
+                BufferedInvocation {
+                    resume_token,
+                    produced_seq: 0,
+                    acked_seq: 0,
+                    send_seq: 0,
+                    chunks: BTreeMap::new(),
+                    controls: None,
+                    completion: None,
+                    completion_sent: false,
+                    attached: true,
+                    bytes: 0,
+                    task: None,
+                    detach_gen: 0,
+                },
+            );
+        }
+
+        let manager = self.clone();
+        let task_session = session_id.clone();
+        let task = tokio::spawn(async move {
+            let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
+            let borrowed = ctx.borrowed();
+            let job = std::panic::AssertUnwindSafe(handle_inference_request_live(
+                req, &borrowed, live_tx,
+            ))
+            .catch_unwind();
+            tokio::pin!(job);
+            let replies = loop {
+                tokio::select! {
+                    Some(payload) = live_rx.recv() => {
+                        if !manager.buffer_payload(&task_session, payload) {
+                            return;
+                        }
+                    }
+                    replies = &mut job => break replies,
+                }
+            };
+            while let Ok(payload) = live_rx.try_recv() {
+                if !manager.buffer_payload(&task_session, payload) {
+                    return;
+                }
+            }
+            match replies {
+                Ok(replies) => {
+                    for reply in replies {
+                        if !manager.buffer_message(&task_session, reply) {
+                            return;
+                        }
+                    }
+                    manager.discard_if_incomplete(&task_session);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        session = %task_session,
+                        "resumable job panicked; isolated it from the serve loop"
+                    );
+                    manager.jobs().remove(&task_session);
+                }
+            }
+        });
+        if let Some(job) = self.jobs().get_mut(&session_id) {
+            job.task = Some(task.abort_handle());
+        }
+        self.notify();
+        None
+    }
+
+    fn discard_if_incomplete(&self, session_id: &str) {
+        let mut jobs = self.jobs();
+        if jobs
+            .get(session_id)
+            .is_some_and(|job| job.completion.is_none())
+        {
+            jobs.remove(session_id);
+        }
+    }
+
+    fn buffer_payload(&self, session_id: &str, payload: String) -> bool {
+        match serde_json::from_str::<AdvisorMessage>(&payload) {
+            Ok(message) => self.buffer_message(session_id, message),
+            Err(error) => {
+                // An undecodable frame can't be classified, so skipping it
+                // could leave a silent hole in the chunk sequence. Fail the
+                // whole invocation terminally instead.
+                tracing::error!(session = %session_id, %error, "invalid buffered frame; failing invocation");
+                let mut jobs = self.jobs();
+                if let Some(job) = jobs.get_mut(session_id) {
+                    Self::fail_terminal(job, session_id);
+                }
+                drop(jobs);
+                self.notify();
+                false
+            }
+        }
+    }
+
+    /// Replace a failed invocation's future output with a synthetic terminal
+    /// completion (zero tokens, no receipt, `final_seq` = chunks produced so
+    /// far) so the requester's stream still ends — after the already-buffered
+    /// chunks replay — instead of hanging until the advisor's idle timeout.
+    fn fail_terminal(job: &mut BufferedInvocation, session_id: &str) {
+        let completion = AdvisorMessage::InferenceComplete(InferenceComplete {
+            session_id: session_id.to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            receipt_uri: String::new(),
+            final_seq: Some(job.produced_seq),
+            receipt_commit_rev: None,
+            receipt_commit_cid: None,
+        });
+        if let Ok(payload) = serde_json::to_string(&completion) {
+            job.bytes = job.bytes.saturating_add(payload.len());
+            job.completion = Some(payload);
+            job.completion_sent = false;
+        }
+    }
+
+    fn buffer_message(&self, session_id: &str, mut message: AdvisorMessage) -> bool {
+        let mut jobs = self.jobs();
+        let total_bytes: usize = jobs.values().map(|job| job.bytes).sum();
+        let Some(job) = jobs.get_mut(session_id) else {
+            return false;
+        };
+        if let AdvisorMessage::InferenceComplete(complete) = &mut message {
+            complete.final_seq = Some(job.produced_seq);
+        }
+        let payload = match serde_json::to_string(&message) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // Skipping just this frame would leave a hole in the
+                // sequence; end the invocation with a terminal completion.
+                tracing::error!(session = %session_id, %error, "could not serialize replay frame; failing invocation");
+                Self::fail_terminal(job, session_id);
+                drop(jobs);
+                self.notify();
+                return false;
+            }
+        };
+        let payload_bytes = payload.len();
+        let frame_count = job.chunks.len() + usize::from(job.completion.is_some());
+        if frame_count >= REPLAY_MAX_FRAMES
+            || job.bytes.saturating_add(payload_bytes) > REPLAY_MAX_BYTES
+            || total_bytes.saturating_add(payload_bytes) > REPLAY_TOTAL_MAX_BYTES
+        {
+            // Everything buffered so far is still contiguous and replayable
+            // (the limits stop growth, they never evict), so a synthetic
+            // completion lets the advisor drain the buffer and terminate the
+            // requester's stream instead of the job silently vanishing.
+            tracing::error!(session = %session_id, "resume replay buffer limit exceeded; failing invocation with a terminal completion");
+            Self::fail_terminal(job, session_id);
+            drop(jobs);
+            self.notify();
+            return false;
+        }
+        match message {
+            AdvisorMessage::InferenceChunk(chunk) => {
+                if chunk.seq != job.produced_seq {
+                    tracing::error!(session = %session_id, expected = job.produced_seq, got = chunk.seq, "non-monotonic provider chunk sequence; failing invocation");
+                    Self::fail_terminal(job, session_id);
+                    drop(jobs);
+                    self.notify();
+                    return false;
+                }
+                job.produced_seq = job.produced_seq.saturating_add(1);
+                job.bytes = job.bytes.saturating_add(payload_bytes);
+                job.chunks.insert(chunk.seq, payload);
+            }
+            AdvisorMessage::InferenceComplete(_) => {
+                job.bytes = job.bytes.saturating_add(payload_bytes);
+                job.completion = Some(payload);
+            }
+            AdvisorMessage::InferenceKeepalive(_) => {
+                if job.attached {
+                    job.controls = Some(payload);
+                }
+            }
+            _ => return true,
+        }
+        drop(jobs);
+        self.notify();
+        true
+    }
+
+    fn resume_frames(&self) -> Vec<String> {
+        self.jobs()
+            .iter()
+            .filter_map(|(session_id, job)| {
+                serde_json::to_string(&AdvisorMessage::InferenceResume(InferenceResume {
+                    session_id: session_id.clone(),
+                    resume_token: job.resume_token.clone(),
+                    produced_seq: job.produced_seq,
+                }))
+                .ok()
+            })
+            .collect()
+    }
+
+    fn handle_resume_result(&self, result: InferenceResumeResult) {
+        let mut jobs = self.jobs();
+        let Some(job) = jobs.get_mut(&result.session_id) else {
+            return;
+        };
+        if job.resume_token != result.resume_token {
+            return;
+        }
+        match result.status {
+            ResumeStatus::Resume if result.next_seq <= job.produced_seq => {
+                Self::ack_chunks(job, result.next_seq);
+                job.send_seq = result.next_seq;
+                job.completion_sent = false;
+                job.attached = true;
+            }
+            ResumeStatus::Resume => {
+                // The advisor claims to have accepted more chunks than we
+                // produced. That's a protocol violation (advisor state
+                // corruption or version skew), not a legitimate rejection —
+                // cancel like one, but say so loudly.
+                tracing::error!(
+                    session = %result.session_id,
+                    next_seq = result.next_seq,
+                    produced_seq = job.produced_seq,
+                    "advisor resume next_seq exceeds produced_seq; protocol violation, cancelling job"
+                );
+                if let Some(task) = job.task.take() {
+                    task.abort();
+                }
+                jobs.remove(&result.session_id);
+            }
+            ResumeStatus::Completed | ResumeStatus::Rejected => {
+                if let Some(task) = job.task.take() {
+                    task.abort();
+                }
+                jobs.remove(&result.session_id);
+            }
+        }
+        drop(jobs);
+        self.notify();
+    }
+
+    fn acknowledge(&self, ack: InferenceAck) {
+        let mut jobs = self.jobs();
+        let Some(job) = jobs.get_mut(&ack.session_id) else {
+            return;
+        };
+        if job.resume_token != ack.resume_token
+            || ack.next_seq < job.acked_seq
+            || ack.next_seq > job.produced_seq
+        {
+            return;
+        }
+        if ack.completed {
+            if job.completion.is_none() || ack.next_seq != job.produced_seq {
+                return;
+            }
+            if let Some(task) = job.task.take() {
+                task.abort();
+            }
+            jobs.remove(&ack.session_id);
+            return;
+        }
+        Self::ack_chunks(job, ack.next_seq);
+    }
+
+    fn ack_chunks(job: &mut BufferedInvocation, next_seq: u32) {
+        let removed: Vec<u32> = job.chunks.range(..next_seq).map(|(seq, _)| *seq).collect();
+        for seq in removed {
+            if let Some(payload) = job.chunks.remove(&seq) {
+                job.bytes = job.bytes.saturating_sub(payload.len());
+            }
+        }
+        job.acked_seq = next_seq;
+        job.send_seq = job.send_seq.max(next_seq);
+    }
+
+    fn drain(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for job in self.jobs().values_mut().filter(|job| job.attached) {
+            if let Some(control) = job.controls.take() {
+                out.push(control);
+            }
+            for (&seq, payload) in job.chunks.range(job.send_seq..) {
+                out.push(payload.clone());
+                job.send_seq = seq.saturating_add(1);
+            }
+            if !job.completion_sent && job.send_seq >= job.produced_seq {
+                if let Some(completion) = &job.completion {
+                    out.push(completion.clone());
+                    job.completion_sent = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// Detach every job from the (gone) connection and arm a per-job
+    /// retention timer. Expiry drops the replay state and aborts the async
+    /// wrapper task — but `abort()` cannot preempt an engine call already
+    /// running on the blocking pool; that thread runs to natural completion
+    /// (its frames just have nowhere to go), so the inference slot is only
+    /// truly reclaimed when generation ends.
+    fn detach_all(&self) {
+        let sessions: Vec<(String, String, u64)> = {
+            let mut jobs = self.jobs();
+            jobs.iter_mut()
+                .map(|(session_id, job)| {
+                    job.attached = false;
+                    job.send_seq = job.acked_seq;
+                    job.completion_sent = false;
+                    job.detach_gen = job.detach_gen.wrapping_add(1);
+                    (session_id.clone(), job.resume_token.clone(), job.detach_gen)
+                })
+                .collect()
+        };
+        for (session_id, resume_token, detach_gen) in sessions {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(REPLAY_RETENTION).await;
+                let mut jobs = manager.jobs();
+                let expire = jobs.get(&session_id).is_some_and(|job| {
+                    !job.attached
+                        && job.resume_token == resume_token
+                        && job.detach_gen == detach_gen
+                });
+                if expire {
+                    if let Some(mut job) = jobs.remove(&session_id) {
+                        if let Some(task) = job.task.take() {
+                            task.abort();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.jobs().len()
+    }
+}
+
+struct ConnectionAttachment(InvocationManager);
+
+impl Drop for ConnectionAttachment {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
 }
 
 /// Owns a [`GenerateRequest`] for the duration of a `spawn_blocking`
@@ -114,8 +596,8 @@ impl AdvisorClient {
     pub async fn run(
         &self,
         mut register: Register,
-        signer: &dyn SigningIdentity,
-        encryption: &dyn EncryptionKey,
+        signer: &Arc<dyn SigningIdentity>,
+        encryption: &Arc<dyn EncryptionKey>,
         pds: &PdsClient,
         // Shared, refreshable attestation cell (see `ServeContext`). Cloned
         // from `cmd_serve`, which also hands a clone to the refresh task; on
@@ -159,6 +641,7 @@ impl AdvisorClient {
         // restart engines when they actually change effective behavior.
         tool_calls_at_start: bool,
         tool_calls_env_override: Option<bool>,
+        invocations: &InvocationManager,
     ) -> Result<()> {
         // Reject a plaintext advisor URL before we connect. A `ws://` link lets
         // a network attacker read/inject job dispatch and control frames
@@ -238,6 +721,13 @@ impl AdvisorClient {
             .await
             .map_err(|e| ProviderError::Advisor(e.to_string()))?;
         tracing::info!("registered with advisor");
+        let _attachment = ConnectionAttachment(invocations.clone());
+        for resume in invocations.resume_frames() {
+            write
+                .send(Message::Text(resume.into()))
+                .await
+                .map_err(|e| ProviderError::Advisor(e.to_string()))?;
+        }
         // A fresh, successful registration is a clean slate — clear any
         // stale "bad standing" marker from a previous serve so the tray's
         // red ping doesn't linger after the machine has recovered.
@@ -275,9 +765,17 @@ impl AdvisorClient {
             }
         }
 
+        let owned_ctx = OwnedServeContext {
+            signer: signer.clone(),
+            encryption: encryption.clone(),
+            pds: pds.clone(),
+            attestation: attestation.clone(),
+            engines: engines.clone(),
+            pro_bono: pro_bono.clone(),
+        };
         let ctx = ServeContext {
-            signer,
-            encryption,
+            signer: signer.as_ref(),
+            encryption: encryption.as_ref(),
             pds,
             attestation,
             engines,
@@ -364,6 +862,7 @@ impl AdvisorClient {
         // the blocking engine thread forwards plaintext deltas here and
         // the async side seals + writes them to the advisor immediately.
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+        let mut invocation_events = invocations.subscribe();
         // When this connection began. After a sustained clean uptime we
         // clear the crash counter (below) so a future "N crashes recently"
         // distinguishes a flapping machine from one that hiccuped once long
@@ -598,6 +1097,15 @@ impl AdvisorClient {
                     }
                     tracing::info!("self-right succeeded; cleared bad-standing");
                 }
+                event = invocation_events.recv() => {
+                    // Lag is harmless: drain() reads authoritative buffered state.
+                    let _ = event;
+                    for payload in invocations.drain() {
+                        write.send(Message::Text(payload.into()))
+                            .await
+                            .map_err(|e| ProviderError::Advisor(e.to_string()))?;
+                    }
+                }
                 Some(payload) = outbound_rx.recv() => {
                     write.send(Message::Text(payload.into()))
                         .await
@@ -612,7 +1120,12 @@ impl AdvisorClient {
                 Some(payload) = next_push(&mut push_rx) => {
                     // Bind our measured cdHash (the value we registered) into the
                     // signed code-attestation, so the proof is tied to this binary.
-                    match handle_code_challenge_payload(encryption, signer, &payload, my_cd_hash.as_deref()) {
+                    match handle_code_challenge_payload(
+                        encryption.as_ref(),
+                        signer.as_ref(),
+                        &payload,
+                        my_cd_hash.as_deref(),
+                    ) {
                         Ok(Some(resp)) => {
                             match serde_json::to_string(&AdvisorMessage::CodeAttestationResponse(resp)) {
                                 Ok(s) => {
@@ -670,6 +1183,19 @@ impl AdvisorClient {
                                     match h.standing {
                                         HealthStanding::Bad => write_bad_standing(h.reason.as_deref()),
                                         HealthStanding::Ok => clear_bad_standing(),
+                                    }
+                                }
+                                Ok(AdvisorMessage::InferenceResumeResult(result)) => {
+                                    invocations.handle_resume_result(result);
+                                }
+                                Ok(AdvisorMessage::InferenceAck(ack)) => {
+                                    invocations.acknowledge(ack);
+                                }
+                                Ok(AdvisorMessage::InferenceRequest(req)) if req.resume_token.is_some() => {
+                                    if let Some(refused) = invocations.start(req, owned_ctx.clone()) {
+                                        for frame in refusal_frames(&refused, &*owned_ctx.encryption) {
+                                            let _ = outbound_tx.send(frame);
+                                        }
                                     }
                                 }
                                 Ok(AdvisorMessage::ControlChanged(_)) => {
@@ -1213,6 +1739,12 @@ async fn handle_inbound(text: &str, ctx: &ServeContext<'_>) -> Result<Vec<Adviso
         | AdvisorMessage::InferenceChunk(_)
         | AdvisorMessage::InferenceKeepalive(_)
         | AdvisorMessage::InferenceComplete(_)
+        // ResumeResult/Ack will be intercepted by the transport-independent
+        // job manager once that capability is enabled. Until then the provider
+        // does not advertise support and safely ignores unexpected frames.
+        | AdvisorMessage::InferenceResume(_)
+        | AdvisorMessage::InferenceResumeResult(_)
+        | AdvisorMessage::InferenceAck(_)
         | AdvisorMessage::AttestationResponse(_)
         | AdvisorMessage::Ping(_)
         | AdvisorMessage::Pong(_)
@@ -1247,6 +1779,42 @@ fn push_frame(
     } else {
         collected.push(msg);
     }
+}
+
+/// Sealed refusal for a job the provider cannot take at all (e.g. the
+/// resumable-invocation cap): one error chunk the requester can decrypt plus
+/// a terminal completion, so the refused job fails fast instead of hanging
+/// until the advisor's idle timeout. `final_seq` is 1 because exactly one
+/// chunk (seq 0) precedes the completion.
+fn refusal_frames(req: &InferenceRequest, encryption: &dyn EncryptionKey) -> Vec<String> {
+    let err = "[cocore provider] this machine is at its concurrent job limit and cannot take this request; please retry.";
+    let ciphertext = match encryption.seal_to(&req.requester_pub_key, err.as_bytes()) {
+        Ok(ct) => ct,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id = %req.session_id, "failed to seal refusal error");
+            return Vec::new();
+        }
+    };
+    [
+        AdvisorMessage::InferenceChunk(InferenceChunk {
+            session_id: req.session_id.clone(),
+            seq: 0,
+            channel: ChunkChannel::Content,
+            ciphertext,
+        }),
+        AdvisorMessage::InferenceComplete(InferenceComplete {
+            session_id: req.session_id.clone(),
+            tokens_in: 0,
+            tokens_out: 0,
+            receipt_uri: String::new(),
+            final_seq: Some(1),
+            receipt_commit_rev: None,
+            receipt_commit_cid: None,
+        }),
+    ]
+    .into_iter()
+    .filter_map(|m| serde_json::to_string(&m).ok())
+    .collect()
 }
 
 /// Production path: stream chunks to the advisor while generation runs.
@@ -1355,6 +1923,7 @@ async fn handle_inference_request_inner(
                         tokens_in: 0,
                         tokens_out: 0,
                         receipt_uri: String::new(),
+                        final_seq: None,
                         receipt_commit_rev: None,
                         receipt_commit_cid: None,
                     }),
@@ -1445,6 +2014,7 @@ async fn handle_inference_request_inner(
                     tokens_in: 0,
                     tokens_out: 0,
                     receipt_uri: String::new(),
+                    final_seq: None,
                     receipt_commit_rev: None,
                     receipt_commit_cid: None,
                 }),
@@ -1725,6 +2295,7 @@ async fn handle_inference_request_inner(
             tokens_in: tokens_in.try_into().unwrap_or(u32::MAX),
             tokens_out: tokens_out.try_into().unwrap_or(u32::MAX),
             receipt_uri,
+            final_seq: None,
             receipt_commit_rev,
             receipt_commit_cid,
         }),
@@ -2294,7 +2865,7 @@ mod tests {
     use crate::engines::stub::StubEngine;
     use crate::oauth::Session;
     use crate::secure_enclave::{identity_lock, load_or_create_identity};
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
     use p256::EncodedPoint;
 
@@ -2349,6 +2920,445 @@ mod tests {
             engines,
             pro_bono: off_pro_bono(),
         }
+    }
+
+    struct CountingEngine(std::sync::atomic::AtomicUsize);
+
+    impl Engine for CountingEngine {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+
+        fn generate_once(
+            &self,
+            _request: &crate::engines::GenerateRequest,
+        ) -> anyhow::Result<crate::engines::GenerateResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(crate::engines::GenerateResponse {
+                text: "one invocation".into(),
+                tokens_in: 1,
+                tokens_out: 2,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resumable_manager_runs_the_engine_once_across_transport_replay() {
+        let signer: Arc<dyn SigningIdentity> = Arc::from(load_or_create_identity().unwrap());
+        let provider_key: Arc<dyn EncryptionKey> = Arc::new(fresh_keypair());
+        let requester_key = fresh_keypair();
+        let ciphertext = requester_key
+            .seal_to(&provider_key.public_key_b64(), b"hello")
+            .unwrap();
+        let engine = Arc::new(CountingEngine(std::sync::atomic::AtomicUsize::new(0)));
+        let mut engines = EngineRegistry::new();
+        engines.register("counting", engine.clone());
+        let ctx = OwnedServeContext {
+            signer,
+            encryption: provider_key,
+            pds: fake_pds(),
+            attestation: Arc::new(RwLock::new(None)),
+            engines,
+            pro_bono: ProBonoPolicy::default(),
+        };
+        let manager = InvocationManager::new();
+        let mut changed = manager.subscribe();
+        manager.start(
+            InferenceRequest {
+                job_uri: "at://job".into(),
+                job_cid: None,
+                requester_did: "did:plc:requester".into(),
+                requester_pub_key: requester_key.public_key_b64(),
+                model: "counting".into(),
+                max_tokens_out: 8,
+                ciphertext,
+                input_format: None,
+                session_id: "session-once".into(),
+                resume_token: Some("token-once".into()),
+                nonce: None,
+                attestation_cid: None,
+                output_schema: None,
+                tools: None,
+                tool_choice: None,
+                tool_choice_function: None,
+                brokerage_countersignature: None,
+            },
+            ctx,
+        );
+        // Drop transport during prefill; generation continues in the manager.
+        manager.detach_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .jobs()
+                    .get("session-once")
+                    .is_some_and(|job| job.completion.is_some())
+                {
+                    break;
+                }
+                let _ = changed.recv().await;
+            }
+        })
+        .await
+        .expect("job completes");
+        assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager.drain().is_empty());
+
+        manager.handle_resume_result(InferenceResumeResult {
+            session_id: "session-once".into(),
+            resume_token: "token-once".into(),
+            status: ResumeStatus::Resume,
+            next_seq: 0,
+            reason: None,
+        });
+        assert!(!manager.drain().is_empty());
+        assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invocation_manager_replays_only_unacknowledged_frames_and_finishes_once() {
+        let manager = InvocationManager::new();
+        manager.jobs().insert(
+            "session-r".into(),
+            BufferedInvocation {
+                resume_token: "token-r".into(),
+                produced_seq: 0,
+                acked_seq: 0,
+                send_seq: 0,
+                chunks: BTreeMap::new(),
+                controls: None,
+                completion: None,
+                completion_sent: false,
+                attached: true,
+                bytes: 0,
+                task: None,
+                detach_gen: 0,
+            },
+        );
+        for seq in 0..2 {
+            assert!(manager.buffer_message(
+                "session-r",
+                AdvisorMessage::InferenceChunk(InferenceChunk {
+                    session_id: "session-r".into(),
+                    seq,
+                    channel: ChunkChannel::Content,
+                    ciphertext: vec![seq as u8],
+                }),
+            ));
+        }
+        assert!(manager.buffer_message(
+            "session-r",
+            AdvisorMessage::InferenceComplete(InferenceComplete {
+                session_id: "session-r".into(),
+                tokens_in: 1,
+                tokens_out: 2,
+                receipt_uri: "at://receipt/one".into(),
+                final_seq: None,
+                receipt_commit_rev: None,
+                receipt_commit_cid: None,
+            }),
+        ));
+        assert_eq!(manager.drain().len(), 3);
+        manager.acknowledge(InferenceAck {
+            session_id: "session-r".into(),
+            resume_token: "token-r".into(),
+            next_seq: 1,
+            completed: false,
+        });
+        manager.detach_all();
+        assert!(manager.drain().is_empty());
+        manager.handle_resume_result(InferenceResumeResult {
+            session_id: "session-r".into(),
+            resume_token: "token-r".into(),
+            status: ResumeStatus::Resume,
+            next_seq: 1,
+            reason: None,
+        });
+        let replay = manager.drain();
+        assert_eq!(replay.len(), 2);
+        assert!(replay[0].contains(r#""seq":1"#));
+        assert!(replay[1].contains(r#""final_seq":2"#));
+        manager.acknowledge(InferenceAck {
+            session_id: "session-r".into(),
+            resume_token: "token-r".into(),
+            next_seq: 2,
+            completed: true,
+        });
+        assert_eq!(manager.len(), 0);
+    }
+
+    /// A minimal live job entry for direct `InvocationManager` tests.
+    fn bare_job(resume_token: &str) -> BufferedInvocation {
+        BufferedInvocation {
+            resume_token: resume_token.into(),
+            produced_seq: 0,
+            acked_seq: 0,
+            send_seq: 0,
+            chunks: BTreeMap::new(),
+            controls: None,
+            completion: None,
+            completion_sent: false,
+            attached: true,
+            bytes: 0,
+            task: None,
+            detach_gen: 0,
+        }
+    }
+
+    fn resumable_req(session_id: &str, requester: &ProviderKeypair) -> InferenceRequest {
+        InferenceRequest {
+            job_uri: "at://job".into(),
+            job_cid: None,
+            requester_did: "did:plc:requester".into(),
+            requester_pub_key: requester.public_key_b64(),
+            model: "stub".into(),
+            max_tokens_out: 8,
+            ciphertext: Vec::new(),
+            input_format: None,
+            session_id: session_id.into(),
+            resume_token: Some("token".into()),
+            nonce: None,
+            attestation_cid: None,
+            output_schema: None,
+            tools: None,
+            tool_choice: None,
+            tool_choice_function: None,
+            brokerage_countersignature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_buffer_overflow_fails_the_job_with_a_terminal_completion() {
+        let manager = InvocationManager::new();
+        manager
+            .jobs()
+            .insert("session-full".into(), bare_job("token-full"));
+        let chunk = |seq: u32| {
+            AdvisorMessage::InferenceChunk(InferenceChunk {
+                session_id: "session-full".into(),
+                seq,
+                channel: ChunkChannel::Content,
+                ciphertext: vec![0],
+            })
+        };
+        for seq in 0..REPLAY_MAX_FRAMES as u32 {
+            assert!(manager.buffer_message("session-full", chunk(seq)));
+        }
+        // The frame over the cap stops the pump…
+        assert!(!manager.buffer_message("session-full", chunk(REPLAY_MAX_FRAMES as u32)));
+        // …but the job survives with a synthetic terminal completion so the
+        // requester's stream still ends after the buffered chunks replay,
+        // instead of the invocation silently vanishing.
+        let jobs = manager.jobs();
+        let job = jobs.get("session-full").expect("job retained");
+        let completion = job.completion.as_ref().expect("terminal completion");
+        assert!(
+            completion.contains(r#""final_seq":512"#),
+            "got: {completion}"
+        );
+        assert!(
+            completion.contains(r#""tokens_out":0"#),
+            "got: {completion}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_ahead_of_produced_seq_cancels_as_protocol_violation() {
+        let manager = InvocationManager::new();
+        manager
+            .jobs()
+            .insert("session-skew".into(), bare_job("token-skew"));
+        // The advisor claims a high-water mark for chunks we never produced.
+        manager.handle_resume_result(InferenceResumeResult {
+            session_id: "session-skew".into(),
+            resume_token: "token-skew".into(),
+            status: ResumeStatus::Resume,
+            next_seq: 3,
+            reason: None,
+        });
+        assert_eq!(manager.len(), 0, "corrupt resume must cancel the job");
+    }
+
+    #[tokio::test]
+    async fn start_at_capacity_returns_the_request_but_ignores_duplicates() {
+        let signer: Arc<dyn SigningIdentity> = Arc::from(load_or_create_identity().unwrap());
+        let requester = fresh_keypair();
+        let ctx = OwnedServeContext {
+            signer,
+            encryption: Arc::new(fresh_keypair()),
+            pds: fake_pds(),
+            attestation: Arc::new(RwLock::new(None)),
+            engines: stub_registry(),
+            pro_bono: ProBonoPolicy::default(),
+        };
+        let manager = InvocationManager::new();
+        {
+            let mut jobs = manager.jobs();
+            for i in 0..INVOCATION_MAX_COUNT {
+                jobs.insert(format!("session-{i}"), bare_job("token"));
+            }
+        }
+        // A duplicate of a live session is swallowed (an error reply would
+        // terminate the live original on the advisor)…
+        assert!(manager
+            .start(resumable_req("session-0", &requester), ctx.clone())
+            .is_none());
+        // …while a refusal at the cap hands the request back so the serve
+        // loop can answer with a sealed error instead of silence.
+        let refused = manager.start(resumable_req("session-new", &requester), ctx);
+        assert_eq!(
+            refused.map(|req| req.session_id).as_deref(),
+            Some("session-new")
+        );
+        assert_eq!(manager.len(), INVOCATION_MAX_COUNT);
+    }
+
+    /// Provider half of the shared stream-resume state-machine vectors
+    /// (fixtures/stream-resume-vectors.json). The advisor half lives in
+    /// infra/advisor/src/resume-vectors.test.ts; both consume the same
+    /// numbers so the two hand-written implementations cannot drift apart.
+    #[tokio::test]
+    async fn provider_side_matches_shared_resume_vectors() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/stream-resume-vectors.json");
+        let vectors: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for v in vectors["resume"].as_array().unwrap() {
+            let name = v["name"].as_str().unwrap();
+            let manager = InvocationManager::new();
+            let produced = v["producedSeq"]
+                .as_u64()
+                .or_else(|| v["providerProducedSeq"].as_u64())
+                .unwrap() as u32;
+            manager.jobs().insert("s".into(), bare_job("tok"));
+            for seq in 0..produced {
+                assert!(manager.buffer_message(
+                    "s",
+                    AdvisorMessage::InferenceChunk(InferenceChunk {
+                        session_id: "s".into(),
+                        seq,
+                        channel: ChunkChannel::Content,
+                        ciphertext: vec![seq as u8],
+                    }),
+                ));
+            }
+            manager.detach_all();
+            let status = match v["status"]
+                .as_str()
+                .or_else(|| v["resultStatus"].as_str())
+                .unwrap()
+            {
+                "resume" => ResumeStatus::Resume,
+                "rejected" => ResumeStatus::Rejected,
+                other => panic!("unknown status in vector {name}: {other}"),
+            };
+            let next_seq = v["nextSeq"]
+                .as_u64()
+                .or_else(|| v["resultNextSeq"].as_u64())
+                .unwrap() as u32;
+            manager.handle_resume_result(InferenceResumeResult {
+                session_id: "s".into(),
+                resume_token: "tok".into(),
+                status,
+                next_seq,
+                reason: None,
+            });
+            let keeps = v["providerKeepsJob"].as_bool().unwrap_or(true);
+            assert_eq!(manager.len(), usize::from(keeps), "{name}");
+            if let Some(replays) = v["providerReplaysSeqs"].as_array() {
+                let want: Vec<u64> = replays.iter().map(|s| s.as_u64().unwrap()).collect();
+                let got: Vec<u64> = manager
+                    .drain()
+                    .iter()
+                    .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+                    .filter_map(|f| f["seq"].as_u64())
+                    .collect();
+                assert_eq!(got, want, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_frames_carry_a_sealed_error_chunk_and_terminal_completion() {
+        let provider = fresh_keypair();
+        let requester = fresh_keypair();
+        let frames = refusal_frames(&resumable_req("session-refused", &requester), &provider);
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames[0].contains(r#""type":"inference_chunk""#),
+            "got: {}",
+            frames[0]
+        );
+        assert!(frames[0].contains(r#""seq":0"#));
+        assert!(
+            frames[1].contains(r#""type":"inference_complete""#),
+            "got: {}",
+            frames[1]
+        );
+        assert!(frames[1].contains(r#""final_seq":1"#));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_detach_keeps_the_latest_retention_window() {
+        // A second detach (provider reconnected then dropped again) must not
+        // let the FIRST retention timer expire the invocation early. The
+        // timer is generation-fenced: only the latest detach's timer fires.
+        let manager = InvocationManager::new();
+        manager.jobs().insert(
+            "session-gen".into(),
+            BufferedInvocation {
+                resume_token: "token-gen".into(),
+                produced_seq: 0,
+                acked_seq: 0,
+                send_seq: 0,
+                chunks: BTreeMap::new(),
+                controls: None,
+                completion: None,
+                completion_sent: false,
+                attached: true,
+                bytes: 0,
+                task: None,
+                detach_gen: 0,
+            },
+        );
+        // T=0: first detach arms timer1 (gen 1, fires at T=45).
+        manager.detach_all();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // T=10: reattach, then detach again → timer2 (gen 2, fires at T=55).
+        manager.handle_resume_result(InferenceResumeResult {
+            session_id: "session-gen".into(),
+            resume_token: "token-gen".into(),
+            status: ResumeStatus::Resume,
+            next_seq: 0,
+            reason: None,
+        });
+        manager.detach_all();
+        // Advance to T=46: timer1 has fired but the gen guard no-ops it; the
+        // job survives. Without the guard the stale timer would have removed
+        // the invocation before the second window opened.
+        tokio::time::advance(Duration::from_secs(36)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            manager.len(),
+            1,
+            "stale first timer must not expire the job before the latest window"
+        );
+        // Clean up via an explicit rejection rather than waiting for timer2.
+        manager.handle_resume_result(InferenceResumeResult {
+            session_id: "session-gen".into(),
+            resume_token: "token-gen".into(),
+            status: ResumeStatus::Rejected,
+            next_seq: 0,
+            reason: Some("test-cleanup".into()),
+        });
+        assert_eq!(manager.len(), 0);
     }
 
     #[test]
@@ -2654,6 +3664,7 @@ mod tests {
             ciphertext: ct,
             input_format: None,
             session_id: "session-1".into(),
+            resume_token: None,
             nonce: None,
             attestation_cid: None,
             output_schema: None,
@@ -2713,6 +3724,7 @@ mod tests {
             ciphertext: vec![0u8; 64],
             input_format: None,
             session_id: "bad".into(),
+            resume_token: None,
             nonce: None,
             attestation_cid: None,
             output_schema: None,
@@ -2755,6 +3767,7 @@ mod tests {
             ciphertext: ct,
             input_format: None,
             session_id: "publish-fails".into(),
+            resume_token: None,
             nonce: None,
             attestation_cid: None,
             output_schema: None,

@@ -28,6 +28,14 @@ pub enum AdvisorMessage {
     InferenceKeepalive(InferenceKeepalive),
     /// Provider → advisor: terminal completion notice.
     InferenceComplete(InferenceComplete),
+    /// Provider → advisor after reconnect: ask to reattach one still-running
+    /// invocation and learn the advisor's accepted sequence high-water mark.
+    InferenceResume(InferenceResume),
+    /// Advisor → provider: result of a resume handshake.
+    InferenceResumeResult(InferenceResumeResult),
+    /// Advisor → provider: accepted chunk/completion high-water mark. The
+    /// provider retains replay state until this acknowledges it.
+    InferenceAck(InferenceAck),
     /// Advisor → provider: nonce-based attestation challenge.
     AttestationChallenge(AttestationChallenge),
     /// Provider → advisor: signed challenge response.
@@ -225,6 +233,11 @@ pub struct Register {
     /// X25519 agent keeps working. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enc_scheme: Option<String>,
+    /// Highest stream-resume protocol version this provider supports. Versioned
+    /// so future incompatible handshakes fail closed. Absent means legacy
+    /// fail-fast disconnect handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_resume_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +285,10 @@ pub struct InferenceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_format: Option<String>,
     pub session_id: String,
+    /// Advisor-generated, unguessable token fencing resume/ack frames to this
+    /// exact dispatch. Present only for stream-resume-capable jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<String>,
     /// Confidential tier: the requester's fresh nonce. When present, the
     /// provider mints a per-request ephemeral key and returns a `SessionKey`
     /// signed over this nonce before serving. Additive — absent = best-effort.
@@ -396,6 +413,10 @@ pub struct InferenceComplete {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub receipt_uri: String, // at:// where the receipt was published
+    /// Number of chunks produced by this invocation. Resume-capable providers
+    /// set it so completion cannot race ahead of a missing chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_seq: Option<u32>,
     /// Inclusion pointer for the published receipt: the signed repo
     /// commit `rev` (and its CID) the receipt landed in. Lets the
     /// requester locate the receipt in the provider's signed MST without
@@ -404,6 +425,60 @@ pub struct InferenceComplete {
     pub receipt_commit_rev: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_commit_cid: Option<String>,
+}
+
+/// Provider → advisor after reconnect: ask to reattach one live invocation.
+///
+/// V1 invariants:
+/// - chunk `seq` starts at zero; `produced_seq`/`final_seq` are the next sequence;
+/// - advisor `next_seq` is monotonic and never exceeds `produced_seq`;
+/// - completion is accepted only when `final_seq == next_seq`;
+/// - every resume/ack is fenced by the original request's token and the same
+///   authenticated `(provider DID, machine_id)`; a rejection cancels the job;
+/// - providers retain unacknowledged encrypted frames for bounded replay, while
+///   advisors retain completion tombstones only for the reconnect grace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceResume {
+    pub session_id: String,
+    /// Unguessable per-dispatch fence received in the original request.
+    pub resume_token: String,
+    /// Provider's next sequence number (number of chunks produced so far).
+    pub produced_seq: u32,
+}
+
+/// Advisor → provider result of an `InferenceResume` handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceResumeResult {
+    pub session_id: String,
+    pub resume_token: String,
+    pub status: ResumeStatus,
+    /// First chunk sequence the advisor has not accepted yet.
+    pub next_seq: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeStatus {
+    /// Reattach and replay from the returned high-water mark.
+    Resume,
+    /// Requester already received completion; delete provider state.
+    Completed,
+    /// Session/token/identity/grace check failed; cancel provider state.
+    Rejected,
+}
+
+/// Advisor → provider accepted progress high-water mark.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceAck {
+    pub session_id: String,
+    pub resume_token: String,
+    /// Chunks below this sequence are durably accepted for this live advisor
+    /// session and may be dropped from the replay buffer.
+    pub next_seq: u32,
+    /// Terminal acknowledgment: the provider may delete the whole job.
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,5 +542,80 @@ mod tests {
         // And it round-trips back.
         let back: InferenceChunk = serde_json::from_str(&s).unwrap();
         assert_eq!(back.channel, ChunkChannel::Reasoning);
+    }
+
+    #[test]
+    fn stream_resume_wire_contract_is_additive_and_round_trips() {
+        let resume = AdvisorMessage::InferenceResume(InferenceResume {
+            session_id: "session-1".into(),
+            resume_token: "token-1".into(),
+            produced_seq: 7,
+        });
+        let json = serde_json::to_string(&resume).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"inference_resume","session_id":"session-1","resume_token":"token-1","produced_seq":7}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<AdvisorMessage>(&json).unwrap(),
+            AdvisorMessage::InferenceResume(InferenceResume {
+                produced_seq: 7,
+                ..
+            })
+        ));
+
+        let result = AdvisorMessage::InferenceResumeResult(InferenceResumeResult {
+            session_id: "session-1".into(),
+            resume_token: "token-1".into(),
+            status: ResumeStatus::Resume,
+            next_seq: 4,
+            reason: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            r#"{"type":"inference_resume_result","session_id":"session-1","resume_token":"token-1","status":"resume","next_seq":4}"#
+        );
+
+        let ack = AdvisorMessage::InferenceAck(InferenceAck {
+            session_id: "session-1".into(),
+            resume_token: "token-1".into(),
+            next_seq: 7,
+            completed: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&ack).unwrap(),
+            r#"{"type":"inference_ack","session_id":"session-1","resume_token":"token-1","next_seq":7,"completed":true}"#
+        );
+    }
+
+    #[test]
+    fn resume_control_frames_reject_missing_tokens_and_unknown_status() {
+        assert!(serde_json::from_str::<AdvisorMessage>(
+            r#"{"type":"inference_resume_result","session_id":"s","status":"resume","next_seq":0}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<AdvisorMessage>(
+            r#"{"type":"inference_resume_result","session_id":"s","resume_token":"t","status":"maybe","next_seq":0}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<AdvisorMessage>(
+            r#"{"type":"inference_ack","session_id":"s","next_seq":0,"completed":false}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn old_register_and_completion_frames_keep_resume_fields_absent() {
+        let register = r#"{"type":"register","provider_did":"did:plc:p","machine_label":"m","chip":"M4","ram_gb":16,"supported_models":["stub"],"encryption_pub_key":"e","attestation_pub_key":"a","attestation_uri":""}"#;
+        match serde_json::from_str::<AdvisorMessage>(register).unwrap() {
+            AdvisorMessage::Register(r) => assert_eq!(r.stream_resume_version, None),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let complete = r#"{"type":"inference_complete","session_id":"s","tokens_in":1,"tokens_out":2,"receipt_uri":""}"#;
+        match serde_json::from_str::<AdvisorMessage>(complete).unwrap() {
+            AdvisorMessage::InferenceComplete(c) => assert_eq!(c.final_seq, None),
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 }

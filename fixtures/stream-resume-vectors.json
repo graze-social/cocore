@@ -1,0 +1,17 @@
+{
+  "description": "Shared test vectors for the stream-resume v1 state machine (see provider/src/protocol.rs InferenceResume invariants). Consumed by infra/advisor/src/resume-vectors.test.ts (advisor acceptance side) and provider/src/advisor.rs tests (provider replay side) so the two hand-written implementations cannot drift apart silently. next_seq always means: first chunk sequence the advisor has NOT accepted yet.",
+  "chunk": [
+    { "name": "in-order chunk is accepted", "nextSeq": 0, "seq": 0, "accept": true, "nextSeqAfter": 1 },
+    { "name": "replayed duplicate is acknowledged but not re-delivered", "preAccept": [0], "seq": 0, "accept": false, "nextSeqAfter": 1 },
+    { "name": "forward gap is not accepted; high-water asks for a replay", "nextSeq": 0, "seq": 2, "accept": false, "nextSeqAfter": 0 }
+  ],
+  "resume": [
+    { "name": "provider ahead of advisor resumes; tail replays from the high-water", "advisorNextSeq": 1, "producedSeq": 3, "status": "resume", "nextSeq": 1, "providerReplaysSeqs": [1, 2] },
+    { "name": "provider behind the advisor is rejected (state loss)", "advisorNextSeq": 2, "producedSeq": 1, "status": "rejected", "nextSeq": 2, "providerKeepsJob": false },
+    { "name": "advisor claiming more than produced is a protocol violation; provider cancels", "resultStatus": "resume", "resultNextSeq": 3, "providerProducedSeq": 2, "providerKeepsJob": false }
+  ],
+  "completion": [
+    { "name": "completion accepted only when finalSeq equals the high-water", "nextSeq": 2, "finalSeq": 2, "accepted": true },
+    { "name": "completion racing ahead of a missing chunk is rejected", "nextSeq": 1, "finalSeq": 2, "accepted": false }
+  ]
+}

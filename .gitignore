@@ -50,3 +50,6 @@ DerivedData/
 
 # Throwaway local dev/debug scripts (login, screenshot, env probes)
 .tmp-*
+
+# pi subagent artifacts
+.pi-subagents/

@@ -12,8 +12,13 @@
 // survives advisor restarts; for v0 a redeploy just disconnects
 // in-flight requesters and they retry.
 
+import { createHash } from "node:crypto";
+
 import type { AttestedSseEvent } from "./events.ts";
 import { renderSseEvent } from "./events.ts";
+
+const COMPLETION_TOMBSTONE_MAX = 1_024;
+const REPLAY_FINGERPRINT_MAX = 512;
 
 /** Minimal write-side an SSE relay needs. Node's `ServerResponse` satisfies
  *  this structurally (the test + any raw-`createServer` caller pass one
@@ -49,9 +54,17 @@ export interface SessionEntry {
   lastChunkAt: number | null;
   /** Underlying SSE response — we own writing to it. */
   res: SseResponse;
-  /** Wall-clock idle timer; reset on every chunk and cleared on
-   *  complete. */
+  /** Wall-clock idle timer; reset on every chunk and cleared on complete. */
   idleTimer: NodeJS.Timeout | null;
+  /** Unguessable per-dispatch fence. Null keeps legacy fail-fast behavior. */
+  resumeToken: string | null;
+  /** First chunk sequence not yet relayed to the requester. */
+  nextSeq: number;
+  /** Reconnect grace timer while the assigned provider transport is absent. */
+  resumeTimer: NodeJS.Timeout | null;
+  detached: boolean;
+  /** Bounded hashes used to reject conflicting duplicate sequence frames. */
+  acceptedFingerprints: Map<number, string>;
 }
 
 export interface SessionManagerOpts {
@@ -79,6 +92,10 @@ export interface SessionManagerOpts {
    *  advisor records these into a rolling window for the public "time to
    *  first token" stat. */
   onFirstChunk?: (ttftMs: number) => void;
+  /** Grace for a resume-capable provider socket replacement. */
+  resumeGraceMs?: number;
+  /** Fired once when reconnect grace expires. */
+  onResumeExpired?: (providerDid: string, providerMachineId: string) => void;
 }
 
 export class SessionManager {
@@ -91,6 +108,18 @@ export class SessionManager {
     streamed: boolean,
   ) => void;
   private onFirstChunk?: (ttftMs: number) => void;
+  private resumeGraceMs: number;
+  private onResumeExpired?: (providerDid: string, providerMachineId: string) => void;
+  private completed = new Map<
+    string,
+    {
+      providerDid: string;
+      providerMachineId: string;
+      resumeToken: string;
+      nextSeq: number;
+      timer: NodeJS.Timeout;
+    }
+  >();
 
   constructor(opts: SessionManagerOpts = {}) {
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
@@ -99,6 +128,8 @@ export class SessionManager {
     this.firstChunkTimeoutMs = opts.firstChunkTimeoutMs ?? this.idleTimeoutMs;
     this.onIdleTimeout = opts.onIdleTimeout;
     this.onFirstChunk = opts.onFirstChunk;
+    this.resumeGraceMs = opts.resumeGraceMs ?? 30_000;
+    this.onResumeExpired = opts.onResumeExpired;
   }
 
   /** Create a session, write SSE preamble headers, and return the
@@ -115,7 +146,11 @@ export class SessionManager {
     requesterDid: string,
     res: SseResponse,
     receivedAt?: number,
+    resumeToken?: string,
   ): SessionEntry {
+    if (this.known(sessionId)) {
+      throw new Error("session_id is already active or recently completed");
+    }
     res.statusCode = 200;
     res.setHeader("content-type", "text/event-stream; charset=utf-8");
     res.setHeader("cache-control", "no-cache, no-transform");
@@ -135,6 +170,11 @@ export class SessionManager {
       lastChunkAt: null,
       res,
       idleTimer: null,
+      resumeToken: resumeToken ?? null,
+      nextSeq: 0,
+      resumeTimer: null,
+      detached: false,
+      acceptedFingerprints: new Map(),
     };
     this.armIdle(sessionId, entry);
     this.bySessionId.set(sessionId, entry);
@@ -144,6 +184,14 @@ export class SessionManager {
 
   has(sessionId: string): boolean {
     return this.bySessionId.has(sessionId);
+  }
+
+  /** Would {@link open} refuse this id? True while the session is live OR
+   *  within the completed-tombstone grace. `sessionId` is client-supplied on
+   *  `/jobs`, so callers must check this and answer with a structured error
+   *  instead of letting `open` throw. */
+  known(sessionId: string): boolean {
+    return this.bySessionId.has(sessionId) || this.completed.has(sessionId);
   }
 
   /** H6b: is `(providerDid, providerMachineId)` the provider this session was
@@ -195,6 +243,126 @@ export class SessionManager {
     return ids.length;
   }
 
+  /** Detach resumable sessions for a bounded socket-replacement grace. Legacy
+   *  sessions still fail immediately. Returns counts for logging/accounting. */
+  detachForMachine(
+    providerDid: string,
+    providerMachineId: string,
+  ): { detached: number; closed: number } {
+    const legacy: string[] = [];
+    let detached = 0;
+    for (const [sessionId, entry] of this.bySessionId) {
+      if (entry.providerDid !== providerDid || entry.providerMachineId !== providerMachineId) {
+        continue;
+      }
+      if (!entry.resumeToken) {
+        legacy.push(sessionId);
+        continue;
+      }
+      // Idempotent: a session already in grace keeps its ORIGINAL timer. A
+      // same-(did,machine) re-register (e.g. a replacement socket that never
+      // presents the resume token) must not restart grace and so starve
+      // expiry/failure accounting. A genuine second disconnect after a
+      // successful resume has detached=false here, so it gets a fresh timer.
+      if (entry.detached) continue;
+      if (entry.idleTimer) clearTimeout(entry.idleTimer);
+      if (entry.resumeTimer) clearTimeout(entry.resumeTimer);
+      entry.idleTimer = null;
+      entry.detached = true;
+      entry.resumeTimer = setTimeout(() => {
+        const current = this.bySessionId.get(sessionId);
+        if (!current?.detached) return;
+        this.close(sessionId, "resume-expired");
+        this.onResumeExpired?.(providerDid, providerMachineId);
+      }, this.resumeGraceMs);
+      entry.resumeTimer.unref?.();
+      detached += 1;
+    }
+    for (const sessionId of legacy) this.close(sessionId, "provider-disconnected");
+    return { detached, closed: legacy.length };
+  }
+
+  /** Validate a provider's reconnect claim and return the advisor high-water. */
+  resume(
+    sessionId: string,
+    providerDid: string,
+    providerMachineId: string,
+    resumeToken: string,
+    producedSeq: number,
+  ):
+    | { status: "resume" | "completed"; nextSeq: number }
+    | { status: "rejected"; nextSeq: number; reason: string } {
+    const entry = this.bySessionId.get(sessionId);
+    if (entry) {
+      if (
+        entry.providerDid !== providerDid ||
+        entry.providerMachineId !== providerMachineId ||
+        entry.resumeToken !== resumeToken
+      ) {
+        return { status: "rejected", nextSeq: 0, reason: "resume-owner-mismatch" };
+      }
+      if (producedSeq < entry.nextSeq) {
+        return { status: "rejected", nextSeq: entry.nextSeq, reason: "provider-state-behind" };
+      }
+      if (entry.resumeTimer) clearTimeout(entry.resumeTimer);
+      entry.resumeTimer = null;
+      entry.detached = false;
+      this.armIdle(sessionId, entry);
+      return { status: "resume", nextSeq: entry.nextSeq };
+    }
+
+    const done = this.completed.get(sessionId);
+    if (
+      done &&
+      done.providerDid === providerDid &&
+      done.providerMachineId === providerMachineId &&
+      done.resumeToken === resumeToken
+    ) {
+      return { status: "completed", nextSeq: done.nextSeq };
+    }
+    return { status: "rejected", nextSeq: 0, reason: "resume-unknown-or-expired" };
+  }
+
+  /** Relay one resumable chunk exactly once. Gaps are not accepted: returning
+   *  the current high-water asks the provider to replay the missing frame. */
+  acceptChunk(
+    sessionId: string,
+    seq: number,
+    ev: AttestedSseEvent,
+  ): { nextSeq: number; resumeToken: string | null } | null {
+    const entry = this.bySessionId.get(sessionId);
+    if (!entry || ev.type !== "chunk") return null;
+    if (!entry.resumeToken) {
+      this.write(sessionId, ev);
+      return { nextSeq: seq + 1, resumeToken: null };
+    }
+    const fingerprint = createHash("sha256")
+      .update(ev.channel ?? "content")
+      .update("\0")
+      .update(JSON.stringify(ev.ciphertext))
+      .digest("hex");
+    if (seq < entry.nextSeq) {
+      const accepted = entry.acceptedFingerprints.get(seq);
+      if (accepted && accepted !== fingerprint) {
+        this.close(sessionId, "resume-sequence-conflict");
+        return null;
+      }
+      return { nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+    }
+    if (entry.detached || seq > entry.nextSeq) {
+      return { nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+    }
+    this.write(sessionId, ev);
+    if (!this.bySessionId.has(sessionId)) return null;
+    if (entry.acceptedFingerprints.size >= REPLAY_FINGERPRINT_MAX) {
+      const oldest = entry.acceptedFingerprints.keys().next().value;
+      if (oldest !== undefined) entry.acceptedFingerprints.delete(oldest);
+    }
+    entry.acceptedFingerprints.set(seq, fingerprint);
+    entry.nextSeq += 1;
+    return { nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+  }
+
   /** Write an SSE event to the session's response. No-op if the
    *  session isn't tracked or the response is already closed. */
   write(sessionId: string, ev: AttestedSseEvent): void {
@@ -231,6 +399,10 @@ export class SessionManager {
       clearTimeout(entry.idleTimer);
       entry.idleTimer = null;
     }
+    if (entry.resumeTimer) {
+      clearTimeout(entry.resumeTimer);
+      entry.resumeTimer = null;
+    }
     if (reason && !entry.res.writableEnded) {
       try {
         entry.res.write(renderSseEvent({ type: "error", sessionId, reason }));
@@ -251,9 +423,15 @@ export class SessionManager {
   complete(
     sessionId: string,
     summary: { tokensIn: number; tokensOut: number; receiptUri: string },
-  ): void {
+    finalSeq?: number,
+  ): { accepted: boolean; nextSeq: number; resumeToken: string | null } | null {
     const entry = this.bySessionId.get(sessionId);
-    if (!entry) return;
+    if (!entry) return null;
+    // Resume-capable completion is valid only after every produced chunk was
+    // accepted. Legacy frames omit finalSeq and retain their old behavior.
+    if (entry.resumeToken && finalSeq !== entry.nextSeq) {
+      return { accepted: false, nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+    }
     this.write(sessionId, {
       type: "complete",
       sessionId,
@@ -261,14 +439,39 @@ export class SessionManager {
       tokensOut: summary.tokensOut,
       receiptUri: summary.receiptUri,
     });
+    if (!this.bySessionId.has(sessionId)) return null;
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    if (entry.resumeTimer) clearTimeout(entry.resumeTimer);
     entry.idleTimer = null;
+    entry.resumeTimer = null;
     try {
       entry.res.end();
     } catch {
       // ignore
     }
     this.bySessionId.delete(sessionId);
+    if (entry.resumeToken) {
+      const prior = this.completed.get(sessionId);
+      if (!prior && this.completed.size >= COMPLETION_TOMBSTONE_MAX) {
+        const oldestId = this.completed.keys().next().value;
+        if (oldestId) {
+          const oldest = this.completed.get(oldestId);
+          if (oldest) clearTimeout(oldest.timer);
+          this.completed.delete(oldestId);
+        }
+      }
+      if (prior) clearTimeout(prior.timer);
+      const timer = setTimeout(() => this.completed.delete(sessionId), this.resumeGraceMs);
+      timer.unref?.();
+      this.completed.set(sessionId, {
+        providerDid: entry.providerDid,
+        providerMachineId: entry.providerMachineId,
+        resumeToken: entry.resumeToken,
+        nextSeq: entry.nextSeq,
+        timer,
+      });
+    }
+    return { accepted: true, nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
   }
 
   /** A provider "still working" signal during a long generation (slow
@@ -280,7 +483,7 @@ export class SessionManager {
    *  unknown/closed session. */
   keepalive(sessionId: string): void {
     const entry = this.bySessionId.get(sessionId);
-    if (!entry) return;
+    if (!entry || entry.detached) return;
     this.armIdle(sessionId, entry);
   }
 

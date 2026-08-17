@@ -208,6 +208,13 @@ export function handleConnection(
     socket.send(JSON.stringify(msg));
   };
 
+  // Fence all session frames to the registry's CURRENT socket. DID+machine
+  // ownership alone lets a replaced-but-not-yet-dead socket race its successor.
+  const ownsCurrentRegistration = (): boolean =>
+    registeredDid !== null &&
+    registeredMachineId !== null &&
+    registry.get(registeredDid, registeredMachineId)?.send === send;
+
   // App-level liveness probe. Resolvers keyed by nonce; settled by the
   // matching `pong` in onMessage, or by the timeout below. Unlike the
   // WS-level ping (auto-ponged by the read half even when the serve loop
@@ -305,17 +312,27 @@ export function handleConnection(
       // Secure-Enclave key, else the X25519 default for older agents.
       entry.encScheme ?? undefined,
     );
-    if (!res.ok) {
+    if (res.ok) {
       console.error(
-        `[ws] code-challenge push failed did=${registeredDid} status=${res.status} reason=${res.reason ?? "?"}`,
+        `[ws] -> code-challenge did=${registeredDid ?? "?"} nonce=${nonce.slice(0, 8)}…`,
       );
     } else {
       console.error(
-        `[ws] -> code-challenge did=${registeredDid ?? "?"} nonce=${nonce.slice(0, 8)}…`,
+        `[ws] code-challenge push failed did=${registeredDid} status=${res.status} reason=${res.reason ?? "?"}`,
       );
     }
   };
 
+  // Preserve WebSocket frame order across async authentication/attestation.
+  // In particular, a resume immediately following register must not overtake
+  // the awaited service-auth verification and be dropped as "before register".
+  // The chain is BOUNDED: while a slow handler (service-auth / attestation
+  // verification) is awaited, a peer could otherwise enqueue arbitrarily many
+  // parsed frames whose payloads accumulate in the pending closures. Over the
+  // cap we close the socket rather than grow memory without limit.
+  let dispatchChain = Promise.resolve();
+  let pendingFrames = 0;
+  const MAX_PENDING_FRAMES = 1024;
   socket.on("message", (data) => {
     let raw: unknown;
     try {
@@ -334,13 +351,23 @@ export function handleConnection(
       console.error(`[ws] bad-frame peer=${peer}: ${check.reason}; closing`);
       return close(1008, "bad-frame");
     }
-    // Wrap dispatch so a rejected promise (e.g. an async verify that throws)
-    // can't escape as an unhandled rejection and crash the process. A handler
-    // failure closes THIS socket, not the advisor.
-    void onMessage(check.msg).catch((e) => {
-      console.error(`[ws] onMessage error peer=${peer}: ${(e as Error).message}`);
-      close(1011, "internal");
-    });
+    if (pendingFrames >= MAX_PENDING_FRAMES) {
+      console.error(
+        `[ws] dispatch backlog over cap peer=${peer} pending=${pendingFrames}; closing`,
+      );
+      return close(1008, "dispatch-backlog");
+    }
+    pendingFrames += 1;
+    // Serialize dispatch and contain failures to this socket.
+    dispatchChain = dispatchChain
+      .then(() => onMessage(check.msg))
+      .catch((e) => {
+        console.error(`[ws] onMessage error peer=${peer}: ${(e as Error).message}`);
+        close(1011, "internal");
+      })
+      .finally(() => {
+        pendingFrames -= 1;
+      });
   });
 
   const onMessage = async (msg: AdvisorMessage): Promise<void> => {
@@ -401,6 +428,13 @@ export function handleConnection(
             registrationAuthenticated = false;
           }
         }
+        const incomingMachineId = ProviderRegistry.machineIdOf(msg);
+        const previous = registry.get(msg.provider_did, incomingMachineId);
+        if (previous && previous.send !== send) {
+          // Fence sessions before replacing the old transport. Legacy jobs fail
+          // immediately; resumable jobs enter their bounded reconnect grace.
+          sessions.detachForMachine(msg.provider_did, incomingMachineId);
+        }
         // M1: refuse the registration if the registry is at capacity (a
         // register flood can't grow the map unbounded). A re-register of an
         // already-present machine always succeeds.
@@ -412,7 +446,7 @@ export function handleConnection(
           return close(1013, "registry-full");
         }
         registeredDid = msg.provider_did;
-        registeredMachineId = ProviderRegistry.machineIdOf(msg);
+        registeredMachineId = incomingMachineId;
         // Record the C1 standing (default entry is authenticated=true, so only
         // the soft-downgrade case needs a write). Drops the machine from
         // confidential routing in the registry AND is surfaced on /providers so
@@ -435,23 +469,20 @@ export function handleConnection(
           );
         }
         sendChallenge();
-        // Restore code-attested standing across a reconnect WITHOUT a fresh
-        // APNs push when the cached proof is still valid for this exact binary
-        // (cdHash). Only push a new challenge when there's no fresh proof — a
-        // first connect, an expired cache, or a changed cdHash. This keeps the
-        // background-push rate to ~the re-challenge cadence instead of once per
-        // (frequent) reconnect, which Apple throttles.
-        {
-          const e = registry.get(registeredDid, registeredMachineId);
-          if (
-            config.apns &&
-            e &&
-            cachedCodeAttestFresh(registeredDid, registeredMachineId, e.cdHash, Date.now())
-          ) {
-            registry.markCodeAttested(registeredDid, registeredMachineId);
-          } else {
-            void issueCodeChallenge();
-          }
+        const codeAttestEntry = registry.get(registeredDid, registeredMachineId);
+        if (
+          config.apns &&
+          codeAttestEntry &&
+          cachedCodeAttestFresh(
+            registeredDid,
+            registeredMachineId,
+            codeAttestEntry.cdHash,
+            Date.now(),
+          )
+        ) {
+          registry.markCodeAttested(registeredDid, registeredMachineId);
+        } else {
+          void issueCodeChallenge();
         }
         challengeTimer = setInterval(() => {
           sendChallenge();
@@ -559,23 +590,52 @@ export function handleConnection(
         pendingCodeNonce = null;
         return;
       }
+      case "inference_resume": {
+        if (!ownsCurrentRegistration() || !registeredDid || !registeredMachineId) return;
+        const result = sessions.resume(
+          msg.session_id,
+          registeredDid,
+          registeredMachineId,
+          msg.resume_token,
+          msg.produced_seq,
+        );
+        send({
+          type: "inference_resume_result",
+          session_id: msg.session_id,
+          resume_token: msg.resume_token,
+          status: result.status,
+          next_seq: result.nextSeq,
+          ...(result.status === "rejected" ? { reason: result.reason } : {}),
+        });
+        return;
+      }
       case "inference_chunk": {
-        // H6b: only the provider this session was dispatched to may stream into
-        // it. A socket that merely learned the session_id can't inject chunks.
+        // H6b + socket fence: only the current transport for the assigned
+        // machine may relay or replay this sequence.
         if (
+          !ownsCurrentRegistration() ||
           !registeredDid ||
           !registeredMachineId ||
           !sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
         ) {
           return;
         }
-        sessions.write(msg.session_id, {
+        const accepted = sessions.acceptChunk(msg.session_id, msg.seq, {
           type: "chunk",
           sessionId: msg.session_id,
           seq: msg.seq,
           ...(msg.channel ? { channel: msg.channel } : {}),
           ciphertext: msg.ciphertext,
         });
+        if (accepted?.resumeToken) {
+          send({
+            type: "inference_ack",
+            session_id: msg.session_id,
+            resume_token: accepted.resumeToken,
+            next_seq: accepted.nextSeq,
+            completed: false,
+          });
+        }
         return;
       }
       case "inference_keepalive": {
@@ -584,6 +644,7 @@ export function handleConnection(
         // Not relayed to the requester; doesn't count as a token.
         // H6b: only the assigned provider may keep its own session alive.
         if (
+          ownsCurrentRegistration() &&
           registeredDid &&
           registeredMachineId &&
           sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
@@ -598,24 +659,39 @@ export function handleConnection(
         // attacker `receipt_uri` AND clear its own bad standing via
         // recordCompletion. Drop the frame from any other socket.
         if (
+          !ownsCurrentRegistration() ||
           !registeredDid ||
           !registeredMachineId ||
           !sessions.ownedBy(msg.session_id, registeredDid, registeredMachineId)
         ) {
           console.error(
-            `[ws] drop inference_complete from non-owner did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} session=${msg.session_id}`,
+            `[ws] drop inference_complete from non-owner/stale socket did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} session=${msg.session_id}`,
           );
           return;
         }
-        // A completion proves this machine isn't silently dropping work —
-        // record it so the silent-failure detector clears, bad standing is
-        // restored, and the dispatch counter has a denominator.
+        const completion = sessions.complete(
+          msg.session_id,
+          {
+            tokensIn: msg.tokens_in,
+            tokensOut: msg.tokens_out,
+            receiptUri: msg.receipt_uri,
+          },
+          msg.final_seq,
+        );
+        if (!completion) return;
+        if (completion.resumeToken) {
+          send({
+            type: "inference_ack",
+            session_id: msg.session_id,
+            resume_token: completion.resumeToken,
+            next_seq: completion.nextSeq,
+            completed: completion.accepted,
+          });
+        }
+        if (!completion.accepted) return;
+        // Count only the first valid terminal delivery; replayed completion is
+        // answered from the tombstone and never reaches this branch.
         registry.recordCompletion(registeredDid, registeredMachineId);
-        sessions.complete(msg.session_id, {
-          tokensIn: msg.tokens_in,
-          tokensOut: msg.tokens_out,
-          receiptUri: msg.receipt_uri,
-        });
         console.error(
           `[ws] complete did=${registeredDid ?? "?"} session=${msg.session_id} receipt=${msg.receipt_uri || "(none)"}`,
         );
@@ -672,33 +748,25 @@ export function handleConnection(
     if (registeredDid && registeredMachineId) {
       const entry = registry.get(registeredDid, registeredMachineId);
       if (entry && entry.send === send) {
-        // A GENUINE drop of a socket that still owns its entry — not an
-        // advisor-initiated clean close ("replaced" on reconnect, "recycle" on
-        // the connection-age cap), where the machine is coming right back and
-        // its in-flight sessions can still be served by the replacement.
         const reasonStr = reason?.toString() ?? "";
         const advisorInitiated = reasonStr === "replaced" || reasonStr === "recycle";
-        if (!advisorInitiated) {
-          // Fail any in-flight requesters fast (clean SSE error) instead of
-          // leaving them to hang until the 90s idle timer, and count the drop
-          // ONCE toward this machine's cooldown ledger. A machine that keeps
-          // dropping mid-stream is exactly the "stream-truncated" case we want
-          // pulled from rotation.
-          const dropped = sessions.closeForMachine(
+        const { detached, closed } = sessions.detachForMachine(registeredDid, registeredMachineId);
+        // Legacy sessions retain fail-fast behavior. Resume-capable sessions
+        // are not failures unless their bounded grace actually expires.
+        if (!advisorInitiated && closed > 0) {
+          const tripped = registry.recordFailure(
             registeredDid,
             registeredMachineId,
             "provider-disconnected",
           );
-          if (dropped > 0) {
-            const tripped = registry.recordFailure(
-              registeredDid,
-              registeredMachineId,
-              "provider-disconnected",
-            );
-            console.error(
-              `[ws] mid-job drop did=${registeredDid} machine=${registeredMachineId}; closed ${dropped} session(s)${tripped ? ", repeated → cooldown" : ""}`,
-            );
-          }
+          console.error(
+            `[ws] mid-job drop did=${registeredDid} machine=${registeredMachineId}; closed ${closed} legacy session(s)${tripped ? ", repeated → cooldown" : ""}`,
+          );
+        }
+        if (detached > 0) {
+          console.error(
+            `[ws] mid-job transport reset did=${registeredDid} machine=${registeredMachineId}; awaiting resume for ${detached} session(s)`,
+          );
         }
         registry.remove(registeredDid, registeredMachineId);
       }
