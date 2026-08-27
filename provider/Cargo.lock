@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "cocore-provider"
-version = "0.9.52"
+version = "0.9.53"
 dependencies = [
  "aes-gcm",
  "anyhow",
