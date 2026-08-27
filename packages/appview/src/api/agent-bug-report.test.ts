@@ -94,3 +94,53 @@ test("POST /api/agent/bug-report: 400 on an empty body", async () => {
     },
   );
 });
+
+test("POST /api/agent/bug-report: persists the reporter's X-Cocore-Note", async () => {
+  const { store, accountStore } = setup();
+  const did = "did:plc:provider2";
+  const { secret } = accountStore.createKey({ did, name: "m" });
+  const note = "confidential stuck on Applying and the tray keeps restarting";
+  await withAppviewServer(
+    buildAppviewApp(store, { accountStore, appviewDid: APPVIEW_DID }),
+    async (base) => {
+      const res = await fetch(`${base}/api/agent/bug-report`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${secret}`,
+          "content-type": "application/gzip",
+          "x-cocore-note": note,
+        },
+        body: bundle,
+      });
+      assert.equal(res.status, 201);
+      const { ticketId } = (await res.json()) as { ticketId: string };
+      // The reporter's own account of the problem is the whole point of the
+      // header; dropping it (as both upload routes used to) forced triage of
+      // br_57cef8d6 to infer the symptom from logs alone.
+      const row = accountStore.db
+        .prepare(`SELECT note FROM bug_reports WHERE ticket_id = ?`)
+        .get(ticketId) as { note: string };
+      assert.equal(row.note, note);
+    },
+  );
+});
+
+test("POST /api/agent/bug-report: a missing note stores an empty string", async () => {
+  const { store, accountStore } = setup();
+  const { secret } = accountStore.createKey({ did: "did:plc:provider3", name: "m" });
+  await withAppviewServer(
+    buildAppviewApp(store, { accountStore, appviewDid: APPVIEW_DID }),
+    async (base) => {
+      const res = await fetch(`${base}/api/agent/bug-report`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${secret}`, "content-type": "application/gzip" },
+        body: bundle,
+      });
+      const { ticketId } = (await res.json()) as { ticketId: string };
+      const row = accountStore.db
+        .prepare(`SELECT note FROM bug_reports WHERE ticket_id = ?`)
+        .get(ticketId) as { note: string };
+      assert.equal(row.note, "");
+    },
+  );
+});

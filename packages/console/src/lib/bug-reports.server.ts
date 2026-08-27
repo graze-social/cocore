@@ -13,7 +13,8 @@
 //     SQLite file, so anywhere the DB is durable (a Railway volume, an
 //     explicit COCORE_CONSOLE_DB path) the bundles are durable too.
 //   * A single `bug_reports` row (see console-db.server.ts) records the
-//     ticket id, uploader DID, on-disk path, and size — metadata only.
+//     ticket id, uploader DID, on-disk path, size, and the reporter's
+//     own note — metadata only.
 //
 // We never read, log, or inspect bundle contents here: the bytes land
 // on disk and the row points at them. An operator triages by ticket id
@@ -35,12 +36,32 @@ export const MAX_BUNDLE_BYTES = 25 * 1024 * 1024;
  *  tarball; reject anything else at the edge. */
 export const BUNDLE_CONTENT_TYPE = "application/gzip";
 
+/** Cap on the stored reporter note. The tray sends it as an HTTP header
+ *  (`X-Cocore-Note`), so it's inherently short; truncating keeps a
+ *  hostile client from parking arbitrary text in the DB. */
+export const MAX_NOTE_CHARS = 2000;
+
+/** Normalise the reporter's note: it arrives as an HTTP header, so drop the
+ *  C0 control characters that transport can carry (CR/LF/TAB from a
+ *  multi-line note), collapse whitespace runs, trim, and truncate. Returns
+ *  "" when there's nothing usable, so the column is never null. */
+export function normalizeNote(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const stripped = Array.from(raw, (ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    return code < 0x20 || code === 0x7f ? " " : ch;
+  }).join("");
+  return stripped.replace(/\s+/g, " ").trim().slice(0, MAX_NOTE_CHARS);
+}
+
 export interface StoredBugReport {
   ticketId: string;
   did: string;
   filePath: string;
   sizeBytes: number;
   createdAt: string;
+  /** What the reporter typed, normalised + truncated; "" when absent. */
+  note: string;
 }
 
 /** Resolve the directory bundles are written under. Mirrors the DB
@@ -78,8 +99,13 @@ function generateTicketId(): string {
  *
  *  Does NOT validate size/content-type — the route does that before
  *  buffering, so this stays a pure persistence step. */
-export function storeBugReport(input: { did: string; bytes: Buffer }): StoredBugReport {
+export function storeBugReport(input: {
+  did: string;
+  bytes: Buffer;
+  note?: string | null;
+}): StoredBugReport {
   const { did, bytes } = input;
+  const note = normalizeNote(input.note);
   const ticketId = generateTicketId();
   const createdAt = new Date().toISOString();
 
@@ -94,10 +120,10 @@ export function storeBugReport(input: { did: string; bytes: Buffer }): StoredBug
 
   consoleDb()
     .prepare(
-      `INSERT INTO bug_reports (ticket_id, did, file_path, size_bytes, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO bug_reports (ticket_id, did, file_path, size_bytes, created_at, note)
+       VALUES (?, ?, ?, ?, ?, ?)`,
     )
-    .run(ticketId, did, filePath, bytes.byteLength, createdAt);
+    .run(ticketId, did, filePath, bytes.byteLength, createdAt, note);
 
-  return { ticketId, did, filePath, sizeBytes: bytes.byteLength, createdAt };
+  return { ticketId, did, filePath, sizeBytes: bytes.byteLength, createdAt, note };
 }

@@ -111,7 +111,11 @@ export function buildAgentBugReportRouter(
           });
         }
 
-        const stored = ctx.accounts.storeBugReport({ did: resolved.did, bytes });
+        // Persist the reporter's own description alongside the bundle. The
+        // tray has always sent it in `X-Cocore-Note`; both upload routes used
+        // to drop it, leaving triage to infer the symptom from logs.
+        const note = yield* header("x-cocore-note");
+        const stored = ctx.accounts.storeBugReport({ did: resolved.did, bytes, note });
         return HttpServerResponse.text(JSON.stringify({ ticketId: stored.ticketId }), {
           contentType: "application/json",
           status: 201,
