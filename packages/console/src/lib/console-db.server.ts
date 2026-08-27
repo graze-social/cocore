@@ -125,7 +125,14 @@ CREATE TABLE IF NOT EXISTS bug_reports (
   file_path TEXT NOT NULL,
   -- Bundle size in bytes, as received (post size-limit check).
   size_bytes INTEGER NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- What the reporter actually typed, from the tray's X-Cocore-Note
+  -- header (truncated at upload). This is the ONLY human account of what
+  -- looked wrong, and it used to be dropped on the floor: triage of
+  -- br_57cef8d6 had to reconstruct the reported symptoms from logs alone
+  -- because two reports arrived with no description anywhere. Empty
+  -- string when the reporter sent none.
+  note TEXT NOT NULL DEFAULT ''
 );
 
 -- Captured Apple x5c attestation chains for Secure Mode (MDA), keyed by
@@ -198,6 +205,10 @@ interface TableSpec {
 }
 
 const REQUIRED_COLUMNS: TableSpec[] = [
+  {
+    table: "bug_reports",
+    columns: [{ name: "note", defSql: "TEXT NOT NULL DEFAULT ''" }],
+  },
   {
     table: "pending_disputes",
     columns: [

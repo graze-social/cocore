@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS bug_reports (
   did TEXT NOT NULL,
   file_path TEXT NOT NULL,
   size_bytes INTEGER NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- The reporter's own description, from the tray's X-Cocore-Note
+  -- header. Mirrors the console column; empty string when none was sent.
+  note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS bug_reports_did ON bug_reports (did);
 `;
@@ -72,6 +75,25 @@ export interface StoredBugReport {
   filePath: string;
   sizeBytes: number;
   createdAt: string;
+  /** What the reporter typed, normalised + truncated; "" when absent. */
+  note: string;
+}
+
+/** Cap on the stored reporter note — it arrives in an HTTP header, so it's
+ *  inherently short. Kept in sync with the console's MAX_NOTE_CHARS. */
+const MAX_NOTE_CHARS = 2000;
+
+/** Normalise a reporter note: drop the C0 control characters HTTP-header
+ *  transport can carry, collapse whitespace runs, trim, truncate. Never
+ *  returns null, so the column stays NOT NULL. Kept in sync with the
+ *  console's normalizeNote in bug-reports.server.ts. */
+function normalizeNote(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const stripped = Array.from(raw, (ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    return code < 0x20 || code === 0x7f ? " " : ch;
+  }).join("");
+  return stripped.replace(/\s+/g, " ").trim().slice(0, MAX_NOTE_CHARS);
 }
 
 interface DbRow {
@@ -145,6 +167,23 @@ export class AccountStore {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    // `CREATE TABLE IF NOT EXISTS` can't add a column to a DB that predates
+    // it, and this store has no migration framework — so ALTER the one
+    // additive column in explicitly, idempotently.
+    this.addColumnIfMissing("bug_reports", "note", "TEXT NOT NULL DEFAULT ''");
+  }
+
+  /** Idempotent additive migration. Reads pragma(table_info) and ALTERs only
+   *  when the column is absent, so it's a no-op on every boot after the first. */
+  private addColumnIfMissing(table: string, column: string, defSql: string): void {
+    const cols = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) return;
+    try {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${defSql}`);
+      console.error(`[account-store] migrated: ${table}.${column}`);
+    } catch (e) {
+      console.error(`[account-store] migration failed for ${table}.${column}: ${String(e)}`);
+    }
   }
 
   // ---- API keys -----------------------------------------------------
@@ -257,8 +296,9 @@ export class AccountStore {
   // Mirrors the console's bug-reports.server.ts so either service can
   // accept an upload depending on where the agent's key was minted.
 
-  storeBugReport(input: { did: string; bytes: Buffer }): StoredBugReport {
+  storeBugReport(input: { did: string; bytes: Buffer; note?: string | null }): StoredBugReport {
     const { did, bytes } = input;
+    const note = normalizeNote(input.note);
     const ticketId = `br_${randomBytes(5).toString("hex").slice(0, 8)}`;
     const createdAt = new Date().toISOString();
 
@@ -273,12 +313,12 @@ export class AccountStore {
 
     this.db
       .prepare(
-        `INSERT INTO bug_reports (ticket_id, did, file_path, size_bytes, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO bug_reports (ticket_id, did, file_path, size_bytes, created_at, note)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(ticketId, did, filePath, bytes.byteLength, createdAt);
+      .run(ticketId, did, filePath, bytes.byteLength, createdAt, note);
 
-    return { ticketId, did, filePath, sizeBytes: bytes.byteLength, createdAt };
+    return { ticketId, did, filePath, sizeBytes: bytes.byteLength, createdAt, note };
   }
 
   /** Rolling-window upload usage for a DID (L8): how many bundles and how many

@@ -83,6 +83,18 @@ final class AgentSupervisor {
     private var intentionalStop = false
     private var restartBackoff: TimeInterval = 2
     private var lastSpawnAt: Date?
+    /// Monotonic id of the child we currently own, bumped on every spawn. A
+    /// `terminationHandler` captures the generation it was installed for and
+    /// compares on exit, so a LATE exit from a superseded child can't be
+    /// mistaken for the live one's. Without this, bug report br_57cef8d6:
+    /// `stop()` abandoned a child that outlived its wait, `start()` spawned a
+    /// replacement, and the old child's handler then nil'd `process` (the tray
+    /// lost track of a healthy, serving agent — `isServing()` false forever) and
+    /// blamed the new child for the exit ("ran 0s"). The 30s liveness
+    /// reconciler then respawned every tick, each spawn reaping the live worker,
+    /// until the circuit breaker parked the machine for 15 minutes — 59 times in
+    /// one day.
+    private var spawnGeneration = 0
 
     private let label = "dev.cocore.provider"
     private var domainTarget: String { "gui/\(getuid())/\(label)" }
@@ -134,10 +146,27 @@ final class AgentSupervisor {
         // (which fires on exit) doesn't treat this as a crash and respawn.
         intentionalStop = true
         if let p = process {
-            Self.supervisorLog("stop(): SIGINT agent pid \(p.processIdentifier) (intentional)")
+            let pid = p.processIdentifier
+            Self.supervisorLog("stop(): SIGINT agent pid \(pid) (intentional)")
             p.interrupt()
-            await waitForExit(p, timeout: 5)
-            if p.isRunning { p.terminate() }
+            // Outwait the agent's own graceful shutdown, which gives its
+            // offline-marker PDS publish a full 5s of its own before giving up
+            // (`offline-marker publish timed out after 5s`). A 5s wait here
+            // therefore expired moments BEFORE the child was actually gone
+            // whenever that publish was slow — leaving a live agent nobody
+            // tracked (br_57cef8d6). Escalate instead of abandoning it: the
+            // singleton invariant depends on this method leaving no survivor.
+            await waitForExit(p, timeout: 12)
+            if p.isRunning {
+                Self.supervisorLog("stop(): pid \(pid) outlived SIGINT+12s — SIGTERM")
+                p.terminate()
+                await waitForExit(p, timeout: 3)
+            }
+            if p.isRunning {
+                Self.supervisorLog("stop(): pid \(pid) outlived SIGTERM — SIGKILL")
+                kill(pid, SIGKILL)
+                await waitForExit(p, timeout: 2)
+            }
             process = nil
         }
         // Reap any leaked sibling workers too — not just the one we track.
@@ -309,6 +338,24 @@ final class AgentSupervisor {
         return CircuitEval(action: .allow, prunedSpawnTimes: pruned)
     }
 
+    /// What an exiting child means for the supervisor. Pure so the ordering
+    /// hazard it fixes is unit-testable without real processes.
+    ///  * `.stale`       — a superseded child (we spawned a replacement after
+    ///                     abandoning this one). Log and touch NOTHING: its
+    ///                     tracking, backoff and spawn budget belong to the
+    ///                     live child now.
+    ///  * `.intentional` — we asked it to stop and it's still the current
+    ///                     generation; stay down.
+    ///  * `.unexpected`  — a genuine crash/kill of the child we own; respawn.
+    enum ExitDisposition: Equatable { case stale, intentional, unexpected }
+
+    nonisolated static func classifyExit(
+        generation: Int, currentGeneration: Int, intentionalStop: Bool
+    ) -> ExitDisposition {
+        if generation != currentGeneration { return .stale }
+        return intentionalStop ? .intentional : .unexpected
+    }
+
     private func spawnChild() {
         guard process == nil else { return }
         // Restart circuit breaker. If we're inside a cooldown from a prior
@@ -341,11 +388,9 @@ final class AgentSupervisor {
         // A fresh deliberate start clears the stop latch so a later
         // unexpected exit is treated as a crash and respawned.
         intentionalStop = false
-        // Probe the owner's trust tier ONCE: it selects the worker binary AND
-        // gates the inference-model env below (a confidential machine is
-        // native-only, so we must not inject subprocess models).
+        // Probe the owner's trust tier ONCE: it selects the worker binary (the
+        // nested measured bundle for attested-confidential, else the default).
         let tier = Self.probeTier()
-        let confidential = (tier == "attested-confidential")
         guard let bin = Self.serveBinary(tier: tier) else {
             NSLog("cocore: provider binary not found")
             return
@@ -371,13 +416,23 @@ final class AgentSupervisor {
             // but this also enriches the stderr line we persist below.
             "RUST_BACKTRACE": "full",
         ]
-        // Best-effort machines serve the owner's subprocess models; a
-        // confidential machine is native-only (inference stays in the measured
-        // binary), so never inject subprocess models there — the agent also
-        // clears them defensively, but not passing them avoids the spawn churn.
+        // The owner's model pick, for BOTH tiers. On a best-effort machine this
+        // is the subprocess engine's model list. On a confidential machine it
+        // is the only channel this pick has: inference there stays in the
+        // measured binary, and the agent picks the ONE model its native MLX
+        // engine serves from `desiredModels` first, then this env var, then a
+        // 0.5B default (`pick_confidential_native_model`). The tray writes the
+        // pick to UserDefaults only — never to PDS `desiredModels` — so
+        // withholding it here left every app-managed confidential Mac serving
+        // the 0.5B default forever, advertising a model nobody routes work to
+        // (br_57cef8d6: zero jobs in ten days). Passing it is safe for the
+        // native-only invariant: `cmd_serve` reads it for the native pick and
+        // then CLEARS it (`inference_models_action` → `.Clear`) before
+        // `build_engines`, so a confidential machine still spawns no Python
+        // child for it.
         let models = (UserDefaults.standard.string(forKey: "inferenceModels") ?? "")
             .trimmingCharacters(in: .whitespaces)
-        if !confidential, !models.isEmpty { env["COCORE_INFERENCE_MODELS"] = models }
+        if !models.isEmpty { env["COCORE_INFERENCE_MODELS"] = models }
         // Owner-chosen display name (set in the tray during setup), so the
         // provider record shows that instead of the raw `.local` hostname.
         let label = (UserDefaults.standard.string(forKey: "machineLabel") ?? "")
@@ -423,17 +478,37 @@ final class AgentSupervisor {
                 Self.appendAgentStderr(s)
             }
         }
+        // The generation this handler speaks for. Bumped just before `run()`
+        // below, so an exit that arrives after a later spawn is recognisable as
+        // stale instead of being applied to the live child.
+        spawnGeneration += 1
+        let generation = spawnGeneration
         p.terminationHandler = { [weak self] proc in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.process = nil
                 NSLog("cocore agent exited with %d", proc.terminationStatus)
                 let ranForLog = self.lastSpawnAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
-                // Deliberate stop → leave it down.
-                guard !self.intentionalStop else {
+                switch Self.classifyExit(
+                    generation: generation, currentGeneration: self.spawnGeneration,
+                    intentionalStop: self.intentionalStop)
+                {
+                case .stale:
+                    // A child we already stopped tracking finally exited, after
+                    // we'd spawned its replacement. Leave `process`,
+                    // `lastSpawnAt`, `spawnTimes` and `crashCount` alone — they
+                    // describe the LIVE child. (br_57cef8d6: clobbering them
+                    // here is what made the tray lose a healthy agent and
+                    // storm-restart itself into a 15-minute circuit trip.)
+                    Self.supervisorLog(
+                        "stale exit ignored (status \(proc.terminationStatus)) — superseded agent gen \(generation), current gen \(self.spawnGeneration); the live child keeps its tracking")
+                    return
+                case .intentional:
+                    self.process = nil
                     Self.supervisorLog(
                         "agent exited (status \(proc.terminationStatus), ran \(ranForLog)s) after an intentional stop — staying down")
                     return
+                case .unexpected:
+                    self.process = nil
                 }
                 Self.supervisorLog(
                     "agent exited UNEXPECTEDLY (status \(proc.terminationStatus), ran \(ranForLog)s) — will respawn")
@@ -546,6 +621,12 @@ final class AgentSupervisor {
         guard !pids.isEmpty else { return }
         NSLog("cocore: reaping %d stray agent worker(s): %@",
               pids.count, pids.map(String.init).joined(separator: ","))
+        // Durably, too: a reap means a worker outlived the bookkeeping that was
+        // supposed to own it, and NSLog ages out of the unified log long before
+        // anyone reads the diagnostic bundle. Attributing the SIGTERM/SIGKILL in
+        // br_57cef8d6 to this reaper (rather than to a crashing agent) is what
+        // separated the real bug from a phantom crash loop.
+        supervisorLog("reaping \(pids.count) stray agent worker(s): \(pids.map(String.init).joined(separator: ","))")
         for pid in pids { kill(pid, SIGTERM) }
         Thread.sleep(forTimeInterval: 0.5)
         for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
@@ -560,6 +641,8 @@ final class AgentSupervisor {
         guard !pids.isEmpty else { return }
         NSLog("cocore: reaping %d stray agent worker(s): %@",
               pids.count, pids.map(String.init).joined(separator: ","))
+        // Same durable note as the blocking twin above.
+        supervisorLog("reaping \(pids.count) stray agent worker(s): \(pids.map(String.init).joined(separator: ","))")
         for pid in pids { kill(pid, SIGTERM) }
         try? await Task.sleep(nanoseconds: 500_000_000)
         for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }

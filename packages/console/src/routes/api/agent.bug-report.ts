@@ -11,7 +11,9 @@
 //
 // The handler validates content-type + size, stores the bundle on the
 // filesystem next to the console DB (see bug-reports.server.ts), records
-// a metadata row keyed by the uploader's DID, and returns { ticketId }.
+// a metadata row keyed by the uploader's DID — including the reporter's
+// own note from `X-Cocore-Note`, which the tray has always sent and this
+// route used to discard — and returns { ticketId }.
 //
 // We deliberately never read or log the bundle's contents — the bytes
 // land on disk untouched and the response carries only the ticket id.
@@ -97,7 +99,14 @@ export const Route = createFileRoute("/api/agent/bug-report")({
           );
         }
 
-        const stored = storeBugReport({ did: resolved.did, bytes });
+        // The reporter's description of what went wrong. The tray sends it
+        // as a header alongside the bundle; persisting it is the difference
+        // between triaging a symptom and guessing at one from logs.
+        const stored = storeBugReport({
+          did: resolved.did,
+          bytes,
+          note: request.headers.get("x-cocore-note"),
+        });
 
         return new Response(JSON.stringify({ ticketId: stored.ticketId }), {
           status: 201,
