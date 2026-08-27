@@ -81,13 +81,13 @@ export interface StoredBugReport {
 
 /** Cap on the stored reporter note — it arrives in an HTTP header, so it's
  *  inherently short. Kept in sync with the console's MAX_NOTE_CHARS. */
-export const MAX_NOTE_CHARS = 2000;
+const MAX_NOTE_CHARS = 2000;
 
 /** Normalise a reporter note: drop the C0 control characters HTTP-header
  *  transport can carry, collapse whitespace runs, trim, truncate. Never
  *  returns null, so the column stays NOT NULL. Kept in sync with the
  *  console's normalizeNote in bug-reports.server.ts. */
-export function normalizeNote(raw: string | null | undefined): string {
+function normalizeNote(raw: string | null | undefined): string {
   if (!raw) return "";
   const stripped = Array.from(raw, (ch) => {
     const code = ch.codePointAt(0) ?? 0;
