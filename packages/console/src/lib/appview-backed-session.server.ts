@@ -117,13 +117,34 @@ class AppviewBackedSession {
   }
 }
 
-/** Liveness + PDS-URL for a DID, read from the AppView's owned session
- *  WITHOUT refreshing. `checked` distinguishes a definitive answer (the
- *  AppView responded) from "couldn't reach the AppView" — callers must only
- *  log a user out on `checked && !present`, never on a transient blip. */
-export async function appviewSessionInfo(
-  did: string,
-): Promise<{ checked: boolean; present: boolean; aud: string | null }> {
+export type AppviewSessionInfo = { checked: boolean; present: boolean; aud: string | null };
+
+/**
+ * Rendering one signed-in page asked the AppView for the SAME session-info,
+ * with the same DID, twice: once in `atprotoSessionForRequestEffect` to decide
+ * whether a live session exists, and again via `getPdsUrl` → `getTokenInfo()`
+ * to read `.aud`. Both are serial and on the critical path, so the second one
+ * was pure duplicated latency — measured at roughly a third of a signed-in
+ * page's server time.
+ *
+ * A short TTL collapses them. It is deliberately brief: this read gates
+ * logging a user out, so it must not serve a stale "present" for long. Only
+ * DEFINITIVE answers (`checked: true`) are cached — a transient AppView blip
+ * must be retried on the next call, never remembered.
+ */
+const SESSION_INFO_TTL_MS = 5_000;
+/** Bound on distinct DIDs held at once; the cache is a latency trick, not a
+ *  store, so it is cheaper to drop it wholesale than to track an LRU. */
+const SESSION_INFO_MAX_ENTRIES = 5_000;
+
+const sessionInfoCache = new Map<string, { expiresAt: number; value: AppviewSessionInfo }>();
+
+/** Test seam: drop memoized session-info so cases don't leak into each other. */
+export function resetAppviewSessionInfoCache(): void {
+  sessionInfoCache.clear();
+}
+
+async function fetchAppviewSessionInfo(did: string): Promise<AppviewSessionInfo> {
   const b = base();
   const s = secret();
   if (!b || !s) return { checked: false, present: false, aud: null };
@@ -137,6 +158,27 @@ export async function appviewSessionInfo(
   } catch {
     return { checked: false, present: false, aud: null };
   }
+}
+
+/** Liveness + PDS-URL for a DID, read from the AppView's owned session
+ *  WITHOUT refreshing. `checked` distinguishes a definitive answer (the
+ *  AppView responded) from "couldn't reach the AppView" — callers must only
+ *  log a user out on `checked && !present`, never on a transient blip.
+ *  Definitive answers are memoized for SESSION_INFO_TTL_MS. */
+export async function appviewSessionInfo(did: string): Promise<AppviewSessionInfo> {
+  const now = Date.now();
+  const hit = sessionInfoCache.get(did);
+  if (hit && hit.expiresAt > now) return hit.value;
+
+  const value = await fetchAppviewSessionInfo(did);
+  if (value.checked) {
+    if (sessionInfoCache.size >= SESSION_INFO_MAX_ENTRIES) sessionInfoCache.clear();
+    sessionInfoCache.set(did, { expiresAt: now + SESSION_INFO_TTL_MS, value });
+  } else {
+    // Never let a blip mask a later definitive answer.
+    sessionInfoCache.delete(did);
+  }
+  return value;
 }
 
 /** Build an AppView-backed session for `did`. Structurally implements the

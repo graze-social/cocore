@@ -7,7 +7,11 @@
 import type { Did } from "@atcute/lexicons";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { appviewBackedSession, appviewSessionInfo } from "./appview-backed-session.server.ts";
+import {
+  appviewBackedSession,
+  appviewSessionInfo,
+  resetAppviewSessionInfoCache,
+} from "./appview-backed-session.server.ts";
 
 const DID = "did:plc:abc123" as Did;
 const BASE = "http://appview.internal:8081";
@@ -45,12 +49,17 @@ function mockFetch(reply: { ok?: boolean; status?: number; json: unknown }) {
 beforeEach(() => {
   process.env["COCORE_APPVIEW_INTERNAL_URL"] = BASE;
   process.env["COCORE_INTERNAL_SECRET"] = SECRET;
+  // session-info is memoized per DID; every case here reuses DID, so without
+  // this the second case would read the first one's answer.
+  resetAppviewSessionInfoCache();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   delete process.env["COCORE_APPVIEW_INTERNAL_URL"];
   delete process.env["COCORE_INTERNAL_SECRET"];
+  resetAppviewSessionInfoCache();
 });
 
 describe("AppviewBackedSession.handle", () => {
@@ -149,5 +158,89 @@ describe("appviewSessionInfo", () => {
     vi.stubGlobal("fetch", f);
     expect(await appviewSessionInfo(DID)).toEqual({ checked: false, present: false, aud: null });
     expect(f).not.toHaveBeenCalled();
+  });
+});
+
+describe("appviewSessionInfo memoization", () => {
+  it("asks the AppView once when the same DID is read twice", async () => {
+    // Rendering one signed-in page reads session-info twice: once for
+    // liveness in `atprotoSessionForRequestEffect`, once for `.aud` via
+    // `getPdsUrl` → `getTokenInfo()`. Both are serial and on the critical
+    // path, so the second was pure duplicated latency.
+    const calls = mockFetch({ json: { present: true, aud: "https://pds.example" } });
+
+    const first = await appviewSessionInfo(DID);
+    const second = await appviewSessionInfo(DID);
+
+    expect(calls).toHaveLength(1);
+    expect(first).toEqual({ checked: true, present: true, aud: "https://pds.example" });
+    expect(second).toEqual(first);
+  });
+
+  it("does not let one DID's answer serve another", async () => {
+    const calls = mockFetch({ json: { present: true, aud: "https://pds.example" } });
+
+    await appviewSessionInfo(DID);
+    await appviewSessionInfo("did:plc:someoneelse");
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it("re-reads once the TTL lapses, so a dead session is still noticed", async () => {
+    vi.useFakeTimers();
+    const calls = mockFetch({ json: { present: true, aud: "https://pds.example" } });
+
+    await expect(appviewSessionInfo(DID)).resolves.toMatchObject({ present: true });
+    vi.advanceTimersByTime(5_001);
+    await appviewSessionInfo(DID);
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it("never caches a transient failure, so a blip can't mask a live session", async () => {
+    // `checked: false` means "couldn't reach the AppView", which callers must
+    // not act on. Remembering it would strand the user on a non-answer.
+    let attempt = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("ECONNREFUSED");
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ present: true, aud: "https://pds.example" }),
+        } as unknown as Response;
+      }),
+    );
+
+    await expect(appviewSessionInfo(DID)).resolves.toEqual({
+      checked: false,
+      present: false,
+      aud: null,
+    });
+    await expect(appviewSessionInfo(DID)).resolves.toMatchObject({ checked: true, present: true });
+    expect(attempt).toBe(2);
+  });
+
+  it("treats a non-OK AppView response as a blip, not a definitive absence", async () => {
+    let attempt = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        attempt += 1;
+        return attempt === 1
+          ? ({ ok: false, status: 503, json: async () => ({}) } as unknown as Response)
+          : ({
+              ok: true,
+              status: 200,
+              json: async () => ({ present: true, aud: "https://pds.example" }),
+            } as unknown as Response);
+      }),
+    );
+
+    await expect(appviewSessionInfo(DID)).resolves.toMatchObject({ checked: false });
+    await expect(appviewSessionInfo(DID)).resolves.toMatchObject({ checked: true });
+    expect(attempt).toBe(2);
   });
 });
