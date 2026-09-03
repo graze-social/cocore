@@ -219,6 +219,23 @@ pub fn collect() -> SystemProfile {
         .map(|n| n.get() as u32);
     let os = read_to_string("/etc/os-release").and_then(|c| parse_os_release_pretty(&c));
 
+    let nvidia = nvidia_gpu();
+    let gpu_cores = nvidia.as_ref().map(|g| g.cuda_cores);
+    let memory_bandwidth_gbs = nvidia.as_ref().map(|g| g.bandwidth_gbs);
+    // cocore.dev/models renders machines as "<label> · <chip>, <ram> GB" using
+    // just the chip field — gpuCores/memoryBandwidthGbs aren't surfaced in
+    // the catalog UI. So we surface the GPU in the chip itself on hosts that
+    // have one. On a VM the /proc/cpuinfo "model name" is just the hypervisor
+    // placeholder ("QEMU Virtual CPU")"), not real silicon, so when a GPU is
+    // detected we replace the chip entirely with the GPU model instead of
+    // concatenating. macOS keeps the SoC-only chip shape; this branch is
+    // Linux-only. Non-GPU Linux hosts keep the CPU string (bare-metal, no
+    // hypervisor).
+    let chip = match nvidia.as_ref() {
+        Some(g) => g.name.clone(),
+        None => chip,
+    };
+
     SystemProfile {
         machine_label: machine_label("linux host"),
         chip,
@@ -226,8 +243,8 @@ pub fn collect() -> SystemProfile {
         cpu_cores,
         p_cores: None,
         e_cores: None,
-        gpu_cores: None,
-        memory_bandwidth_gbs: None,
+        gpu_cores,
+        memory_bandwidth_gbs,
         model_identifier: None,
         os,
     }
@@ -283,6 +300,82 @@ fn parse_os_release_pretty(contents: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Best-effort NVIDIA GPU probe. Returns the (CUDA cores, memory bandwidth
+/// in GB/s) for the first NVIDIA GPU we recognize. `None` for non-NVIDIA
+/// hosts or unrecognized models — leaves `gpu_cores` / `memory_bandwidth_gbs`
+/// at their `None` fallbacks so non-NVIDIA providers publish no false data.
+///
+/// `nvidia-smi` is queried at well-known absolute paths because the
+/// systemd unit runs with a stripped PATH (similar to how the macOS tray
+/// needs absolute paths to `system_profiler`).
+#[cfg(target_os = "linux")]
+fn nvidia_gpu() -> Option<NvidiaGpu> {
+    for path in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "/run/current-system/sw/bin/nvidia-smi"] {
+        let out = std::process::Command::new(path)
+            .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
+            .output()
+            .ok();
+        let Some(out) = out else { continue; };
+        if !out.status.success() { continue; }
+        let stdout = String::from_utf8(out.stdout).ok()?;
+        let name = stdout.lines().next()?.trim();
+        if name.is_empty() { continue; }
+        let (cuda_cores, bandwidth_gbs) = nvidia_gpu_specs(name)?;
+        return Some(NvidiaGpu { name: name.to_string(), cuda_cores, bandwidth_gbs });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+struct NvidiaGpu {
+    #[allow(dead_code)]
+    name: String,
+    cuda_cores: u32,
+    bandwidth_gbs: u32,
+}
+
+/// Lookup table for the (cuda_cores, memory_bandwidth_gbs) of NVIDIA cards we
+/// recognize. Extend as new cards ship. Memory bandwidth is the spec-sheet
+/// peak DRAM bandwidth, matching how `bandwidth_for_chip` reports for macOS.
+#[cfg(target_os = "linux")]
+fn nvidia_gpu_specs(name: &str) -> Option<(u32, u32)> {
+    Some(match name {
+        // GeForce RTX 30 series
+        "NVIDIA GeForce RTX 3060" => (3584, 360),
+        "NVIDIA GeForce RTX 3060 Ti" => (4864, 448),
+        "NVIDIA GeForce RTX 3070" => (5888, 448),
+        "NVIDIA GeForce RTX 3080" => (8704, 760),
+        "NVIDIA GeForce RTX 3080 Ti" => (10240, 912),
+        "NVIDIA GeForce RTX 3090" => (10496, 936),
+        "NVIDIA GeForce RTX 3090 Ti" => (10752,  1008),
+        // GeForce RTX 40 series
+        "NVIDIA GeForce RTX 4060" => (3072, 272),
+        "NVIDIA GeForce RTX 4060 Ti" => (4352, 288),
+        "NVIDIA GeForce RTX 4070" => (5888, 504),
+        "NVIDIA GeForce RTX 4070 Ti" => (7680, 504),
+        "NVIDIA GeForce RTX 4080" => (9728, 717),
+        "NVIDIA GeForce RTX 4090" => (16384, 1008),
+        // Data center / workstation
+        "NVIDIA Tesla T4" => (2560, 320),
+        "NVIDIA A100" => (6912, 1555),
+        "NVIDIA A100-SXM4-40GB" => (6912, 1555),
+        "NVIDIA A100-SXM4-80GB" => (6912, 2039),
+        "NVIDIA A100-PCIe-40GB" => (6912, 1555),
+        "NVIDIA A100-PCIe-80GB" => (6912, 2039),
+        "NVIDIA H100" => (14592, 3350),
+        "NVIDIA H100 PCIe" => (14592, 2050),
+        "NVIDIA H100 SXM" => (14592, 3350),
+        "NVIDIA H100 SXM5" => (14592, 3350),
+        "NVIDIA L4" => (7680, 300),
+        "NVIDIA L40" => (18190, 864),
+        "NVIDIA L40S" => (18190, 864),
+        // Older GeForce
+        "NVIDIA GeForce GTX 1080" => (2560, 320),
+        "NVIDIA GeForce GTX 1080 Ti" => (3584, 484),
+        _ => return None,
+    })
 }
 
 // ─────────────────────── other platforms ───────────────────────
