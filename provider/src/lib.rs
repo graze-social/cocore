@@ -16,11 +16,11 @@
 //!   pds             — publishes records via com.atproto.repo.applyWrites
 
 pub mod advisor;
-pub mod determinism;
 pub mod attestation;
 pub mod canonical;
 pub mod codesign;
 pub mod crypto;
+pub mod determinism;
 pub mod diagnostics;
 pub mod engines;
 pub mod error;
