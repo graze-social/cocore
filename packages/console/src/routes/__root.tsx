@@ -44,19 +44,12 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
             href: "/virtual:stylex.css",
           }
         : null,
-      {
-        rel: "preconnect",
-        href: "https://fonts.googleapis.com",
-      },
-      {
-        rel: "preconnect",
-        href: "https://fonts.gstatic.com",
-        crossorigin: true,
-      },
-      {
-        rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap",
-      },
+      // Space Grotesk + Space Mono are self-hosted from /fonts/ and declared
+      // in styles.css, which is already linked above. The render-blocking
+      // fonts.googleapis.com stylesheet that used to live here cost two extra
+      // third-party origins in the critical path — googleapis for the CSS,
+      // and only once that landed did the browser learn to fetch the files
+      // from gstatic — which no amount of preconnecting removes.
     ].filter((x): x is NonNullable<typeof x> => x !== null),
   }),
   shellComponent: RootDocument,
