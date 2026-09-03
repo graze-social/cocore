@@ -1,5 +1,7 @@
 import { Data, Duration, Effect, Schedule } from "effect";
 
+import { slowCallThresholdMs, warnFields } from "@/lib/slow-log.server.ts";
+
 /** JSON subset TanStack server functions can serialize across the RPC boundary. */
 export type JsonValue =
   | string
@@ -221,8 +223,63 @@ function appviewTransportError(e: unknown, url: string): AppviewFetchError {
   });
 }
 
+/**
+ * Per-attempt timing for the AppView read path.
+ *
+ * This is the one call path none of the earlier instrumentation covered, and
+ * it is where signed-in page latency actually lives. The retry schedule makes
+ * a single slow read expensive: 6000 + 250 + 6000 + 500 + 6000 = 18750ms worst
+ * case, which is exactly the 19245ms measured on /friends.
+ *
+ * What matters is not just "slow" but the SHAPE. The AppView answers the same
+ * endpoints in ~340ms over the public edge, at 6x concurrency, while the
+ * console sees multi-second hangs over `services.railway.internal`. So:
+ *
+ *   - attempts clustering at ~6000ms with a timeout  → the request is HANGING,
+ *     not slow. Points at connection setup or a dead pooled socket, since a
+ *     server that never got the request cannot be the cause.
+ *   - a slow first attempt followed by a fast retry   → stale keep-alive
+ *     socket: undici reused a connection the far side had already closed, and
+ *     it hung until abort. Classic, intermittent, invisible to the server.
+ *   - attempts slow but spread across a range         → genuinely slow server
+ *     or saturated link.
+ *
+ * `phase` distinguishes a hang before headers from one during the body read.
+ */
+function logAppviewAttempt(fields: {
+  url: string;
+  attempt: number;
+  ms: number;
+  outcome: string;
+  phase: string;
+}): void {
+  if (fields.ms < slowCallThresholdMs()) return;
+  const path = (() => {
+    try {
+      return new URL(fields.url).pathname;
+    } catch {
+      return fields.url;
+    }
+  })();
+  warnFields("slow appview read", {
+    path,
+    attempt: fields.attempt,
+    ms: fields.ms,
+    outcome: fields.outcome,
+    phase: fields.phase,
+  });
+}
+
+/** Attempt counter per URL, so the log can show whether a retry recovered
+ *  quickly (stale-socket signature) or was uniformly slow. Reset once a URL
+ *  succeeds, so counts stay meaningful rather than growing forever. */
+const attemptCounts = new Map<string, number>();
+
 function appviewFetchOnceEffect<T>(url: string): Effect.Effect<T, AppviewFetchError> {
   return Effect.async((resume) => {
+    const attempt = (attemptCounts.get(url) ?? 0) + 1;
+    attemptCounts.set(url, attempt);
+    const startedAt = Date.now();
     // Every await below is individually guarded, and the whole body runs
     // inside one async function whose rejection can't escape.
     //
@@ -242,9 +299,18 @@ function appviewFetchOnceEffect<T>(url: string): Effect.Effect<T, AppviewFetchEr
           signal: AbortSignal.timeout(APPVIEW_FETCH_TIMEOUT_MS),
         });
       } catch (e) {
+        const cause = (e as { cause?: { code?: string } }).cause;
+        logAppviewAttempt({
+          url,
+          attempt,
+          ms: Date.now() - startedAt,
+          outcome: (e as Error)?.name === "TimeoutError" ? "timeout" : (cause?.code ?? "error"),
+          phase: "headers",
+        });
         resume(Effect.fail(appviewTransportError(e, url)));
         return;
       }
+      const headersMs = Date.now() - startedAt;
 
       let text: string;
       try {
@@ -252,9 +318,26 @@ function appviewFetchOnceEffect<T>(url: string): Effect.Effect<T, AppviewFetchEr
       } catch (e) {
         // Aborted or truncated mid-body — we have headers but no usable
         // payload. Same transient class as a failed connect.
+        logAppviewAttempt({
+          url,
+          attempt,
+          ms: Date.now() - startedAt,
+          outcome: (e as Error)?.name === "TimeoutError" ? "timeout" : "body-error",
+          phase: "body",
+        });
         resume(Effect.fail(appviewTransportError(e, url)));
         return;
       }
+      logAppviewAttempt({
+        url,
+        attempt,
+        ms: Date.now() - startedAt,
+        outcome: `ok-${res.status}`,
+        // Which half of the round-trip was slow: waiting for headers (connect
+        // + server) or streaming the body.
+        phase: headersMs >= Date.now() - startedAt - headersMs ? "headers" : "body",
+      });
+      attemptCounts.delete(url);
 
       if (!res.ok) {
         resume(

@@ -9,13 +9,7 @@
 // This is `.server.ts` so the runtime (and the OTel SDK it pulls in)
 // never reaches the client bundle.
 
-import {
-  logWarn,
-  makeRuntime,
-  record,
-  runTraced as runTracedWith,
-  type SpanAttributes,
-} from "@cocore/o11y";
+import { makeRuntime, runTraced as runTracedWith, type SpanAttributes } from "@cocore/o11y";
 import type { Effect } from "effect";
 
 import { AppviewClient } from "@/integrations/appview/appview.server.ts";
@@ -77,17 +71,6 @@ export function runTraced<A, E>(
   return runTracedWith(runtime, name, effect, attributes);
 }
 
-/** Emit a structured warning from plain async code (no Effect context).
- *  `logWarn` returns an Effect, so callers outside an effect need the
- *  runtime to run it; this is that seam. */
-export function warnFields(message: string, fields: Record<string, string | number | boolean>) {
-  record(runtime, logWarn(message, fields));
-}
-
-/** A call slower than this almost certainly did real network work rather
- *  than hitting a warm path. Tunable without a deploy so the threshold can
- *  be dropped to 0 to capture every call while chasing a latency problem. */
-export function slowCallThresholdMs(): number {
-  const raw = Number(process.env["COCORE_SLOW_CALL_LOG_MS"]);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 750;
-}
+// Re-exported so existing callers keep one import site; the implementation
+// lives in a dependency-free module to avoid an appview.server cycle.
+export { slowCallThresholdMs, warnFields } from "@/lib/slow-log.server.ts";
