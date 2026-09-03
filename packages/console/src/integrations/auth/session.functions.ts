@@ -45,9 +45,7 @@ const getSessionServerFn = createServerFn({ method: "GET" }).handler(() =>
         cocore.displayName == null ||
         cocore.handle == null ||
         cocore.avatarUrl == null;
-      const bsky = needsBskyFallback
-        ? yield* fetchBlueskyPublicProfileFieldsEffect(ctx.did)
-        : null;
+      const bsky = needsBskyFallback ? yield* fetchBlueskyPublicProfileFieldsEffect(ctx.did) : null;
 
       const displayName = cocore?.displayName ?? bsky?.displayName?.trim() ?? null;
       const handle = cocore?.handle ?? bsky?.handle?.trim() ?? null;

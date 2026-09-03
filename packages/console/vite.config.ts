@@ -42,8 +42,12 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url));
  */
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const PUBLIC_ASSET_CACHE = "public, max-age=3600";
-/** Everything Vite emits here is content-hashed; no route serves from it. */
-const IMMUTABLE_PREFIX = "/assets/";
+/**
+ * Everything Vite emits under `/assets/` is content-hashed, and the vendored
+ * woff2 files under `/fonts/` carry a content hash in their filename for the
+ * same reason — so both can be cached forever. No route serves from either.
+ */
+const IMMUTABLE_PREFIXES = ["/assets/", "/fonts/"];
 /** Static, unhashed files copied verbatim out of `public/`. */
 const PUBLIC_ASSET_PREFIXES = ["/goobies/", "/og-fonts/"];
 const PUBLIC_ASSET_PATHS = new Set(["/favicon.svg", "/app-icon.svg", "/robots.txt"]);
@@ -59,7 +63,7 @@ function assetCacheHeaders(): Plugin {
         const isPublicAsset =
           PUBLIC_ASSET_PATHS.has(pathname) ||
           PUBLIC_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix));
-        const cacheControl = pathname.startsWith(IMMUTABLE_PREFIX)
+        const cacheControl = IMMUTABLE_PREFIXES.some((prefix) => pathname.startsWith(prefix))
           ? IMMUTABLE_CACHE
           : isPublicAsset
             ? PUBLIC_ASSET_CACHE
