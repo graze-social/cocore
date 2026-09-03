@@ -11,10 +11,83 @@ import remarkMdxFrontmatter from "remark-mdx-frontmatter";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import stylexPlugin from "@stylexjs/unplugin";
 import viteReact from "@vitejs/plugin-react";
-import { defineConfig, mergeConfig } from "vite";
+import { defineConfig, mergeConfig, type Plugin } from "vite";
 import { defineConfig as defineVitestConfig } from "vitest/config";
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Production is served by `vite preview` (see the `start` script), and Vite's
+ * preview server hands static files to sirv, which hardcodes
+ * `Cache-Control: no-cache` on every hit regardless of filename:
+ *
+ *   headers["Cache-Control"] = isEtag ? "no-cache" : "no-store";
+ *
+ * Every file Vite emits under `/assets/` is content-hashed, so `no-cache` buys
+ * nothing and costs a great deal: the browser must revalidate ~60 files on
+ * every navigation, and Railway's edge can't cache any of them. Measured on
+ * console.cocore.dev before this plugin: a *warm* load transferred only 23KB
+ * of JS yet still spent 1.66s on 50 conditional GETs.
+ *
+ * sirv writes the header itself via `res.writeHead(code, headers)`, so a plain
+ * pre-middleware loses the race — we have to intercept the write. Unhashed
+ * files from `public/` (favicon, goobies, fonts) get a short revalidatable TTL
+ * instead of `immutable`, since their URLs are stable across deploys.
+ *
+ * Matching is a deliberate allowlist of paths that are served straight off
+ * disk, NOT a file-extension test: plenty of real routes set their own
+ * Cache-Control on purpose (`/og.png` caches for a day, `/lexicons/*` for an
+ * hour, `/agent.*` are no-store), and an extension rule silently stomped
+ * `/og.png` down to an hour.
+ */
+const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
+const PUBLIC_ASSET_CACHE = "public, max-age=3600";
+/** Everything Vite emits here is content-hashed; no route serves from it. */
+const IMMUTABLE_PREFIX = "/assets/";
+/** Static, unhashed files copied verbatim out of `public/`. */
+const PUBLIC_ASSET_PREFIXES = ["/goobies/", "/og-fonts/"];
+const PUBLIC_ASSET_PATHS = new Set(["/favicon.svg", "/app-icon.svg", "/robots.txt"]);
+
+function assetCacheHeaders(): Plugin {
+  return {
+    name: "cocore:preview-asset-cache-headers",
+    configurePreviewServer(server) {
+      // `configurePreviewServer` runs before Vite installs its own
+      // middlewares, so this sees the request first.
+      server.middlewares.use((req, res, next) => {
+        const pathname = (req.url ?? "").split("?")[0] ?? "";
+        const isPublicAsset =
+          PUBLIC_ASSET_PATHS.has(pathname) ||
+          PUBLIC_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+        const cacheControl = pathname.startsWith(IMMUTABLE_PREFIX)
+          ? IMMUTABLE_CACHE
+          : isPublicAsset
+            ? PUBLIC_ASSET_CACHE
+            : null;
+        if (cacheControl === null) return next();
+
+        const originalWriteHead = res.writeHead.bind(res);
+        res.writeHead = function patchedWriteHead(status: number, ...rest: unknown[]) {
+          // Drop sirv's own Cache-Control from the headers object it passes
+          // positionally, then set ours — `writeHead` merges what
+          // `setHeader` has recorded with the object argument.
+          for (const arg of rest) {
+            if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+              for (const key of Object.keys(arg as Record<string, unknown>)) {
+                if (key.toLowerCase() === "cache-control") {
+                  delete (arg as Record<string, unknown>)[key];
+                }
+              }
+            }
+          }
+          res.setHeader("Cache-Control", cacheControl);
+          return originalWriteHead(status, ...(rest as []));
+        } as typeof res.writeHead;
+        next();
+      });
+    },
+  };
+}
 
 export default mergeConfig(
   defineConfig({
@@ -80,6 +153,7 @@ export default mergeConfig(
       }),
       tanstackStart(),
       viteReact({ include: /\.(mdx|js|jsx|ts|tsx)$/ }),
+      assetCacheHeaders(),
     ],
   }),
   defineVitestConfig({
