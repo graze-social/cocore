@@ -32,7 +32,22 @@ const getSessionServerFn = createServerFn({ method: "GET" }).handler(() =>
         Effect.tryPromise(() => ensureMyProfile(ctx.oauthSession)),
       );
       const cocore = Either.isRight(cocoreEither) ? cocoreEither.right : null;
-      const bsky = yield* fetchBlueskyPublicProfileFieldsEffect(ctx.did);
+
+      // bsky is only ever a *fallback* for the three fields below, and
+      // `ensureMyProfile` already provisions all of them from bsky on first
+      // sign-in (making its own call to public.api.bsky.app to do it). So on
+      // a settled account this was a second, identical, serial round-trip to
+      // an external service on every single page load, whose result was then
+      // discarded by the `??` chain. Only pay for it when a field is
+      // genuinely missing.
+      const needsBskyFallback =
+        cocore == null ||
+        cocore.displayName == null ||
+        cocore.handle == null ||
+        cocore.avatarUrl == null;
+      const bsky = needsBskyFallback
+        ? yield* fetchBlueskyPublicProfileFieldsEffect(ctx.did)
+        : null;
 
       const displayName = cocore?.displayName ?? bsky?.displayName?.trim() ?? null;
       const handle = cocore?.handle ?? bsky?.handle?.trim() ?? null;

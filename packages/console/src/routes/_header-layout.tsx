@@ -102,12 +102,20 @@ export const Route = createFileRoute("/_header-layout")({
       });
     }
   },
-  loader: async ({ context }) => {
-    await context.queryClient.ensureQueryData(getSessionQueryOptions);
+  loader: ({ context }) => {
+    // `beforeLoad` already awaited the session, so this is a cache read.
     const session = context.queryClient.getQueryData(getSessionQueryOptions.queryKey);
-    if (session) {
-      await context.queryClient.ensureQueryData(listMyMachinesQueryOptions);
-    }
+    if (!session) return;
+    // Start the fleet query but deliberately do NOT await it. This layout
+    // wraps every page in the app, so awaiting here held the whole SSR
+    // response — docs, blog, chat, everything — behind an AppView
+    // listProviders + receipts + advisor round-trip. The only thing it
+    // feeds is the machine-count badge in the navbar, which renders fine
+    // as absent; `setupRouterSsrQueryIntegration` streams the result into
+    // the dehydrated cache, so the badge fills in when the data lands.
+    // `prefetchQuery` (not `ensureQueryData`) so a failure resolves rather
+    // than becoming an unhandled rejection with nothing to catch it.
+    void context.queryClient.prefetchQuery(listMyMachinesQueryOptions);
   },
   component: HeaderLayoutChrome,
 });
