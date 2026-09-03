@@ -9,7 +9,7 @@ import { readAllAuthSessionTokens } from "@/integrations/auth/cookie-parse.ts";
 import { ensureMyProfile } from "@/lib/account-profile.server.ts";
 import { deriveChatStorageKey } from "@/lib/chat-storage-key.server.ts";
 import { fetchBlueskyPublicProfileFieldsEffect } from "@/lib/bluesky-public-profile.server.ts";
-import { runTraced } from "@/lib/o11y.server.ts";
+import { runTraced, slowCallThresholdMs, warnFields } from "@/lib/o11y.server.ts";
 import { atprotoSessionForRequestEffect } from "@/middleware/auth.server.ts";
 
 const getSessionServerFn = createServerFn({ method: "GET" }).handler(() =>
@@ -17,7 +17,13 @@ const getSessionServerFn = createServerFn({ method: "GET" }).handler(() =>
     "auth.getSession",
     Effect.gen(function* () {
       const request = getRequest();
+      // Stage timings: signed-in pages measure 4-10s while every downstream
+      // we can see answers fast (PDS ~235ms, plc ~243ms, and the AppView's
+      // own handler timers stay under threshold). Splitting getSession into
+      // its two I/O stages says which one actually holds the time.
+      const sessionStart = Date.now();
       const ctx = yield* atprotoSessionForRequestEffect(request);
+      const sessionMs = Date.now() - sessionStart;
       if (!ctx) return null;
 
       // Prefer the user's cocore profile over their bsky profile so
@@ -28,10 +34,22 @@ const getSessionServerFn = createServerFn({ method: "GET" }).handler(() =>
       // forever. Wrap in `Either` so a profile-fetch failure (e.g.
       // legacy token missing the profile scope) falls back to the
       // bsky public profile instead of breaking the whole session.
+      const profileStart = Date.now();
       const cocoreEither = yield* Effect.either(
         Effect.tryPromise(() => ensureMyProfile(ctx.oauthSession)),
       );
+      const profileMs = Date.now() - profileStart;
       const cocore = Either.isRight(cocoreEither) ? cocoreEither.right : null;
+
+      const threshold = slowCallThresholdMs();
+      if (sessionMs + profileMs >= threshold) {
+        warnFields("slow getSession", {
+          did: ctx.did,
+          sessionMs,
+          profileMs,
+          totalMs: sessionMs + profileMs,
+        });
+      }
 
       // bsky is only ever a *fallback* for the three fields below, and
       // `ensureMyProfile` already provisions all of them from bsky on first

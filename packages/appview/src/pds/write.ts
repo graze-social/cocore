@@ -238,8 +238,13 @@ interface PdsMeta {
 
 /** Slower than this and the restore almost certainly did network work — a DID
  *  document resolve, an auth-server metadata fetch, or a token refresh with a
- *  DPoP nonce handshake — rather than reading a still-valid stored token. */
-const SLOW_RESTORE_MS = 750;
+ *  DPoP nonce handshake — rather than reading a still-valid stored token.
+ *  Tunable without a deploy: set COCORE_SLOW_CALL_LOG_MS=0 to log every
+ *  restore while chasing a latency problem. */
+function slowRestoreThresholdMs(): number {
+  const raw = Number(process.env["COCORE_SLOW_CALL_LOG_MS"]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 750;
+}
 
 /** Time `restoreSession`, recording ms on `meta`.
  *
@@ -262,7 +267,7 @@ function timedRestore(ctx: PdsWriteContext, did: string, meta: PdsMeta) {
     yield* Effect.annotateCurrentSpan("pds.restore_ms", ms);
     // Warn (not debug) so it lands in service logs without a trace backend
     // attached — this is the live readout while we chase signed-in latency.
-    if (ms >= SLOW_RESTORE_MS) {
+    if (ms >= slowRestoreThresholdMs()) {
       yield* logWarn("slow oauth session restore", { did, ms, outcome: restored._tag });
     }
     return restored;
