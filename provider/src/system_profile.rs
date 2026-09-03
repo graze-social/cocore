@@ -312,18 +312,32 @@ fn parse_os_release_pretty(contents: &str) -> Option<String> {
 /// needs absolute paths to `system_profiler`).
 #[cfg(target_os = "linux")]
 fn nvidia_gpu() -> Option<NvidiaGpu> {
-    for path in ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi", "/run/current-system/sw/bin/nvidia-smi"] {
+    for path in [
+        "/usr/bin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "/run/current-system/sw/bin/nvidia-smi",
+    ] {
         let out = std::process::Command::new(path)
             .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
             .output()
             .ok();
-        let Some(out) = out else { continue; };
-        if !out.status.success() { continue; }
+        let Some(out) = out else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
         let stdout = String::from_utf8(out.stdout).ok()?;
         let name = stdout.lines().next()?.trim();
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
         let (cuda_cores, bandwidth_gbs) = nvidia_gpu_specs(name)?;
-        return Some(NvidiaGpu { name: name.to_string(), cuda_cores, bandwidth_gbs });
+        return Some(NvidiaGpu {
+            name: name.to_string(),
+            cuda_cores,
+            bandwidth_gbs,
+        });
     }
     None
 }
@@ -349,7 +363,7 @@ fn nvidia_gpu_specs(name: &str) -> Option<(u32, u32)> {
         "NVIDIA GeForce RTX 3080" => (8704, 760),
         "NVIDIA GeForce RTX 3080 Ti" => (10240, 912),
         "NVIDIA GeForce RTX 3090" => (10496, 936),
-        "NVIDIA GeForce RTX 3090 Ti" => (10752,  1008),
+        "NVIDIA GeForce RTX 3090 Ti" => (10752, 1008),
         // GeForce RTX 40 series
         "NVIDIA GeForce RTX 4060" => (3072, 272),
         "NVIDIA GeForce RTX 4060 Ti" => (4352, 288),
