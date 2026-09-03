@@ -233,6 +233,40 @@ function parseDelete(b: Record<string, unknown>): DeleteArgs | string {
 interface PdsMeta {
   upstreamMs?: number;
   upstreamStatus?: number;
+  restoreMs?: number;
+}
+
+/** Slower than this and the restore almost certainly did network work — a DID
+ *  document resolve, an auth-server metadata fetch, or a token refresh with a
+ *  DPoP nonce handshake — rather than reading a still-valid stored token. */
+const SLOW_RESTORE_MS = 750;
+
+/** Time `restoreSession`, recording ms on `meta`.
+ *
+ *  Every proxied call restores before it can talk to the PDS, and nothing
+ *  caches that. `pds.upstream_ms` already isolates the PDS round-trip, so
+ *  without this the restore is invisible — folded into the span's total and
+ *  indistinguishable from our own overhead. Signed-in console pages were
+ *  measured at 3.7s best case and 8-10s worst, bimodal, against a PDS that
+ *  answers in ~235ms; this is the number that says whether restore explains
+ *  the gap. Observes only — behaviour is identical to calling it directly. */
+function timedRestore(ctx: PdsWriteContext, did: string, meta: PdsMeta) {
+  return Effect.gen(function* () {
+    const start = Date.now();
+    const restored = yield* Effect.tryPromise({
+      try: () => restoreSession(ctx.oauth, did as Did),
+      catch: (e) => e,
+    }).pipe(Effect.either);
+    const ms = Date.now() - start;
+    meta.restoreMs = ms;
+    yield* Effect.annotateCurrentSpan("pds.restore_ms", ms);
+    // Warn (not debug) so it lands in service logs without a trace backend
+    // attached — this is the live readout while we chase signed-in latency.
+    if (ms >= SLOW_RESTORE_MS) {
+      yield* logWarn("slow oauth session restore", { did, ms, outcome: restored._tag });
+    }
+    return restored;
+  });
 }
 
 /** Time one DPoP-authed call to the user's PDS, recording the upstream HTTP
@@ -417,6 +451,8 @@ function runCore(
           yield* Effect.annotateCurrentSpan("pds.upstream_ms", meta.upstreamMs);
         if (meta.upstreamStatus !== undefined)
           yield* Effect.annotateCurrentSpan("pds.upstream_status", meta.upstreamStatus);
+        if (meta.restoreMs !== undefined)
+          yield* Effect.annotateCurrentSpan("pds.restore_ms", meta.restoreMs);
       }),
     ),
   );
@@ -425,12 +461,9 @@ function runCore(
 /** Restore the session for `did`, or a non-2xx response: 401 when the
  *  session is simply gone, 502 when the restore itself throws (so a broken
  *  OAuth layer is a legible error, not an unhandled defect). */
-function sessionOr401(ctx: PdsWriteContext, did: string) {
+function sessionOr401(ctx: PdsWriteContext, did: string, meta: PdsMeta = {}) {
   return Effect.gen(function* () {
-    const restored = yield* Effect.tryPromise({
-      try: () => restoreSession(ctx.oauth, did as Did),
-      catch: (e) => e,
-    }).pipe(Effect.either);
+    const restored = yield* timedRestore(ctx, did, meta);
     if (restored._tag === "Left") {
       const e = restored.left;
       return {
@@ -470,7 +503,8 @@ function bearerRoute<A extends { collection: string }>(
     const resolved = ctx.accounts.resolveBearerKey(token);
     if (!resolved) return err(401, { error: "AuthRequired", message: "invalid API key" });
 
-    const session = yield* sessionOr401(ctx, resolved.did);
+    const meta: PdsMeta = {};
+    const session = yield* sessionOr401(ctx, resolved.did, meta);
     if (!session.ok) return session.res;
 
     const parsed = yield* Effect.either(jsonBody);
@@ -482,7 +516,6 @@ function bearerRoute<A extends { collection: string }>(
 
     yield* Effect.annotateCurrentSpan("pds.did", resolved.did);
     yield* Effect.annotateCurrentSpan("pds.collection", a.collection);
-    const meta: PdsMeta = {};
     return yield* runCore(op, meta, () => core(ctx, resolved.did, session.session, a, meta));
   }).pipe(Effect.withSpan(`appview.pds.${op}`));
 }
@@ -515,12 +548,12 @@ function internalRoute<A extends { collection: string }>(
     const a = parse(b);
     if (typeof a === "string") return err(400, { error: "InvalidRequest", message: a });
 
-    const session = yield* sessionOr401(ctx, did);
+    const meta: PdsMeta = {};
+    const session = yield* sessionOr401(ctx, did, meta);
     if (!session.ok) return session.res;
 
     yield* Effect.annotateCurrentSpan("pds.did", did);
     yield* Effect.annotateCurrentSpan("pds.collection", a.collection);
-    const meta: PdsMeta = {};
     return yield* runCore(op, meta, () => core(ctx, did, session.session, a, meta));
   }).pipe(Effect.withSpan(`appview.internal.pds.${op}`));
 }
@@ -607,10 +640,8 @@ function internalProxyRoute(ctx: PdsWriteContext, secret: string) {
     const a = parseProxy(parsed.right as Record<string, unknown>);
     if (typeof a === "string") return err(400, { error: "InvalidRequest", message: a });
 
-    const restored = yield* Effect.tryPromise({
-      try: () => restoreSession(ctx.oauth, a.did as Did),
-      catch: (e) => e,
-    }).pipe(Effect.either);
+    const meta: PdsMeta = {};
+    const restored = yield* timedRestore(ctx, a.did, meta);
     if (restored._tag === "Left") {
       const e = restored.left;
       return err(502, {
@@ -630,7 +661,6 @@ function internalProxyRoute(ctx: PdsWriteContext, secret: string) {
     const session = restored.right;
 
     yield* Effect.annotateCurrentSpan("pds.did", a.did);
-    const meta: PdsMeta = {};
     return yield* runCore("proxy", meta, async () => {
       const init = {
         method: a.method,
