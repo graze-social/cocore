@@ -604,6 +604,65 @@ test("listAccounts excludeViewerFriends omits DIDs the viewer has friended", asy
   );
 });
 
+test("listAccounts excludeViewerFriends with NO friends still returns everyone", async () => {
+  // The friend set is now read up front and turned into a literal `NOT IN`
+  // list, so the empty case has to skip the clause entirely — an empty
+  // `NOT IN ()` is a SQL syntax error, and emitting `NOT IN (NULL)` would
+  // silently match nothing and blank the directory.
+  await withAccountsStore(
+    [{ did: "did:plc:alice" }, { did: "did:plc:bob" }, { did: "did:plc:carol" }],
+    async (base) => {
+      const r = await fetch(
+        `${base}/xrpc/dev.cocore.account.listAccounts?viewerDid=${encodeURIComponent("did:plc:alice")}&excludeViewerFriends=true`,
+      );
+      const body = (await r.json()) as { accounts: AccountSummaryWire[]; total: number };
+      // alice is excluded as the viewer; bob and carol remain.
+      assert.equal(body.total, 2);
+      assert.deepEqual(body.accounts.map((a) => a.did).sort(), ["did:plc:bob", "did:plc:carol"]);
+    },
+    [],
+  );
+});
+
+test("listAccounts excludeViewerFriends excludes every friend, not just the first", async () => {
+  await withAccountsStore(
+    [
+      { did: "did:plc:alice" },
+      { did: "did:plc:bob" },
+      { did: "did:plc:carol" },
+      { did: "did:plc:dave" },
+    ],
+    async (base) => {
+      const r = await fetch(
+        `${base}/xrpc/dev.cocore.account.listAccounts?viewerDid=${encodeURIComponent("did:plc:alice")}&excludeViewerFriends=true`,
+      );
+      const body = (await r.json()) as { accounts: AccountSummaryWire[]; total: number };
+      assert.equal(body.total, 1);
+      assert.equal(body.accounts[0]!.did, "did:plc:dave");
+    },
+    [
+      { friender: "did:plc:alice", subject: "did:plc:bob" },
+      { friender: "did:plc:alice", subject: "did:plc:carol" },
+    ],
+  );
+});
+
+test("listAccounts excludeViewerFriends ignores OTHER people's friend records", async () => {
+  // The pre-read is scoped by repo; a friend edge owned by someone else must
+  // not filter the viewer's directory.
+  await withAccountsStore(
+    [{ did: "did:plc:alice" }, { did: "did:plc:bob" }, { did: "did:plc:carol" }],
+    async (base) => {
+      const r = await fetch(
+        `${base}/xrpc/dev.cocore.account.listAccounts?viewerDid=${encodeURIComponent("did:plc:alice")}&excludeViewerFriends=true`,
+      );
+      const body = (await r.json()) as { accounts: AccountSummaryWire[]; total: number };
+      assert.equal(body.total, 2);
+    },
+    [{ friender: "did:plc:bob", subject: "did:plc:carol" }],
+  );
+});
+
 test("listAccounts providersOnly=true filters to DIDs with provider records", async () => {
   await withAccountsStore(
     [

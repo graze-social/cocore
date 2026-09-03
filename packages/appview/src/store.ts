@@ -344,6 +344,32 @@ export class Store {
     return r.changes;
   }
 
+  /** DIDs the viewer has friended — the `subject` of every
+   *  `dev.cocore.account.friend` record in their own repo.
+   *
+   *  Pulled out so {@link listAccounts} can exclude them with a literal set
+   *  instead of a correlated subquery that JSON-parses the viewer's friend
+   *  records once per candidate row. Scoped by `repo` + `collection`, both of
+   *  which the records table indexes, so this is a small indexed read no
+   *  matter how large the directory grows. Rows with a malformed or missing
+   *  `subject` are skipped rather than yielding nulls into the filter. */
+  listViewerFriendSubjects(viewerDid: string): string[] {
+    if (!viewerDid) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(body, '$.subject') AS subject
+           FROM records
+          WHERE repo = ?
+            AND collection = 'dev.cocore.account.friend'`,
+      )
+      .all(viewerDid) as Array<{ subject: unknown }>;
+    const out: string[] = [];
+    for (const r of rows) {
+      if (typeof r.subject === "string" && r.subject.length > 0) out.push(r.subject);
+    }
+    return out;
+  }
+
   upsert(rec: Omit<IndexedRecord, "indexedAt">): void {
     // Version guard: never let a stale, out-of-order, or replayed ingest
     // clobber a newer record body. The AppView is a cache the dashboard
@@ -478,15 +504,29 @@ export class Store {
       params.push(viewerDid);
     }
     if (excludeViewerFriends) {
-      filterClauses.push(
-        `NOT EXISTS (
-          SELECT 1 FROM records fr
-          WHERE fr.repo = ?
-            AND fr.collection = 'dev.cocore.account.friend'
-            AND json_extract(fr.body, '$.subject') = m.repo
-        )`,
-      );
-      params.push(viewerDid);
+      // Read the viewer's friend DIDs ONCE, then filter with a literal set.
+      //
+      // This used to be a correlated `NOT EXISTS` subquery running
+      // `json_extract(fr.body, '$.subject')` per candidate row. There is no
+      // index on the extracted field, so SQLite re-scanned the viewer's friend
+      // records and JSON-parsed each one for every member in the directory —
+      // O(members x friends) with a parse per pair. `better-sqlite3` is
+      // synchronous, so that pinned the AppView's single event loop for the
+      // whole query, and every other request (down to the trivial
+      // `session-info` read) queued behind it. Measured on production:
+      // listAccounts went from 0.64s to 19.5s purely by adding
+      // `excludeViewerFriends=true&viewerDid=...`, and /friends issues four of
+      // these concurrently.
+      //
+      // A viewer's friend list is small and bounded, so one query up front is
+      // strictly cheaper than a per-row subquery, and the JSON parsing happens
+      // once per friend instead of once per (member, friend) pair.
+      const friendDids = this.listViewerFriendSubjects(viewerDid);
+      if (friendDids.length > 0) {
+        filterClauses.push(`m.repo NOT IN (${friendDids.map(() => "?").join(",")})`);
+        params.push(...friendDids);
+      }
+      // No friends → nothing to exclude, so no clause at all.
     }
     if (providersOnly) {
       filterClauses.push("pc.providerCount > 0");
