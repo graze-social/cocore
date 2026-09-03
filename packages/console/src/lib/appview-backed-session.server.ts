@@ -23,6 +23,28 @@
 import type { Did } from "@atcute/lexicons";
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
+import { slowCallThresholdMs, warnFields } from "@/lib/o11y.server.ts";
+
+/** Time one console→AppView call and log it when slow.
+ *
+ *  The AppView already records its own handler time (`pds.restore_ms`,
+ *  `pds.upstream_ms`), and both come back fast while signed-in pages take
+ *  seconds. That leaves a gap neither side measures: the round-trip over
+ *  Railway internal networking, plus any queueing before the handler runs.
+ *  This closes it by timing from the caller — `ms` here minus the AppView's
+ *  own handler time IS that gap. */
+async function timedInternalCall<T>(op: string, did: string, run: () => Promise<T>): Promise<T> {
+  const start = Date.now();
+  try {
+    return await run();
+  } finally {
+    const ms = Date.now() - start;
+    if (ms >= slowCallThresholdMs()) {
+      warnFields("slow console→appview call", { op, did, ms });
+    }
+  }
+}
+
 function base(): string | null {
   return process.env["COCORE_APPVIEW_INTERNAL_URL"]?.replace(/\/$/, "") || null;
 }
@@ -82,18 +104,20 @@ class AppviewBackedSession {
       else bodyText = String(body);
     }
 
-    const res = await fetch(`${b}/internal/pds/proxy`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-cocore-internal-secret": s },
-      body: JSON.stringify({
-        did: this.did,
-        path,
-        method,
-        ...(bodyText !== undefined ? { bodyText } : {}),
-        ...(blobB64 !== undefined ? { blobB64 } : {}),
-        ...(contentType ? { contentType } : {}),
+    const res = await timedInternalCall("proxy", this.did, () =>
+      fetch(`${b}/internal/pds/proxy`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-cocore-internal-secret": s },
+        body: JSON.stringify({
+          did: this.did,
+          path,
+          method,
+          ...(bodyText !== undefined ? { bodyText } : {}),
+          ...(blobB64 !== undefined ? { blobB64 } : {}),
+          ...(contentType ? { contentType } : {}),
+        }),
       }),
-    });
+    );
     if (!res.ok) {
       // Internal-layer failure (403 secret / 502 restore-threw / network):
       // a real transport problem, not an upstream PDS status. Throw so the
@@ -149,9 +173,11 @@ async function fetchAppviewSessionInfo(did: string): Promise<AppviewSessionInfo>
   const s = secret();
   if (!b || !s) return { checked: false, present: false, aud: null };
   try {
-    const res = await fetch(`${b}/internal/pds/session-info?did=${encodeURIComponent(did)}`, {
-      headers: { "x-cocore-internal-secret": s },
-    });
+    const res = await timedInternalCall("session-info", did, () =>
+      fetch(`${b}/internal/pds/session-info?did=${encodeURIComponent(did)}`, {
+        headers: { "x-cocore-internal-secret": s },
+      }),
+    );
     if (!res.ok) return { checked: false, present: false, aud: null };
     const body = (await res.json()) as { present?: boolean; aud?: string | null };
     return { checked: true, present: body.present === true, aud: body.aud ?? null };
