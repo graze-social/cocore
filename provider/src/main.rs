@@ -4314,10 +4314,7 @@ mod vision_fault_tests {
     fn probe_reports_incomplete_when_modules_are_absent() {
         // Presence stage exits 1 and names what's missing — the shape of a
         // venv the installer has not finished filling.
-        let (root, py) = fake_venv(
-            "#!/bin/sh\nprintf 'uvicorn,vllm_mlx' >&2\nexit 1\n",
-            false,
-        );
+        let (root, py) = fake_venv("#!/bin/sh\nprintf 'uvicorn,vllm_mlx' >&2\nexit 1\n", false);
         assert_eq!(
             probe_venv(&py),
             VenvState::Incomplete(vec!["uvicorn".to_string(), "vllm_mlx".to_string()])
@@ -4368,7 +4365,8 @@ mod vision_fault_tests {
         //
         // The fake interpreter reports two modules missing on its first two
         // invocations, then reports everything present.
-        let counter = std::env::temp_dir().join(format!("cocore-venv-count-{}", std::process::id()));
+        let counter =
+            std::env::temp_dir().join(format!("cocore-venv-count-{}", std::process::id()));
         std::fs::write(&counter, "0").unwrap();
         let script = format!(
             "#!/bin/sh\n\
