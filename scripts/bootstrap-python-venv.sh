@@ -36,6 +36,19 @@
 #   2  uv install failed
 #   3  pip install vllm-mlx failed
 #   4  venv verification failed (packages installed but don't import)
+#
+# Readiness marker:
+#   This script writes `$COCORE_PYTHON_VENV/.cocore-venv-ready` as its
+#   LAST act, and deletes it before touching packages. The marker is the
+#   only positive, on-disk signal that the environment is complete —
+#   `bin/python` exists from `uv venv` onward, minutes before the
+#   packages land, so the interpreter's presence says nothing about
+#   whether the venv can actually serve. The agent reads this marker to
+#   tell "the installer is still working" (retry, stay quiet) apart from
+#   "the installed packages are broken" (fault, tell the operator).
+#   Without it, an agent that spawns an engine mid-install sees
+#   `ModuleNotFoundError` and permanently mislabels a healthy machine
+#   as having a broken Python environment.
 
 set -euo pipefail
 
@@ -44,6 +57,11 @@ COCORE_PYTHON_VENV="${COCORE_PYTHON_VENV:-$DEFAULT_VENV}"
 COCORE_PYTHON_VERSION="${COCORE_PYTHON_VERSION:-3.12}"
 COCORE_VLLM_MLX_VERSION="${COCORE_VLLM_MLX_VERSION:-}"
 COCORE_UV="${COCORE_UV:-}"
+
+# Written only after `verify` passes; removed the moment we start
+# mutating packages. See "Readiness marker" in the header.
+readonly READY_MARKER_NAME=".cocore-venv-ready"
+ready_marker() { printf '%s/%s' "$COCORE_PYTHON_VENV" "$READY_MARKER_NAME"; }
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -109,6 +127,12 @@ create_venv() {
 
 install_packages() {
   phase "install vllm-mlx + uvicorn into the venv"
+  # The environment is about to be incomplete for as long as the resolve
+  # + download runs (minutes on a cold cache). Drop the readiness marker
+  # FIRST so a concurrently-running agent — the menu-bar app supervises
+  # one, and re-running this installer does not stop it — reads "still
+  # provisioning" instead of "broken" while packages are in flight.
+  rm -f "$(ready_marker)"
   local pkg="vllm-mlx"
   if [[ -n "$COCORE_VLLM_MLX_VERSION" ]]; then
     pkg="vllm-mlx==$COCORE_VLLM_MLX_VERSION"
@@ -144,6 +168,13 @@ verify() {
   # decouple the version we serve under from vllm-mlx's pin.
   if "$py" -c 'import vllm_mlx.server, uvicorn' 2>/dev/null; then
     note "import vllm_mlx.server, uvicorn: ok"
+    # Verification passed, so the environment is complete AND importable.
+    # Publishing the marker here — after the check, never before — is what
+    # makes it trustworthy: its presence means a real import succeeded on
+    # this interpreter, not merely that files were copied.
+    printf '{"schema":1,"completedAt":"%s","python":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$py" > "$(ready_marker)"
+    note "readiness marker: $(ready_marker)"
   else
     # Hard failure, not a warning: a venv that installed but doesn't import
     # means EVERY engine spawn will crash at startup and the machine will
@@ -155,6 +186,8 @@ verify() {
     err "venv verification failed — the installed packages don't import:"
     "$py" -c 'import vllm_mlx.server, uvicorn' 2>&1 | sed 's/^/    /' >&2 || true
     err "re-run this installer to retry; if it persists, DM @cocore.dev on Bluesky"
+    # Leave the readiness marker absent (install_packages already removed
+    # it). A venv that installed but won't import must never look ready.
     exit 4
   fi
 }
