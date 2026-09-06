@@ -155,37 +155,12 @@ export function discoverAccountsQueryOptions(input: DiscoverAccountsInput) {
 /** Discovery grid page size; `/friends` loader and `DiscoverFriendsCard` share this. */
 export const FRIENDS_DISCOVER_PAGE_SIZE = 24;
 
-/** First page, “recent activity” (default UI) — `/friends` loader awaits this. */
+/** First page, “recent activity” (default UI) — the only variant the
+ *  `/friends` loader awaits. Every other filter combination is built
+ *  on demand by `DiscoverFriendsCard` via `discoverAccountsQueryOptions`. */
 export const friendsDiscoverRecentFirstPageQueryOptions = discoverAccountsQueryOptions({
   sortBy: "recent",
   providersOnly: false,
-  excludeViewerFriends: true,
-  limit: FRIENDS_DISCOVER_PAGE_SIZE,
-  offset: 0,
-});
-
-/** First page, “newest signup” — `/friends` loader prefetches without awaiting. */
-export const friendsDiscoverNewestFirstPageQueryOptions = discoverAccountsQueryOptions({
-  sortBy: "newest",
-  providersOnly: false,
-  excludeViewerFriends: true,
-  limit: FRIENDS_DISCOVER_PAGE_SIZE,
-  offset: 0,
-});
-
-/** First page, “recent activity” + providers only — `/friends` loader prefetches lazily. */
-export const friendsDiscoverRecentProvidersFirstPageQueryOptions = discoverAccountsQueryOptions({
-  sortBy: "recent",
-  providersOnly: true,
-  excludeViewerFriends: true,
-  limit: FRIENDS_DISCOVER_PAGE_SIZE,
-  offset: 0,
-});
-
-/** First page, “newest signup” + providers only — `/friends` loader prefetches lazily. */
-export const friendsDiscoverNewestProvidersFirstPageQueryOptions = discoverAccountsQueryOptions({
-  sortBy: "newest",
-  providersOnly: true,
   excludeViewerFriends: true,
   limit: FRIENDS_DISCOVER_PAGE_SIZE,
   offset: 0,

@@ -3239,6 +3239,8 @@ fn build_engines(
 
     let mut failed: Vec<String> = vec![];
     let mut saw_venv_missing = false;
+    // Modules the venv still lacked after we waited for the installer.
+    let mut venv_missing_modules: Vec<String> = vec![];
     let mut last_err: Option<String> = None;
 
     let tool_config = cocore_provider::engines::subprocess::VllmToolConfig::from_env();
@@ -3265,6 +3267,17 @@ fn build_engines(
                     tool_call_models.push(model.clone());
                 }
                 registry.register(model.clone(), std::sync::Arc::new(engine));
+            }
+            Err(EngineStartFailure::VenvIncomplete(missing)) => {
+                for m in missing {
+                    if !venv_missing_modules.contains(&m) {
+                        venv_missing_modules.push(m);
+                    }
+                }
+                // Same stable phrase as the other terminal arms so
+                // `models_cli::match_log_line` and the tray keep matching.
+                tracing::warn!(model = %model, reason = "venv-incomplete", "inference engine load failed");
+                failed.push(model.clone());
             }
             Err(EngineStartFailure::VenvMissing) => {
                 saw_venv_missing = true;
@@ -3305,7 +3318,38 @@ fn build_engines(
     // the most actionable global problem, then real load failures, then
     // RAM-floor skips. The chosen message's prose references its own
     // category's models; `models` always carries the full unserved set.
-    let fault = if saw_venv_missing {
+    let fault = if !venv_missing_modules.is_empty() {
+        // The interpreter is present but the packages the engine imports are
+        // not — and they did not arrive while we waited. This is an install
+        // that never finished, NOT a dependency conflict, so the message must
+        // not send the operator hunting for a version mismatch. Most often
+        // the installer was interrupted (closed terminal, sleep, dropped
+        // network) partway through the ~250MB dependency download.
+        tracing::warn!(
+            models = ?failed,
+            missing = ?venv_missing_modules,
+            "python environment is incomplete (packages never finished installing); serving stub only"
+        );
+        EngineFault {
+            code: "python-env-incomplete".to_string(),
+            message: format!(
+                "The Python inference environment at {} is incomplete: it is missing \
+                 [{}], so the configured model(s) [{}] could not load. The models \
+                 themselves are fine, and nothing is misconfigured — this almost \
+                 always means the installer did not finish downloading its \
+                 dependencies (about 250MB) before it was interrupted. The machine \
+                 is online but only serving the no-op `stub` engine, so it won't be \
+                 matched to real inference jobs. Fix: re-run the installer and let it \
+                 run to completion — `curl -fsSL https://cocore.dev/agent | sh` — then \
+                 start serving again.",
+                venv_python.display(),
+                venv_missing_modules.join(", "),
+                failed.join(", "),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
+    } else if saw_venv_missing {
         EngineFault {
             code: "venv-missing".to_string(),
             message: format!(
@@ -3526,6 +3570,12 @@ fn build_engines(
 enum EngineStartFailure {
     /// The venv interpreter never appeared across all attempts.
     VenvMissing,
+    /// The interpreter is there but the Python packages the engine needs
+    /// are not installed, and they did not arrive within the wait budget.
+    /// Carries the module names still missing. Distinct from `Failed`
+    /// because the operator's fix is "let the installer finish / re-run
+    /// it", not "your dependencies are incompatible".
+    VenvIncomplete(Vec<String>),
     /// The subprocess was spawned but never became ready. Carries the
     /// last attempt's content-safe error string for local logging.
     Failed(String),
@@ -3544,15 +3594,23 @@ const ENGINE_START_MAX_ATTEMPTS: u32 = 3;
 /// download to make progress.
 const ENGINE_START_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// Whether an engine-start error is the "the Python environment itself is
-/// broken" failure — the wrapper (`cocore_inference_server.py`) dying at
-/// IMPORT time, before any model or socket work. This is deterministic: no
-/// amount of retrying or model-picking helps, only re-provisioning the venv.
-/// Seen in the field when an unconstrained dependency resolve pulled
-/// transformers 5.13.0, whose stricter `AutoTokenizer.register` broke
-/// mlx-lm's import (`AttributeError: 'str' object has no attribute
-/// '__module__'`). Detected from the captured startup stderr, which is
-/// content-safe (library tracebacks only — no request has been served yet).
+/// Whether an engine-start error is the "the wrapper died at IMPORT time"
+/// failure — `cocore_inference_server.py` crashing before any model or socket
+/// work. Detected from the captured startup stderr, which is content-safe
+/// (library tracebacks only — no request has been served yet).
+///
+/// This is the *trigger* for diagnosis, not the diagnosis itself. An import
+/// crash has two very different causes that look identical here:
+///
+///   * the venv is mid-install and the module simply isn't there yet, and
+///   * the venv is complete but its dependency versions don't work together
+///     (transformers 5.13.0 vs mlx-lm's `AutoTokenizer.register`, which
+///     raises `AttributeError: 'str' object has no attribute '__module__'`).
+///
+/// Treating both as terminal is what let a two-second race latch a healthy
+/// machine into "broken Python environment" for the life of the process.
+/// Callers must resolve the ambiguity with [`probe_venv`] / [`await_venv_ready`]
+/// before reporting a fault.
 fn is_python_env_broken(last_err: Option<&str>) -> bool {
     let Some(e) = last_err else { return false };
     let import_traceback = e.contains("Traceback")
@@ -3561,6 +3619,234 @@ fn is_python_env_broken(last_err: Option<&str>) -> bool {
     // exactly so it classifies even if a future wrapper reorders imports.
     let transformers_register_break = e.contains("'str' object has no attribute '__module__'");
     import_traceback || transformers_register_break
+}
+
+/// Filename of the readiness marker `scripts/bootstrap-python-venv.sh`
+/// writes into the venv root once its own import verification passes.
+///
+/// This exists because `bin/python` is a *useless* readiness signal: `uv
+/// venv` creates the interpreter in under a second, and the packages land
+/// one to several minutes later. Every check that asked "does the venv
+/// python exist?" therefore answered "yes" during the entire window in
+/// which the venv could not serve anything.
+const VENV_READY_MARKER: &str = ".cocore-venv-ready";
+
+/// Top-level modules `cocore_inference_server.py` imports before it looks
+/// at a model. If one of these is absent the engine cannot start — and the
+/// installer, not the operator, is what puts them there. That distinction
+/// is the whole point of [`probe_venv`]: a *missing* module means "not
+/// finished installing", while a module that is present but raises on
+/// import means "genuinely broken".
+const VENV_REQUIRED_MODULES: [&str; 3] = ["uvicorn", "vllm_mlx", "mlx_lm"];
+
+/// What a probe of the venv concluded. Ordered by how actionable it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VenvState {
+    /// Every required module is installed AND imports cleanly. The venv can
+    /// host an engine right now.
+    Ready,
+    /// At least one required module is not installed yet. Either the
+    /// installer is running concurrently with us, or it died partway
+    /// through. Retrying is meaningful; faulting is not.
+    Incomplete(Vec<String>),
+    /// Everything is installed but importing it raises. A real dependency
+    /// break (the transformers-5.13 / mlx-lm case is the known instance).
+    /// No amount of waiting helps — only re-provisioning.
+    Broken(String),
+    /// The probe itself could not run (interpreter missing, not executable,
+    /// or it hung past its timeout). Carries a content-safe reason.
+    Unknown(String),
+}
+
+/// Run a short snippet under the venv interpreter with a hard timeout.
+///
+/// `std::process::Command::output()` blocks forever, and these probes run on
+/// the serve path during startup — a hung interpreter (a half-written shared
+/// library, a stalled network filesystem) must not wedge the agent. Returns
+/// `(exit_ok, captured_stderr)`. Stderr is content-safe: these snippets
+/// touch no request data, only the import machinery.
+fn run_venv_probe(
+    venv_python: &std::path::Path,
+    code: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<(bool, String), String> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(venv_python)
+        .arg("-c")
+        .arg(code)
+        // An operator's shell config can point PYTHONPATH / PYTHONHOME at a
+        // different interpreter's libraries, which would make the probe
+        // disagree with the engine spawn. Clear both so we measure the venv
+        // itself, exactly as the engine subprocess sees it.
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONHOME")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", venv_python.display()))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "probe of {} timed out after {}s",
+                        venv_python.display(),
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("probe wait failed: {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("probe output failed: {e}"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+/// Ask the venv what state it is in, cheaply.
+///
+/// Two stages, because they cost three orders of magnitude apart:
+///
+///  1. **Presence** (~15ms): `importlib.util.find_spec` locates each
+///     required module *without executing it*. A site-packages that the
+///     installer is still filling answers instantly, so polling this while
+///     an install runs is effectively free.
+///  2. **Import** (~2s): only once everything is present do we pay for the
+///     real `import`, which is the same work the engine wrapper does and so
+///     is the authoritative Ready/Broken verdict.
+///
+/// Deliberately probe-based rather than marker-based: every machine
+/// installed before the marker existed has a perfectly healthy venv and no
+/// marker, and must be judged Ready on the evidence rather than made to wait
+/// for a file that will never appear.
+fn probe_venv(venv_python: &std::path::Path) -> VenvState {
+    if !venv_python.exists() {
+        return VenvState::Unknown(format!("no interpreter at {}", venv_python.display()));
+    }
+    let mods = VENV_REQUIRED_MODULES
+        .iter()
+        .map(|m| format!("'{m}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    // Prints the missing names (if any) and exits 1, so one cheap call
+    // yields both the verdict and the detail for the operator message.
+    let presence = format!(
+        "import importlib.util as u, sys\n\
+         missing = [m for m in ({mods},) if u.find_spec(m) is None]\n\
+         sys.stderr.write(','.join(missing))\n\
+         sys.exit(1 if missing else 0)\n"
+    );
+    match run_venv_probe(venv_python, &presence, std::time::Duration::from_secs(60)) {
+        Err(e) => return VenvState::Unknown(e),
+        Ok((false, stderr)) => {
+            let missing: Vec<String> = stderr
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Exited non-zero with nothing named: the interpreter itself is
+            // sick (a broken stdlib, a dyld failure). Not our "incomplete"
+            // case — don't sit and wait for it.
+            if missing.is_empty() {
+                return VenvState::Unknown(if stderr.is_empty() {
+                    "interpreter failed to run the presence probe".to_string()
+                } else {
+                    stderr
+                });
+            }
+            return VenvState::Incomplete(missing);
+        }
+        Ok((true, _)) => {}
+    }
+    // Everything is installed. Now the expensive, decisive part.
+    let import = format!(
+        "import {}\nimport vllm_mlx.server\n",
+        VENV_REQUIRED_MODULES.join(", ")
+    );
+    match run_venv_probe(venv_python, &import, std::time::Duration::from_secs(180)) {
+        Err(e) => VenvState::Unknown(e),
+        Ok((true, _)) => VenvState::Ready,
+        Ok((false, stderr)) => VenvState::Broken(stderr),
+    }
+}
+
+/// Whether the venv bootstrap has published its completion marker.
+///
+/// Only ever used to make a *negative* verdict fast — a `Broken` probe with
+/// the marker present is final, because the installer already verified this
+/// exact interpreter and something has broken it since. Never used to
+/// declare readiness (see [`probe_venv`]): pre-marker installs have none.
+fn venv_marker_present(venv_python: &std::path::Path) -> bool {
+    venv_python
+        .parent() // .../python/bin
+        .and_then(|p| p.parent()) // .../python
+        .map(|root| root.join(VENV_READY_MARKER).exists())
+        .unwrap_or(false)
+}
+
+/// How long to wait for an in-flight venv install to finish before giving up
+/// and reporting a fault. The install is a ~250MB dependency resolve, so it
+/// runs one to several minutes on a cold cache; a slow link stretches that.
+/// Waiting costs nothing an operator can see — the machine is already up and
+/// registered, just serving `stub` — so the budget is generous.
+fn venv_ready_timeout() -> std::time::Duration {
+    std::env::var("COCORE_VENV_READY_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(600))
+}
+
+/// Block until the venv becomes usable, or the budget runs out.
+///
+/// This closes the race that made a healthy machine report a broken Python
+/// environment: the agent spawns an engine, the installer is 75 seconds from
+/// finishing, the import fails, and the old code treated that single failure
+/// as terminal. Now the missing-module case parks here and the engine starts
+/// the moment the install lands.
+///
+/// Returns the last state observed. `Ready` means "retry the spawn now".
+fn await_venv_ready(venv_python: &std::path::Path) -> VenvState {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + venv_ready_timeout();
+    let mut last = probe_venv(venv_python);
+    let mut logged_wait = false;
+    loop {
+        match &last {
+            VenvState::Ready => return last,
+            // Installed-but-raises is only final once we know the install
+            // itself finished. Mid-install, a partially-written package can
+            // import-fail transiently, so keep waiting for the marker.
+            VenvState::Broken(_) if venv_marker_present(venv_python) => return last,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return last;
+        }
+        if !logged_wait {
+            logged_wait = true;
+            tracing::info!(
+                python = %venv_python.display(),
+                budget_s = venv_ready_timeout().as_secs(),
+                state = ?last,
+                "python environment is not ready yet (installer likely still provisioning); waiting"
+            );
+        }
+        std::thread::sleep(POLL);
+        last = probe_venv(venv_python);
+    }
 }
 
 /// Whether an engine-start error is the "this VLM's image config is broken"
@@ -3631,7 +3917,15 @@ fn start_engine_with_recovery(
 {
     use cocore_provider::engines::subprocess::SubprocessEngine;
     let mut last_err: Option<String> = None;
-    for attempt in 1..=ENGINE_START_MAX_ATTEMPTS {
+    // Retries granted because we waited out an in-flight venv install do NOT
+    // consume a normal attempt: the previous failure was the installer's
+    // race, not this engine's. Capped so a venv that flickers between ready
+    // and broken can't spin here forever.
+    const MAX_VENV_RECOVERIES: u32 = 2;
+    let mut venv_recoveries = 0u32;
+    let mut attempt = 0u32;
+    while attempt < ENGINE_START_MAX_ATTEMPTS {
+        attempt += 1;
         if !venv_python.exists() {
             last_err = Some(format!("venv python missing at {}", venv_python.display()));
             tracing::warn!(
@@ -3646,15 +3940,52 @@ fn start_engine_with_recovery(
                     Ok(()) => return Ok(engine),
                     Err(e) => {
                         let err = format!("{e:#}");
-                        // An import-time crash of the wrapper is deterministic —
-                        // the venv's packages are broken, and the same spawn will
-                        // fail identically every time. Retrying (and then
-                        // retrying the NEXT model) just burns minutes before the
-                        // operator sees the fault; bail to classification now.
+                        // The wrapper died at import. Before calling that a
+                        // broken environment, find out whether the environment
+                        // is merely UNFINISHED — the installer creates
+                        // `bin/python` a minute or more before the packages
+                        // land, and the menu-bar app keeps an agent running
+                        // straight through a re-install, so this crash is at
+                        // least as often a race as a real dependency break.
                         if is_python_env_broken(Some(&err)) {
-                            tracing::warn!(model = %model, attempt, error = %err,
-                                "inference subprocess died at import (broken python env); not retrying");
-                            return Err(EngineStartFailure::Failed(err));
+                            match await_venv_ready(venv_python) {
+                                // The install finished (or was already fine and
+                                // this was a transient mid-write read). Retry
+                                // the spawn immediately rather than burning an
+                                // attempt on backoff.
+                                VenvState::Ready => {
+                                    tracing::info!(model = %model, attempt,
+                                        "python environment became ready; retrying engine start");
+                                    // Refund the attempt this race cost us, so
+                                    // an install that lands on the LAST attempt
+                                    // still gets a spawn instead of falling
+                                    // through to a fault it no longer deserves.
+                                    if venv_recoveries < MAX_VENV_RECOVERIES {
+                                        venv_recoveries += 1;
+                                        attempt -= 1;
+                                    }
+                                    last_err = Some(err);
+                                    continue;
+                                }
+                                VenvState::Incomplete(missing) => {
+                                    tracing::warn!(model = %model, attempt, missing = ?missing,
+                                        "python environment is still incomplete after waiting; not retrying");
+                                    return Err(EngineStartFailure::VenvIncomplete(missing));
+                                }
+                                // Installed but won't import, or the
+                                // interpreter itself is unusable: deterministic,
+                                // and retrying cannot help.
+                                VenvState::Broken(detail) => {
+                                    tracing::warn!(model = %model, attempt, detail = %detail,
+                                        "python environment is installed but does not import; not retrying");
+                                    return Err(EngineStartFailure::Failed(err));
+                                }
+                                VenvState::Unknown(reason) => {
+                                    tracing::warn!(model = %model, attempt, reason = %reason,
+                                        "could not probe the python environment; treating the import crash as terminal");
+                                    return Err(EngineStartFailure::Failed(err));
+                                }
+                            }
                         }
                         tracing::warn!(model = %model, attempt, error = %err, "inference subprocess failed to start; will retry");
                         last_err = Some(err);
@@ -3948,7 +4279,163 @@ mod vision_fault_tests {
         let err = "exited during startup with exit status: 1\n\
                    [stderr] Traceback (most recent call last):\n\
                    [stderr] ModuleNotFoundError: No module named 'vllm_mlx'";
+        // Still classifies as an import-time crash — but that is now only the
+        // trigger for probing the venv, not a terminal verdict on its own.
         assert!(is_python_env_broken(Some(err)));
+    }
+
+    use super::{probe_venv, venv_marker_present, VenvState, VENV_READY_MARKER};
+
+    /// A venv-shaped temp dir whose `bin/python` is a shell script we control,
+    /// so the probe's two stages can be driven without a real interpreter.
+    fn fake_venv(script: &str, marker: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cocore-venv-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let py = root.join("bin/python");
+        let mut f = std::fs::File::create(&py).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if marker {
+            std::fs::write(root.join(VENV_READY_MARKER), "{\"schema\":1}").unwrap();
+        }
+        (root, py)
+    }
+
+    #[test]
+    fn probe_reports_incomplete_when_modules_are_absent() {
+        // Presence stage exits 1 and names what's missing — the shape of a
+        // venv the installer has not finished filling.
+        let (root, py) = fake_venv("#!/bin/sh\nprintf 'uvicorn,vllm_mlx' >&2\nexit 1\n", false);
+        assert_eq!(
+            probe_venv(&py),
+            VenvState::Incomplete(vec!["uvicorn".to_string(), "vllm_mlx".to_string()])
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn probe_reports_ready_without_a_marker() {
+        // Every machine installed before the marker existed has a healthy venv
+        // and no marker. Readiness must come from the probe, never the file,
+        // or those machines would wait out the budget on every engine start.
+        let (root, py) = fake_venv("#!/bin/sh\nexit 0\n", false);
+        assert_eq!(probe_venv(&py), VenvState::Ready);
+        assert!(!venv_marker_present(&py));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn probe_reports_broken_when_present_but_import_raises() {
+        // Presence passes (no args match), the import stage raises: the
+        // transformers-5.13 class of failure, which waiting cannot fix.
+        let script = "#!/bin/sh\ncase \"$2\" in *find_spec*) exit 0;; esac\n\
+                      printf \"AttributeError: 'str' object has no attribute '__module__'\" >&2\nexit 1\n";
+        let (root, py) = fake_venv(script, true);
+        match probe_venv(&py) {
+            VenvState::Broken(d) => assert!(d.contains("__module__"), "got {d}"),
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn probe_reports_unknown_when_the_interpreter_is_missing() {
+        let missing = std::path::Path::new("/nonexistent/cocore/python/bin/python");
+        assert!(matches!(probe_venv(missing), VenvState::Unknown(_)));
+    }
+
+    use super::await_venv_ready;
+
+    #[test]
+    fn await_returns_ready_when_the_install_lands_mid_wait() {
+        // The exact production race: the agent probes an interpreter whose
+        // packages are still downloading, then the installer finishes. The
+        // old code took the first failure as terminal and latched a
+        // "broken python environment" fault on a machine that was fine
+        // two seconds later. Waiting must convert that into a clean retry.
+        //
+        // The fake interpreter reports two modules missing on its first two
+        // invocations, then reports everything present.
+        let counter =
+            std::env::temp_dir().join(format!("cocore-venv-count-{}", std::process::id()));
+        std::fs::write(&counter, "0").unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             n=$(cat {c})\n\
+             echo $((n+1)) > {c}\n\
+             if [ \"$n\" -lt 2 ]; then printf 'uvicorn,vllm_mlx' >&2; exit 1; fi\n\
+             exit 0\n",
+            c = counter.display()
+        );
+        let (root, py) = fake_venv(&script, false);
+        std::env::set_var("COCORE_VENV_READY_TIMEOUT_S", "60");
+        let got = await_venv_ready(&py);
+        std::env::remove_var("COCORE_VENV_READY_TIMEOUT_S");
+        assert_eq!(got, VenvState::Ready, "must recover once the install lands");
+        std::fs::remove_file(&counter).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn await_gives_up_promptly_when_the_install_is_broken_and_marked_done() {
+        // Marker present + import raises => the installer already verified
+        // this interpreter and something broke it since. Terminal, and it
+        // must NOT sit out the whole budget before saying so.
+        let script = "#!/bin/sh\ncase \"$2\" in *find_spec*) exit 0;; esac\n\
+                      printf \"AttributeError: 'str' object has no attribute '__module__'\" >&2\nexit 1\n";
+        let (root, py) = fake_venv(script, true);
+        std::env::set_var("COCORE_VENV_READY_TIMEOUT_S", "300");
+        let started = std::time::Instant::now();
+        let got = await_venv_ready(&py);
+        std::env::remove_var("COCORE_VENV_READY_TIMEOUT_S");
+        assert!(matches!(got, VenvState::Broken(_)), "got {got:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "must return immediately, took {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn await_reports_incomplete_when_the_install_never_finishes() {
+        // An installer that died partway leaves the interpreter behind with
+        // no packages and no marker. After the budget we report the honest
+        // "incomplete" fault, naming what's missing — not "broken deps".
+        let (root, py) = fake_venv(
+            "#!/bin/sh\nprintf 'uvicorn,vllm_mlx,mlx_lm' >&2\nexit 1\n",
+            false,
+        );
+        std::env::set_var("COCORE_VENV_READY_TIMEOUT_S", "1");
+        let got = await_venv_ready(&py);
+        std::env::remove_var("COCORE_VENV_READY_TIMEOUT_S");
+        assert_eq!(
+            got,
+            VenvState::Incomplete(vec![
+                "uvicorn".to_string(),
+                "vllm_mlx".to_string(),
+                "mlx_lm".to_string()
+            ])
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn marker_is_read_from_the_venv_root_not_the_bin_dir() {
+        let (root, py) = fake_venv("#!/bin/sh\nexit 0\n", true);
+        assert!(venv_marker_present(&py));
+        std::fs::remove_file(root.join(VENV_READY_MARKER)).unwrap();
+        assert!(!venv_marker_present(&py));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
