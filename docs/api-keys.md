@@ -34,14 +34,21 @@ agent that's just the `atproto-proxy` header:
 await agent.call(
   "dev.cocore.account.listApiKeys",
   {},
-  { headers: { "atproto-proxy": "did:web:console.cocore.dev#cocore_account" } },
+  { headers: { "atproto-proxy": "did:web:cocore.dev#cocore_console" } },
 );
 ```
 
 The PDS resolves the console's DID document (served at
-`https://console.cocore.dev/.well-known/did.json`), forwards the request to
-`https://console.cocore.dev/xrpc/<nsid>`, and signs a JWT whose `iss` is your
-DID, `aud` is `did:web:console.cocore.dev`, and `lxm` is the method NSID. The
+`https://cocore.dev/.well-known/did.json`; the document's `id` is
+`did:web:cocore.dev` and its single service is `#cocore_console`), forwards the
+request to `https://cocore.dev/xrpc/<nsid>`, and signs a JWT whose `iss` is your
+DID, `aud` is `did:web:cocore.dev`, and `lxm` is the method NSID.
+
+> **Granular OAuth scopes.** A PDS will only proxy a call like this when the
+> OAuth session was granted `rpc:<nsid>?aud=did:web:cocore.dev%23cocore_console`
+> at login; otherwise it answers `403 ScopeMissingError`. Your own session at the
+> console has that grant. A *third-party* application acting for its users
+> usually does not, and should use device pairing instead — see below. The
 console verifies that signature against your DID document — so a valid token is
 proof you control the DID, with no shared secret. This is the recommended path:
 because you authenticate with your own identity, there's nothing to bootstrap.
@@ -183,3 +190,43 @@ A bearer key can mint and delete other keys for the same account, so treat
 it like a password. Revoke any key you suspect is leaked — that severs every
 capability it carried (inference, the proxy, and key management alike) in one
 step, while leaving a `revokedAt` audit marker behind.
+
+## Connecting an application on a user's behalf
+
+An application that wants to run inference for its users (Graze's Feed Pulse
+is the first) should not ask them to copy keys around, and cannot mint keys
+through their PDS unless its own OAuth client requested the `rpc` scope above.
+The device-pairing flow (`dev.cocore.devicePair.*`) covers this: it is the same
+OAuth device-authorization pattern `cocore agent pair` uses, with optional
+metadata so the approve screen can say who is asking.
+
+1. **Start**, server-side, with your app's identity:
+   ```sh
+   curl -sS -X POST https://cocore.dev/api/xrpc/dev.cocore.devicePair.start \
+     -H 'Content-Type: application/json' \
+     -d '{"appName":"Graze","keyName":"Graze Feed Pulse","returnUrl":"https://www.graze.social/app/account?cocore=connected"}'
+   ```
+   ```json
+   { "deviceId": "…32 hex…", "userCode": "K7PX2M4Q",
+     "verificationUri": "https://cocore.dev/devices/new?code=K7PX2M4Q",
+     "pollIntervalSecs": 3, "expiresInSecs": 600 }
+   ```
+   Keep `deviceId` on your server; it is the only credential needed to collect
+   the key. `returnUrl` must be https and on a host the deployment allowlists
+   (`COCORE_PAIR_RETURN_HOSTS`), otherwise it is dropped and the approve screen
+   ends with "you can close this tab".
+2. **Send the user to `verificationUri`** as a top-level navigation. If they are
+   not signed in at co/core they sign in first (which also gives the network
+   the session it needs to run jobs for them) and land back on the approve
+   screen, which reads *"Connect Graze to co/core — Graze is asking for an API
+   key on your account, named `Graze Feed Pulse` …"*. On approval the browser is
+   sent to `returnUrl`.
+3. **Poll** `GET https://cocore.dev/api/xrpc/dev.cocore.devicePair.poll?deviceId=…`
+   every `pollIntervalSecs`. `pending` until they act; `session` exactly once,
+   carrying `{did, handle, apiKey, apiBase}`; then `consumed`. `denied` and
+   `expired` (ten minutes) are terminal. Verify `did` is the user you expected
+   before storing `apiKey`.
+
+`dev.cocore.devicePair.describe?userCode=…` is the public read the approve screen
+uses; it echoes only what you sent at `start`. All three unauthenticated endpoints
+are rate-limited per client IP.

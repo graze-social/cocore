@@ -23,6 +23,7 @@ import {
   startServiceSessionKeepAlive,
 } from "../auth/oauth-client.ts";
 import { buildDevicePairRouter } from "../devicepair/routes.ts";
+import { parseReturnHosts } from "../devicepair/pair-meta.ts";
 import { PairStore } from "../devicepair/pair-store.ts";
 import { buildInferenceRouter } from "../inference/routes.ts";
 import { AccountStore } from "../operational/account-store.ts";
@@ -401,15 +402,21 @@ function buildAppviewRouters(
     // service is not publicly routed, so deriving apiBase from `did:web:` would
     // hand agents a dead hostname even though pairing succeeded.
     const apiBase = process.env["COCORE_AGENT_API_BASE"]?.replace(/\/$/, "") || verificationBase;
+    // Hosts an application may ask to be returned to after the user approves
+    // a pairing (Graze's "Connect co/core"). Unset → return URLs are dropped.
+    const returnHosts = parseReturnHosts(process.env["COCORE_PAIR_RETURN_HOSTS"]);
     routers.push(
       buildDevicePairRouter(new PairStore(verificationBase), {
         accountStore: opts.accountStore,
         appviewDid: opts.appviewDid,
         apiBase,
+        returnHosts,
         ...(internalSecret ? { internalSecret } : {}),
       }),
     );
-    console.error("appview: device-pair endpoints enabled");
+    console.error(
+      `appview: device-pair endpoints enabled (return hosts: ${returnHosts.length ? returnHosts.join(",") : "none"})`,
+    );
   }
 
   return { publicRouters: routers, internalRouters };

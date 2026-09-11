@@ -37,6 +37,15 @@ export interface ProviderSession {
   apiBase: string;
 }
 
+/** What the requester told us about itself at `start`. All optional; a bare
+ *  `cocore agent pair` sends none of it. Validated by the route layer before it
+ *  reaches the store. */
+export interface PairMeta {
+  appName?: string;
+  keyName?: string;
+  returnUrl?: string;
+}
+
 export interface PairEntry {
   deviceId: string;
   userCode: string;
@@ -44,6 +53,15 @@ export interface PairEntry {
   expiresAt: number; // epoch ms
   status: PairStatus;
   session: ProviderSession | null;
+  meta: PairMeta;
+}
+
+export interface DescribeResult {
+  status: PairStatus;
+  appName?: string;
+  keyName?: string;
+  returnUrl?: string;
+  expiresInSecs: number;
 }
 
 export interface StartResult {
@@ -75,7 +93,7 @@ export class PairStore {
     this.nowFn = nowFn;
   }
 
-  start(): StartResult {
+  start(meta: PairMeta = {}): StartResult {
     const now = this.nowFn();
     const entry: PairEntry = {
       deviceId: randomString(32),
@@ -84,6 +102,7 @@ export class PairStore {
       expiresAt: now + this.ttlMs,
       status: "pending",
       session: null,
+      meta: { ...meta },
     };
     this.byDevice.set(entry.deviceId, entry);
     this.byCode.set(entry.userCode, entry.deviceId);
@@ -106,6 +125,19 @@ export class PairStore {
   }
 
   /** Browser side: user pressed "approve" after signing in. */
+  describe(userCode: string): DescribeResult | null {
+    const entry = this.lookupByCode(userCode);
+    if (!entry) return null;
+    const remaining = Math.max(0, Math.floor((entry.expiresAt - this.nowFn()) / 1000));
+    return {
+      status: entry.status,
+      ...(entry.meta.appName ? { appName: entry.meta.appName } : {}),
+      ...(entry.meta.keyName ? { keyName: entry.meta.keyName } : {}),
+      ...(entry.meta.returnUrl ? { returnUrl: entry.meta.returnUrl } : {}),
+      expiresInSecs: remaining,
+    };
+  }
+
   approve(userCode: string, session: ProviderSession): PairEntry {
     const entry = this.lookupByCode(userCode);
     if (!entry) throw new PairError("unknown", "no such pair code");

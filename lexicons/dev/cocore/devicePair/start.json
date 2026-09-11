@@ -4,21 +4,71 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Begin a device-pairing flow (OAuth 2.0 device-authorization style). Returns a `deviceId` plus a short human-typable `userCode` and the `verificationUri` where a signed-in user approves the pairing. The caller then polls `dev.cocore.devicePair.poll` until approval.",
+      "description": "Begin a device-pairing flow (OAuth 2.0 device-authorization style). Returns a `deviceId` plus a short human-typable `userCode` and the `verificationUri` where a signed-in user approves the pairing. The caller then polls `dev.cocore.devicePair.poll` until approval. The optional input lets an application (rather than a provider machine) say who it is: `appName` is shown on the approve screen, `keyName` names the minted API key so the user can recognise and revoke it, and `returnUrl` is where the approve screen sends the browser afterwards. `returnUrl` is honoured only for hosts the deployment allowlists; anything else is dropped silently, never rejected.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "appName": {
+              "type": "string",
+              "maxLength": 40,
+              "description": "Human name of the requesting application, shown on the approve screen."
+            },
+            "keyName": {
+              "type": "string",
+              "maxLength": 100,
+              "description": "Name for the API key minted on approval."
+            },
+            "returnUrl": {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 2000,
+              "description": "Where to send the browser after approval. Must be https and on an allowlisted host."
+            }
+          }
+        }
+      },
       "output": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["deviceId", "userCode", "verificationUri", "pollIntervalSecs", "expiresInSecs"],
+          "required": [
+            "deviceId",
+            "userCode",
+            "verificationUri",
+            "pollIntervalSecs",
+            "expiresInSecs"
+          ],
           "properties": {
-            "deviceId": { "type": "string" },
-            "userCode": { "type": "string", "description": "Short code the user types at the verification URI." },
-            "verificationUri": { "type": "string", "format": "uri" },
-            "pollIntervalSecs": { "type": "integer", "description": "Minimum seconds between poll calls." },
-            "expiresInSecs": { "type": "integer", "description": "Seconds until this pairing attempt expires." }
+            "deviceId": {
+              "type": "string"
+            },
+            "userCode": {
+              "type": "string",
+              "description": "Short code the user types at the verification URI."
+            },
+            "verificationUri": {
+              "type": "string",
+              "format": "uri"
+            },
+            "pollIntervalSecs": {
+              "type": "integer",
+              "description": "Minimum seconds between poll calls."
+            },
+            "expiresInSecs": {
+              "type": "integer",
+              "description": "Seconds until this pairing attempt expires."
+            }
           }
         }
-      }
+      },
+      "errors": [
+        {
+          "name": "RateLimited",
+          "description": "Too many pairing attempts from this client; retry later."
+        }
+      ]
     }
   }
 }

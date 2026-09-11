@@ -1,15 +1,24 @@
 // Device-pairing XRPC handlers, served by the AppView as an @effect/platform
 // HttpRouter over the in-memory PairStore.
 //
-//   /xrpc/dev.cocore.devicePair.start    (POST, public)        — agent begins a pairing
-//   /xrpc/dev.cocore.devicePair.poll     (GET,  public)        — agent polls for the session
-//   /xrpc/dev.cocore.devicePair.confirm  (POST, service-auth)  — user approves/denies
+//   /xrpc/dev.cocore.devicePair.start     (POST, public)        — requester begins a pairing
+//   /xrpc/dev.cocore.devicePair.describe  (GET,  public)        — approve screen asks who is asking
+//   /xrpc/dev.cocore.devicePair.poll      (GET,  public)        — requester polls for the session
+//   /xrpc/dev.cocore.devicePair.confirm   (POST, service-auth)  — user approves/denies
+//
+// Two kinds of requester share this flow. A provider machine (`cocore agent
+// pair`) sends an empty `start` and gets a key named "paired machine". An
+// application connecting on a user's behalf (Graze's "Connect co/core") sends
+// `{appName, keyName, returnUrl}`: the approve screen then names the app and
+// the key, and sends the browser back to the app afterwards. `returnUrl` is
+// honoured only for allowlisted hosts (`COCORE_PAIR_RETURN_HOSTS`).
 //
 // confirm is a real public XRPC method authed via AT Protocol service auth
 // (the approving user's PDS proxies the call to `#cocore_appview`). On
 // approve the AppView mints a `cocore-...` key scoped to the verified DID,
-// builds the ProviderSession, and binds it to the pairing. start/poll are
-// agent-facing and need no auth.
+// builds the ProviderSession, and binds it to the pairing. start/describe/poll
+// need no auth, so each carries a per-client rate limit — they are reachable
+// from any browser now, not just the user's own terminal.
 //
 // Handlers close over the PairStore and DevicePairContext (dependency
 // injection by closure — no Context tags). Each route is an Effect returning
@@ -23,6 +32,7 @@ import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { AccountStore } from "../operational/account-store.ts";
 import { hydrateDids } from "../bsky-hydrate.ts";
 import { bearer, err, header, jsonBody, ok, searchParams } from "../api/http-app.ts";
+import { clientKey, createRateLimiter, sanitizePairMeta, type RateLimiter } from "./pair-meta.ts";
 import { PairError, type PairStore, type ProviderSession } from "./pair-store.ts";
 
 /** Constant-time compare that tolerates length differences (never short-
@@ -33,6 +43,24 @@ function secretEquals(a: string, b: string): boolean {
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
 }
+
+interface DevicePairRateLimits {
+  /** Window every limit below is counted in. */
+  windowMs: number;
+  start: number;
+  describe: number;
+  confirm: number;
+}
+
+/** Generous for a human, tight for a script: nobody pairs 30 machines in
+ *  ten minutes, and 30 confirm attempts is far too few to guess an 8-char
+ *  code from a 31-symbol alphabet. */
+const DEFAULT_RATE_LIMITS: DevicePairRateLimits = {
+  windowMs: 10 * 60 * 1000,
+  start: 30,
+  describe: 120,
+  confirm: 30,
+};
 
 export interface DevicePairContext {
   /** Mints the scoped API key handed to the paired agent. */
@@ -51,6 +79,11 @@ export interface DevicePairContext {
    *  point a victim's agent at an attacker key/endpoint. Undefined → the
    *  pre-minted path is disabled entirely (always mint server-side). */
   internalSecret?: string;
+  /** Hosts a requester's `returnUrl` may point at. Empty/undefined → return
+   *  URLs are dropped. */
+  returnHosts?: readonly string[];
+  /** Override the per-client budgets (tests). */
+  rateLimits?: DevicePairRateLimits;
 }
 
 function isProviderSession(v: unknown): v is ProviderSession {
@@ -67,10 +100,35 @@ function isProviderSession(v: unknown): v is ProviderSession {
   );
 }
 
+/** The key name for a pairing nobody named: what the CLI has always minted. */
+function defaultKeyName(now: Date = new Date()): string {
+  return `paired machine (${now.toISOString().slice(0, 10)})`;
+}
+
+const rateLimited = err(429, {
+  error: "RateLimited",
+  message: "too many pairing requests from this client; try again in a few minutes",
+});
+
+/** Consume one unit of `limiter` for the calling client; Some(response) when
+ *  over budget. */
+const consume = (limiter: RateLimiter) =>
+  Effect.gen(function* () {
+    const fwd = yield* header("x-forwarded-for");
+    const real = yield* header("x-real-ip");
+    return limiter.allow(clientKey(fwd, real));
+  });
+
 export function buildDevicePairRouter(
   store: PairStore,
   ctx: DevicePairContext,
 ): HttpRouter.HttpRouter<never, never> {
+  const limits = ctx.rateLimits ?? DEFAULT_RATE_LIMITS;
+  const startLimiter = createRateLimiter(limits.start, limits.windowMs);
+  const describeLimiter = createRateLimiter(limits.describe, limits.windowMs);
+  const confirmLimiter = createRateLimiter(limits.confirm, limits.windowMs);
+  const returnHosts = ctx.returnHosts ?? [];
+
   return HttpRouter.empty.pipe(
     // start is mounted with `all` so a wrong method reaches the handler and
     // gets an explicit 405 (the test asserts GET → 405) rather than the
@@ -80,8 +138,27 @@ export function buildDevicePairRouter(
       Effect.gen(function* () {
         const req = yield* HttpServerRequest.HttpServerRequest;
         if (req.method !== "POST") return err(405, { error: "MethodNotAllowed" });
-        return ok(store.start());
+        if (!(yield* consume(startLimiter))) return rateLimited;
+        // The CLI sends no body at all; an app sends JSON. Anything
+        // unparseable is treated as "no metadata", never as an error, so a
+        // requester that sends a stray content-type still gets paired.
+        const parsed = yield* Effect.either(jsonBody);
+        const meta = parsed._tag === "Right" ? sanitizePairMeta(parsed.right, returnHosts) : {};
+        return ok(store.start(meta));
       }).pipe(Effect.withSpan("appview.devicePair.start")),
+    ),
+
+    HttpRouter.get(
+      "/xrpc/dev.cocore.devicePair.describe",
+      Effect.gen(function* () {
+        if (!(yield* consume(describeLimiter))) return rateLimited;
+        const sp = yield* searchParams;
+        const userCode = (sp.get("userCode") ?? "").trim().toUpperCase();
+        if (!userCode) return err(400, { error: "InvalidRequest", message: "missing userCode" });
+        const described = store.describe(userCode);
+        if (!described) return err(404, { error: "NotFound", message: "no such pair code" });
+        return ok(described);
+      }).pipe(Effect.withSpan("appview.devicePair.describe")),
     ),
 
     HttpRouter.get(
@@ -111,6 +188,7 @@ export function buildDevicePairRouter(
     HttpRouter.post(
       "/xrpc/dev.cocore.devicePair.confirm",
       Effect.gen(function* () {
+        if (!(yield* consume(confirmLimiter))) return rateLimited;
         const token = yield* bearer;
         const auth = yield* Effect.promise(() =>
           verifyServiceAuthToken(token, {
@@ -148,6 +226,14 @@ export function buildDevicePairRouter(
           });
         }
 
+        // Look the attempt up BEFORE minting anything: an unknown or already
+        // settled code must not cost the user a stray key.
+        const pending = store.describe(code);
+        if (!pending) return err(404, { error: "NotFound", message: "no such pair code" });
+        if (pending.status !== "pending") {
+          return err(409, { error: "Conflict", message: `pair already ${pending.status}` });
+        }
+
         // Approve: bind a ProviderSession to the pairing.
         //
         // M6: a caller-supplied `providerSession` (apiKey/apiBase chosen by the
@@ -178,13 +264,17 @@ export function buildDevicePairRouter(
           const handle = hydrated.get(did)?.handle ?? did;
           const { secret } = ctx.accountStore.createKey({
             did,
-            name: `paired machine (${new Date().toISOString().slice(0, 10)})`,
+            name: pending.keyName ?? defaultKeyName(),
           });
           session = { did, handle, apiKey: secret, apiBase: ctx.apiBase };
         }
         try {
           const entry = store.approve(code, session);
-          return ok({ ok: true, status: entry.status });
+          return ok({
+            ok: true,
+            status: entry.status,
+            ...(entry.meta.returnUrl ? { returnUrl: entry.meta.returnUrl } : {}),
+          });
         } catch (e) {
           if (e instanceof PairError) return err(409, { error: e.message });
           return err(409, { error: e instanceof Error ? e.message : String(e) });
