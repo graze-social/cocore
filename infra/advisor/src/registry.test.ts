@@ -896,3 +896,24 @@ describe("ProviderRegistry failure ledger / cooldown", () => {
     });
   });
 });
+
+describe("ProviderRegistry.setAttestationUri (attestation_refreshed)", () => {
+  it("moves a connected machine to its republished attestation and leaves siblings alone", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing);
+    const sibling = { ...baseReg, machine_id: "m2", attestation_pub_key: "p256-pub-2" };
+    r.upsert(sibling, noop, noopSend, noopPing);
+
+    const fresh = "at://did:plc:test1/dev.cocore.compute.attestation/fresh";
+    expect(r.setAttestationUri(DID, MID, fresh)).toBe(true);
+    expect(r.get(DID, MID)?.attestationUri).toBe(fresh);
+    expect(r.get(DID, "m2")?.attestationUri).toBe(baseReg.attestation_uri);
+  });
+
+  it("returns false for a machine that is not connected", () => {
+    const r = new ProviderRegistry();
+    expect(
+      r.setAttestationUri(DID, "ghost", "at://did:plc:test1/dev.cocore.compute.attestation/x"),
+    ).toBe(false);
+  });
+});

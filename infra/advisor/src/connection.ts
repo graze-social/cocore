@@ -516,6 +516,29 @@ export function handleConnection(
         }
         return;
       }
+      case "attestation_refreshed": {
+        if (!registeredDid || !registeredMachineId) {
+          console.error(`[ws] attestation_refreshed before register peer=${peer}; closing`);
+          return close(1002, "attestation-refreshed-before-register");
+        }
+        // Owner-bound: the brokerage countersignature will name this URI, so
+        // it must be a record in THIS provider's own repo — a machine can't
+        // point its witness at another provider's (or a self-minted foreign)
+        // attestation. Same collection the Register frame's URI lives in.
+        const expectedPrefix = `at://${registeredDid}/dev.cocore.compute.attestation/`;
+        const uri = msg.attestation_uri;
+        if (!uri.startsWith(expectedPrefix) || uri.length <= expectedPrefix.length) {
+          console.error(
+            `[ws] attestation_refreshed rejected did=${registeredDid} machine=${registeredMachineId}: uri ${uri} is not in the provider's own attestation collection`,
+          );
+          return;
+        }
+        registry.setAttestationUri(registeredDid, registeredMachineId, uri);
+        console.error(
+          `[ws] attestation refreshed did=${registeredDid} machine=${registeredMachineId} uri=${uri}`,
+        );
+        return;
+      }
       case "attestation_response": {
         if (!registeredDid || !registeredMachineId || !pendingChallenge) {
           console.error(`[ws] unsolicited attestation peer=${peer}`);

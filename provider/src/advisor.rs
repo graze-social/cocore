@@ -27,7 +27,7 @@ use crate::hypervisor;
 use crate::pds::{effective_tool_calls, PdsClient, ProBonoPolicy};
 use crate::pricing;
 use crate::protocol::{
-    AdvisorMessage, AttestationChallenge, AttestationResponse, ChunkChannel,
+    AdvisorMessage, AttestationChallenge, AttestationRefreshed, AttestationResponse, ChunkChannel,
     CodeAttestationResponse, HealthStanding, Heartbeat, InferenceAck, InferenceChunk,
     InferenceComplete, InferenceKeepalive, InferenceRequest, InferenceResume,
     InferenceResumeResult, Pong, Register, ResumeStatus, SessionKey,
@@ -713,6 +713,19 @@ impl AdvisorClient {
             }
         }
 
+        // Register with the attestation that is live NOW, not the one built at
+        // boot: `register` is constructed once per serve and this is a
+        // reconnect path, so after a refresh the boot URI is stale. The
+        // advisor countersigns dispatches against this URI (ADR-0004) and
+        // receipts reference the live cell, so the two must agree.
+        let mut registered_attestation_uri = register.attestation_uri.clone();
+        if let Some(live) = attestation.read().await.as_ref() {
+            if live.uri != register.attestation_uri {
+                register.attestation_uri = live.uri.clone();
+                registered_attestation_uri = live.uri.clone();
+            }
+        }
+
         // Register
         let payload = serde_json::to_string(&AdvisorMessage::Register(register))
             .map_err(|e| ProviderError::Advisor(e.to_string()))?;
@@ -777,7 +790,7 @@ impl AdvisorClient {
             signer: signer.as_ref(),
             encryption: encryption.as_ref(),
             pds,
-            attestation,
+            attestation: attestation.clone(),
             engines,
             pro_bono,
         };
@@ -906,6 +919,25 @@ impl AdvisorClient {
                     write.send(Message::Text(s.into()))
                         .await
                         .map_err(|e| ProviderError::Advisor(e.to_string()))?;
+                    // The refresh task swapped a new attestation into the shared
+                    // cell since we registered: tell the advisor, so its brokerage
+                    // countersignature binds the same attestation the next
+                    // receipt strong-refs. Piggybacks on the heartbeat cadence —
+                    // a refresh is ~hourly, so a heartbeat of delay is nothing.
+                    let live_uri = attestation.read().await.as_ref().map(|r| r.uri.clone());
+                    if let Some(uri) = live_uri {
+                        if uri != registered_attestation_uri {
+                            let m = AdvisorMessage::AttestationRefreshed(AttestationRefreshed {
+                                attestation_uri: uri.clone(),
+                            });
+                            let s = serde_json::to_string(&m).map_err(|e| ProviderError::Advisor(e.to_string()))?;
+                            write.send(Message::Text(s.into()))
+                                .await
+                                .map_err(|e| ProviderError::Advisor(e.to_string()))?;
+                            tracing::info!(uri = %uri, "told advisor about the refreshed attestation");
+                            registered_attestation_uri = uri;
+                        }
+                    }
                 }
                 // Slow poll: re-read the owner's start/stop switch off our
                 // PDS as the fallback for a missed nudge. The read runs in
@@ -1746,6 +1778,9 @@ async fn handle_inbound(text: &str, ctx: &ServeContext<'_>) -> Result<Vec<Adviso
         | AdvisorMessage::InferenceResumeResult(_)
         | AdvisorMessage::InferenceAck(_)
         | AdvisorMessage::AttestationResponse(_)
+        // AttestationRefreshed is provider→advisor only (sent from the
+        // heartbeat arm when the refresh task swaps in a new attestation).
+        | AdvisorMessage::AttestationRefreshed(_)
         | AdvisorMessage::Ping(_)
         | AdvisorMessage::Pong(_)
         | AdvisorMessage::HealthNotice(_)

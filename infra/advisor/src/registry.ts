@@ -388,6 +388,17 @@ export class ProviderRegistry {
     return true;
   }
 
+  /** Point a connected machine at its freshly republished attestation record
+   *  (`attestation_refreshed`). Only the URI moves: the signing key is the same
+   *  Secure-Enclave/software key the challenge cycle keeps verifying, so
+   *  attested standing is untouched. Returns false for an unknown machine. */
+  setAttestationUri(did: string, machineId: string, attestationUri: string): boolean {
+    const e = this.byKey.get(ProviderRegistry.key(did, machineId));
+    if (!e) return false;
+    e.attestationUri = attestationUri;
+    return true;
+  }
+
   private static key(did: string, machineId: string): string {
     return `${did}${KEY_SEP}${machineId}`;
   }

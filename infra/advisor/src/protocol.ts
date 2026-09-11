@@ -314,11 +314,26 @@ interface RecoverResult {
   detail?: string;
 }
 
+/** Provider → advisor: the agent republished its attestation record (it
+ *  re-attests ~hourly before the 24h expiry and swaps the fresh strong-ref
+ *  into the cell every receipt reads). The advisor's ADR-0004 brokerage
+ *  countersignature binds `attestation` — signing the URI learned at Register
+ *  time means every receipt after the first refresh names a DIFFERENT
+ *  attestation than the witness, and `verifyReceipt` reports
+ *  `brokerage-countersignature-invalid`. This frame keeps the registry's
+ *  `attestationUri` current so the witness and the receipt agree. Owner-bound
+ *  on receipt: the URI must live in the registered provider's own repo.
+ *  Additive — old advisors ignore the unknown frame. */
+interface AttestationRefreshed {
+  attestation_uri: string;
+}
+
 export type AdvisorMessage =
   | ({ type: "register" } & Register)
   | ({ type: "heartbeat" } & Heartbeat)
   | ({ type: "attestation_challenge" } & AttestationChallenge)
   | ({ type: "attestation_response" } & AttestationResponse)
+  | ({ type: "attestation_refreshed" } & AttestationRefreshed)
   | ({ type: "code_attestation_response" } & CodeAttestationResponse)
   | ({ type: "inference_request" } & InferenceRequest)
   | ({ type: "inference_chunk" } & InferenceChunk)
@@ -393,6 +408,11 @@ export function validateFrame(raw: unknown): FrameCheck {
       // and byte-shaped so verify can't throw on undefined.
       if (!isBytes(raw["signature"]))
         return { ok: false, reason: "attestation_response: signature" };
+      break;
+    }
+    case "attestation_refreshed": {
+      if (!isStr(raw["attestation_uri"]) || raw["attestation_uri"].length === 0)
+        return { ok: false, reason: "attestation_refreshed: attestation_uri" };
       break;
     }
     case "code_attestation_response": {
