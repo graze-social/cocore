@@ -254,6 +254,9 @@ export function InferenceApiReferencePage({ baseUrl }: { baseUrl: string }) {
                   code={`// 404 — no provider is serving this model
 { "error": { "type": "invalid_request_error", "code": "model_not_found", "message": "..." } }
 
+// 402 — not enough credits: balance must cover the price ceiling plus the admission floor
+{ "error": { "type": "insufficient_credits_error", "code": "insufficient_credits", "message": "Not enough co/core credits: balance 12,000 CC, needs 200,000 CC ..." } }
+
 // 503 — no providers are connected
 { "error": { "type": "service_unavailable_error", "code": "no_providers_connected", "message": "..." } }
 
