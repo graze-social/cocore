@@ -29,7 +29,7 @@
             "type": "array",
             "minLength": 1,
             "maxLength": 32,
-            "items": { "type": "string", "minLength": 3, "maxLength": 8 },
+            "items": { "type": "string", "minLength": 2, "maxLength": 8 },
             "description": "ISO 4217 (or XBT/XSAT-style) currency codes the exchange will settle in."
           },
           "selfLoop": {
@@ -104,7 +104,7 @@
         },
         "currency": {
           "type": "string",
-          "minLength": 3,
+          "minLength": 2,
           "maxLength": 8,
           "description": "Currency the fee schedule is denominated in."
         }
