@@ -10,6 +10,10 @@
 //   * dev.cocore.compute.provider             — pair-machine flow
 //   * dev.cocore.compute.job                  — inference dispatch
 //   * dev.cocore.compute.paymentAuthorization — inference dispatch
+//   * dev.cocore.app.registration            — "Sign in with co/core": an app
+//                                               publishes its own name/website/
+//                                               icon/returnUrls so the pairing
+//                                               consent screen can name + verify it
 //   * dev.cocore.account.profile              — /account auto-provision + edits
 //   * dev.cocore.account.friend               — /friends add / remove
 //   * dev.cocore.account.tokenGrant           — exchange-side onboarding grants
@@ -55,6 +59,7 @@ export const oauthScopes = [
       "dev.cocore.compute.exchangeAttestation",
       "dev.cocore.compute.termsAcceptance",
       "dev.cocore.compute.dispute",
+      "dev.cocore.app.registration",
       "dev.cocore.account.profile",
       "dev.cocore.account.friend",
       "dev.cocore.account.tokenGrant",
