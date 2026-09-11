@@ -32,8 +32,16 @@ import { verifyServiceAuthToken } from "../auth/service-auth.ts";
 import type { AccountStore } from "../operational/account-store.ts";
 import { hydrateDids } from "../bsky-hydrate.ts";
 import { bearer, err, header, jsonBody, ok, searchParams } from "../api/http-app.ts";
+import { isDid } from "@atcute/lexicons/syntax";
+
+import {
+  type AppIdentity,
+  type AppResolver,
+  createAppResolver,
+  matchesRegisteredReturnUrl,
+} from "./app-registration.ts";
 import { clientKey, createRateLimiter, sanitizePairMeta, type RateLimiter } from "./pair-meta.ts";
-import { PairError, type PairStore, type ProviderSession } from "./pair-store.ts";
+import { type PairMeta, PairError, type PairStore, type ProviderSession } from "./pair-store.ts";
 
 /** Constant-time compare that tolerates length differences (never short-
  *  circuits on unequal lengths in a timing-observable way). */
@@ -84,6 +92,9 @@ export interface DevicePairContext {
   returnHosts?: readonly string[];
   /** Override the per-client budgets (tests). */
   rateLimits?: DevicePairRateLimits;
+  /** Resolves `appDid` → the app's registration record and verifies return
+   *  hosts. Defaults to live plc/web + https resolution; tests inject one. */
+  appResolver?: AppResolver;
 }
 
 function isProviderSession(v: unknown): v is ProviderSession {
@@ -128,6 +139,51 @@ export function buildDevicePairRouter(
   const describeLimiter = createRateLimiter(limits.describe, limits.windowMs);
   const confirmLimiter = createRateLimiter(limits.confirm, limits.windowMs);
   const returnHosts = ctx.returnHosts ?? [];
+  const appResolver = ctx.appResolver ?? createAppResolver();
+
+  /** Build the pairing metadata for a `start` body.
+   *
+   *  Without `appDid` this is the legacy path: a self-declared `appName`, and
+   *  a return URL only for operator-allowlisted hosts. With `appDid`, identity
+   *  comes from the app's own `dev.cocore.app.registration` record and the
+   *  return URL must be one the record lists AND on a host that vouches for the
+   *  DID (or that the operator allowlists). An unverified app still pairs — the
+   *  approve screen just says so and never sends the browser to it. */
+  async function metaForStart(body: unknown): Promise<{ meta: PairMeta } | { error: string }> {
+    const meta = sanitizePairMeta(body, returnHosts);
+    const b = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
+    if (b.appDid === undefined || b.appDid === null) return { meta };
+    if (typeof b.appDid !== "string" || !isDid(b.appDid)) return { error: "appDid must be a DID" };
+    const appDid = b.appDid;
+    const registration = await appResolver.resolve(appDid);
+    if (!registration) {
+      return {
+        error: `AppNotRegistered: no dev.cocore.app.registration record at ${appDid}; publish one on the app's account first`,
+      };
+    }
+    const handle = (await hydrateDids([appDid]).catch(() => new Map())).get(appDid)?.handle;
+    const app: AppIdentity = {
+      did: appDid,
+      ...(handle ? { handle } : {}),
+      name: registration.name,
+      ...(registration.website ? { website: registration.website } : {}),
+      ...(registration.iconUrl ? { iconUrl: registration.iconUrl } : {}),
+      verified: false,
+    };
+    // The record's name wins over anything the request typed.
+    const withApp: PairMeta = { ...meta, appName: registration.name, app };
+    delete withApp.returnUrl;
+    const requested = typeof b.returnUrl === "string" ? b.returnUrl : undefined;
+    if (requested && matchesRegisteredReturnUrl(requested, registration.returnUrls)) {
+      const host = new URL(requested).hostname.toLowerCase();
+      const verified = returnHosts.includes(host) || (await appResolver.verifyHost(host, appDid));
+      if (verified) {
+        withApp.returnUrl = requested;
+        withApp.app = { ...app, verified: true, verifiedHost: host };
+      }
+    }
+    return { meta: withApp };
+  }
 
   return HttpRouter.empty.pipe(
     // start is mounted with `all` so a wrong method reaches the handler and
@@ -143,8 +199,10 @@ export function buildDevicePairRouter(
         // unparseable is treated as "no metadata", never as an error, so a
         // requester that sends a stray content-type still gets paired.
         const parsed = yield* Effect.either(jsonBody);
-        const meta = parsed._tag === "Right" ? sanitizePairMeta(parsed.right, returnHosts) : {};
-        return ok(store.start(meta));
+        const body = parsed._tag === "Right" ? parsed.right : undefined;
+        const built = yield* Effect.promise(() => metaForStart(body));
+        if ("error" in built) return err(400, { error: "InvalidRequest", message: built.error });
+        return ok(store.start(built.meta));
       }).pipe(Effect.withSpan("appview.devicePair.start")),
     ),
 

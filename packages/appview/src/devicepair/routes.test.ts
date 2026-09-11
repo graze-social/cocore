@@ -144,3 +144,107 @@ describe("devicePair routes: application metadata", () => {
     );
   });
 });
+
+describe("devicePair routes: registered applications (appDid)", () => {
+  const APP = "did:plc:grazeapp";
+  const registration = {
+    did: APP,
+    name: "Graze",
+    website: "https://www.graze.social/",
+    returnUrls: ["https://www.graze.social/app/account"],
+  };
+  const fakeResolver = (verified: boolean) => ({
+    resolve: async (did: string) => (did === APP ? registration : null),
+    verifyHost: async () => verified,
+  });
+
+  it("takes the name from the record, verifies the return host, and describes the app", async () => {
+    await withAppviewServer(
+      router({ returnHosts: [], appResolver: fakeResolver(true) }),
+      async (base) => {
+        const r = await fetch(`${base}/xrpc/dev.cocore.devicePair.start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            appDid: APP,
+            appName: "Totally Not Graze",
+            keyName: "Graze Feed Pulse",
+            returnUrl: "https://www.graze.social/app/account?cocore=connected",
+          }),
+        });
+        expect(r.status).toBe(200);
+        const started = (await r.json()) as { userCode: string };
+        const described = (await (
+          await fetch(`${base}/xrpc/dev.cocore.devicePair.describe?userCode=${started.userCode}`)
+        ).json()) as Record<string, unknown>;
+        expect(described.appName).toBe("Graze");
+        expect(described.returnUrl).toBe("https://www.graze.social/app/account?cocore=connected");
+        expect(described.app).toMatchObject({
+          did: APP,
+          name: "Graze",
+          verified: true,
+          verifiedHost: "www.graze.social",
+        });
+      },
+    );
+  });
+
+  it("drops the return URL for an unverified host but still pairs, marked unverified", async () => {
+    await withAppviewServer(
+      router({ returnHosts: [], appResolver: fakeResolver(false) }),
+      async (base) => {
+        const r = await fetch(`${base}/xrpc/dev.cocore.devicePair.start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ appDid: APP, returnUrl: "https://www.graze.social/app/account" }),
+        });
+        expect(r.status).toBe(200);
+        const started = (await r.json()) as { userCode: string };
+        const described = (await (
+          await fetch(`${base}/xrpc/dev.cocore.devicePair.describe?userCode=${started.userCode}`)
+        ).json()) as Record<string, unknown>;
+        expect(described).not.toHaveProperty("returnUrl");
+        expect(described.app).toMatchObject({ did: APP, verified: false });
+      },
+    );
+  });
+
+  it("rejects a return URL the record does not list, and an unregistered or malformed appDid", async () => {
+    await withAppviewServer(
+      router({ returnHosts: [], appResolver: fakeResolver(true) }),
+      async (base) => {
+        const other = await fetch(`${base}/xrpc/dev.cocore.devicePair.start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            appDid: APP,
+            returnUrl: "https://www.graze.social/somewhere-else",
+          }),
+        });
+        const described = (await (
+          await fetch(
+            `${base}/xrpc/dev.cocore.devicePair.describe?userCode=${((await other.json()) as { userCode: string }).userCode}`,
+          )
+        ).json()) as Record<string, unknown>;
+        expect(described).not.toHaveProperty("returnUrl");
+
+        const unregistered = await fetch(`${base}/xrpc/dev.cocore.devicePair.start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ appDid: "did:plc:nobody" }),
+        });
+        expect(unregistered.status).toBe(400);
+        expect(((await unregistered.json()) as { message: string }).message).toContain(
+          "AppNotRegistered",
+        );
+
+        const malformed = await fetch(`${base}/xrpc/dev.cocore.devicePair.start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ appDid: "graze" }),
+        });
+        expect(malformed.status).toBe(400);
+      },
+    );
+  });
+});

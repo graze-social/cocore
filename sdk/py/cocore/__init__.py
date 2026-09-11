@@ -3,6 +3,15 @@
 Mirrors the TypeScript SDK's verification surface so ML practitioners can verify
 a provider's confidential-tier attestation (fail-closed) before sealing a prompt.
 """
+from .connect import (
+    AppPairing,
+    AppPairingError,
+    AppPairingPoll,
+    PairedSession,
+    poll_app_pairing,
+    start_app_pairing,
+    wait_for_app_pairing,
+)
 
 from .appattest import (
     APP_ATTEST_APP_ID,
@@ -35,6 +44,13 @@ from .validate import (
 from .verify import VerifyResult, session_key_message, verify_provider_for_seal
 
 __all__ = [
+    "AppPairing",
+    "AppPairingError",
+    "AppPairingPoll",
+    "PairedSession",
+    "poll_app_pairing",
+    "start_app_pairing",
+    "wait_for_app_pairing",
     "CanonicalError",
     "canonicalize",
     "canonical_bytes",
