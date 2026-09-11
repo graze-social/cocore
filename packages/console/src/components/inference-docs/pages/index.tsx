@@ -9,6 +9,7 @@ import {
   InferenceDocsPage,
 } from "@/components/inference-docs/inference-docs-page.tsx";
 import { InferenceApiReferencePage } from "@/components/inference-docs/pages/api-reference.tsx";
+import { ConnectYourAppPage } from "@/components/inference-docs/pages/connect-your-app.tsx";
 import { InferenceQuickstartPage } from "@/components/inference-docs/pages/quickstart.tsx";
 import {
   InferenceApiDocLink,
@@ -77,6 +78,8 @@ export function InferenceDocsSlugPage({
   switch (slug) {
     case "quickstart":
       return <InferenceQuickstartPage baseUrl={baseUrl} />;
+    case "connect-your-app":
+      return <ConnectYourAppPage baseUrl={baseUrl} />;
     case "api-reference":
       return <InferenceApiReferencePage baseUrl={baseUrl} />;
     case "opencode":
