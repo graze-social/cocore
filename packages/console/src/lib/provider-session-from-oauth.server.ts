@@ -30,14 +30,21 @@ function consoleBaseUrl(): string {
   return u.replace(/\/$/, "");
 }
 
-export function providerSessionForDidEffect(did: Did): Effect.Effect<ProviderSessionWire | null> {
+/** The key name for a pairing nobody named: what the CLI has always minted. */
+export function defaultPairKeyName(now: Date = new Date()): string {
+  return `paired machine (${now.toISOString().slice(0, 10)})`;
+}
+
+export function providerSessionForDidEffect(
+  did: Did,
+  keyName?: string,
+): Effect.Effect<ProviderSessionWire | null> {
   return Effect.gen(function* () {
     const profile = yield* fetchBlueskyPublicProfileFieldsEffect(did);
     const handle = profile?.handle ?? did;
 
     const minted = yield* Effect.try({
-      try: () =>
-        createKey({ did, name: `paired machine (${new Date().toISOString().slice(0, 10)})` }),
+      try: () => createKey({ did, name: keyName ?? defaultPairKeyName() }),
       catch: (e) => e,
     }).pipe(Effect.either);
     if (minted._tag === "Left") return null;

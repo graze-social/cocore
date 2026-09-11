@@ -1,0 +1,34 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.devicePair.describe",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Describe a pending pairing attempt by its `userCode`, so the approve screen can say who is asking and for what. Public: it only echoes what the requester supplied at `start` (application name, key name, return URL) plus the attempt's status and remaining lifetime. It never returns the `deviceId` or a session.",
+      "parameters": {
+        "type": "params",
+        "required": ["userCode"],
+        "properties": { "userCode": { "type": "string", "description": "The code the requester displayed (case-insensitive)." } }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["status", "expiresInSecs"],
+          "properties": {
+            "status": { "type": "string", "enum": ["pending", "approved", "denied", "expired", "consumed"] },
+            "appName": { "type": "string" },
+            "keyName": { "type": "string" },
+            "returnUrl": { "type": "string", "format": "uri" },
+            "expiresInSecs": { "type": "integer" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "The `userCode` parameter is missing." },
+        { "name": "NotFound", "description": "No pairing attempt matches the `userCode`." },
+        { "name": "RateLimited", "description": "Too many describe calls from this client; retry later." }
+      ]
+    }
+  }
+}

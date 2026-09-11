@@ -54,6 +54,7 @@ import { Route as ApiXrpcDevDotcocoreDotproxyDotcreateRecordRouteImport } from '
 import { Route as ApiXrpcDevDotcocoreDotinferenceDotdispatchRouteImport } from './routes/api/xrpc/dev[.]cocore[.]inference[.]dispatch'
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotstartRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]start'
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotpollRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]poll'
+import { Route as ApiXrpcDevDotcocoreDotdevicePairDotdescribeRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]describe'
 import { Route as ApiXrpcDevDotcocoreDotdevicePairDotconfirmRouteImport } from './routes/api/xrpc/dev[.]cocore[.]devicePair[.]confirm'
 import { Route as ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]revokeApiKey'
 import { Route as ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]listApiKeys'
@@ -336,6 +337,12 @@ const ApiXrpcDevDotcocoreDotdevicePairDotpollRoute =
   ApiXrpcDevDotcocoreDotdevicePairDotpollRouteImport.update({
     id: '/api/xrpc/dev.cocore.devicePair.poll',
     path: '/api/xrpc/dev.cocore.devicePair.poll',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute =
+  ApiXrpcDevDotcocoreDotdevicePairDotdescribeRouteImport.update({
+    id: '/api/xrpc/dev.cocore.devicePair.describe',
+    path: '/api/xrpc/dev.cocore.devicePair.describe',
     getParentRoute: () => rootRouteImport,
   } as any)
 const ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute =
@@ -670,6 +677,7 @@ export interface FileRoutesByFullPath {
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
   '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
+  '/api/xrpc/dev.cocore.devicePair.describe': typeof ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
   '/api/xrpc/dev.cocore.inference.dispatch': typeof ApiXrpcDevDotcocoreDotinferenceDotdispatchRoute
@@ -762,6 +770,7 @@ export interface FileRoutesByTo {
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
   '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
+  '/api/xrpc/dev.cocore.devicePair.describe': typeof ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
   '/api/xrpc/dev.cocore.inference.dispatch': typeof ApiXrpcDevDotcocoreDotinferenceDotdispatchRoute
@@ -858,6 +867,7 @@ export interface FileRoutesById {
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
   '/api/xrpc/dev.cocore.account.revokeApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   '/api/xrpc/dev.cocore.devicePair.confirm': typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
+  '/api/xrpc/dev.cocore.devicePair.describe': typeof ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute
   '/api/xrpc/dev.cocore.devicePair.poll': typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   '/api/xrpc/dev.cocore.devicePair.start': typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
   '/api/xrpc/dev.cocore.inference.dispatch': typeof ApiXrpcDevDotcocoreDotinferenceDotdispatchRoute
@@ -953,6 +963,7 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.account.listApiKeys'
     | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
+    | '/api/xrpc/dev.cocore.devicePair.describe'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
     | '/api/xrpc/dev.cocore.inference.dispatch'
@@ -1045,6 +1056,7 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.account.listApiKeys'
     | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
+    | '/api/xrpc/dev.cocore.devicePair.describe'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
     | '/api/xrpc/dev.cocore.inference.dispatch'
@@ -1140,6 +1152,7 @@ export interface FileRouteTypes {
     | '/api/xrpc/dev.cocore.account.listApiKeys'
     | '/api/xrpc/dev.cocore.account.revokeApiKey'
     | '/api/xrpc/dev.cocore.devicePair.confirm'
+    | '/api/xrpc/dev.cocore.devicePair.describe'
     | '/api/xrpc/dev.cocore.devicePair.poll'
     | '/api/xrpc/dev.cocore.devicePair.start'
     | '/api/xrpc/dev.cocore.inference.dispatch'
@@ -1206,6 +1219,7 @@ export interface RootRouteChildren {
   ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute: typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
   ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute
   ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute
+  ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute
   ApiXrpcDevDotcocoreDotdevicePairDotpollRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRoute
   ApiXrpcDevDotcocoreDotdevicePairDotstartRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotstartRoute
   ApiXrpcDevDotcocoreDotinferenceDotdispatchRoute: typeof ApiXrpcDevDotcocoreDotinferenceDotdispatchRoute
@@ -1548,6 +1562,13 @@ declare module '@tanstack/react-router' {
       path: '/api/xrpc/dev.cocore.devicePair.poll'
       fullPath: '/api/xrpc/dev.cocore.devicePair.poll'
       preLoaderRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotpollRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/xrpc/dev.cocore.devicePair.describe': {
+      id: '/api/xrpc/dev.cocore.devicePair.describe'
+      path: '/api/xrpc/dev.cocore.devicePair.describe'
+      fullPath: '/api/xrpc/dev.cocore.devicePair.describe'
+      preLoaderRoute: typeof ApiXrpcDevDotcocoreDotdevicePairDotdescribeRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/xrpc/dev.cocore.devicePair.confirm': {
@@ -2048,6 +2069,8 @@ const rootRouteChildren: RootRouteChildren = {
     ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRoute,
   ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute:
     ApiXrpcDevDotcocoreDotdevicePairDotconfirmRoute,
+  ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute:
+    ApiXrpcDevDotcocoreDotdevicePairDotdescribeRoute,
   ApiXrpcDevDotcocoreDotdevicePairDotpollRoute:
     ApiXrpcDevDotcocoreDotdevicePairDotpollRoute,
   ApiXrpcDevDotcocoreDotdevicePairDotstartRoute:

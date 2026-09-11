@@ -30,6 +30,19 @@ export interface ProviderSession {
   apiBase: string;
 }
 
+/** What the requester told us about itself at `start`. All optional; a bare
+ *  `cocore agent pair` sends none of it. Validated by the route layer (length
+ *  caps, control characters stripped, `returnUrl` host allowlisted) before it
+ *  reaches the store. */
+export interface PairMeta {
+  /** Human name of the app asking for a key, shown on the approve screen. */
+  appName?: string;
+  /** Name for the minted API key, so the user can recognise and revoke it. */
+  keyName?: string;
+  /** Where to send the browser after approval. */
+  returnUrl?: string;
+}
+
 export interface PairEntry {
   deviceId: string;
   userCode: string;
@@ -37,6 +50,17 @@ export interface PairEntry {
   expiresAt: number;
   status: PairStatus;
   session: ProviderSession | null;
+  meta: PairMeta;
+}
+
+/** Public view of one pairing attempt, keyed by the user-visible code. Safe to
+ *  return to anyone holding the code: it only echoes what the requester sent. */
+export interface DescribeResult {
+  status: PairStatus;
+  appName?: string;
+  keyName?: string;
+  returnUrl?: string;
+  expiresInSecs: number;
 }
 
 export interface StartResult {
@@ -68,7 +92,7 @@ export class PairStore {
     this.nowFn = nowFn;
   }
 
-  start(): StartResult {
+  start(meta: PairMeta = {}): StartResult {
     const now = this.nowFn();
     const entry: PairEntry = {
       deviceId: randomString(32),
@@ -77,6 +101,7 @@ export class PairStore {
       expiresAt: now + this.ttlMs,
       status: "pending",
       session: null,
+      meta: { ...meta },
     };
     this.byDevice.set(entry.deviceId, entry);
     this.byCode.set(entry.userCode, entry.deviceId);
@@ -94,6 +119,19 @@ export class PairStore {
     const id = this.byCode.get(userCode.toUpperCase());
     if (!id) return null;
     return this.byDevice.get(id) ?? null;
+  }
+
+  describe(userCode: string): DescribeResult | null {
+    const entry = this.lookupByCode(userCode);
+    if (!entry) return null;
+    const remaining = Math.max(0, Math.floor((entry.expiresAt - this.nowFn()) / 1000));
+    return {
+      status: entry.status,
+      ...(entry.meta.appName ? { appName: entry.meta.appName } : {}),
+      ...(entry.meta.keyName ? { keyName: entry.meta.keyName } : {}),
+      ...(entry.meta.returnUrl ? { returnUrl: entry.meta.returnUrl } : {}),
+      expiresInSecs: remaining,
+    };
   }
 
   approve(userCode: string, session: ProviderSession): PairEntry {

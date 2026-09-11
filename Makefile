@@ -12,7 +12,7 @@
         build test e2e clean
 
 lex-validate:
-	@for f in lexicons/dev/cocore/compute/*.json; do \
+	@for f in lexicons/dev/cocore/*/*.json; do \
 		python3 -c "import json,sys; json.load(open('$$f'))" && echo "ok  $$f" || exit 1; \
 	done
 
