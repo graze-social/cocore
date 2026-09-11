@@ -15,9 +15,9 @@
         },
         "currency": {
           "type": "string",
-          "minLength": 3,
+          "minLength": 2,
           "maxLength": 8,
-          "description": "Uppercase currency code."
+          "description": "Uppercase currency code: `CC` for co/core credits, or an ISO 4217 code."
         }
       }
     },
@@ -48,8 +48,9 @@
         },
         "currency": {
           "type": "string",
-          "minLength": 3,
-          "maxLength": 8
+          "minLength": 2,
+          "maxLength": 8,
+          "description": "Uppercase currency code: `CC` for co/core credits, or an ISO 4217 code."
         }
       }
     },
@@ -70,8 +71,9 @@
         },
         "currency": {
           "type": "string",
-          "minLength": 3,
-          "maxLength": 8
+          "minLength": 2,
+          "maxLength": 8,
+          "description": "Uppercase currency code: `CC` for co/core credits, or an ISO 4217 code."
         }
       }
     },
