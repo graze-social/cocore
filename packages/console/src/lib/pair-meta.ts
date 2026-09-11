@@ -1,17 +1,15 @@
-// Validation for what a requester may attach to a pairing attempt, and a
-// small in-memory rate limiter for the now web-facing pair endpoints.
+// Validation for what a requester may attach to a pairing attempt.
 //
-// Why this exists: `start` was designed for a CLI on the user's own machine.
-// A web app such as Graze calling it on behalf of its users makes the approve
-// screen a consent screen ("Graze wants a key on your account") and makes the
-// endpoints reachable from any browser, so the inputs get bounds and the
-// endpoints get a budget. Pure functions, no Effect — easy to test.
+// Twin of the relevant half of packages/appview/src/devicepair/pair-meta.ts
+// (the packages do not share code). The console only needs this for its
+// legacy in-process pair store; in production it forwards `start` to the
+// AppView, which validates and rate-limits.
 
 import type { PairMeta } from "./pair-store.ts";
 
-export const APP_NAME_MAX = 40;
-export const KEY_NAME_MAX = 100;
-export const RETURN_URL_MAX = 2000;
+const APP_NAME_MAX = 40;
+const KEY_NAME_MAX = 100;
+const RETURN_URL_MAX = 2000;
 
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
@@ -32,14 +30,7 @@ export function parseReturnHosts(raw: string | undefined): string[] {
     .filter((h) => h.length > 0);
 }
 
-/** A return URL is honoured only when it is https (http for localhost, so a
- *  developer can test), carries no credentials, and its host is on the
- *  allowlist. Anything else yields undefined — dropped, never an error, so a
- *  misconfigured requester still gets a working pairing. */
-export function sanitizeReturnUrl(
-  value: unknown,
-  allowedHosts: readonly string[],
-): string | undefined {
+function sanitizeReturnUrl(value: unknown, allowedHosts: readonly string[]): string | undefined {
   if (typeof value !== "string" || value.length === 0 || value.length > RETURN_URL_MAX)
     return undefined;
   let url: URL;
@@ -67,48 +58,5 @@ export function sanitizePairMeta(body: unknown, allowedHosts: readonly string[])
     ...(appName ? { appName } : {}),
     ...(keyName ? { keyName } : {}),
     ...(returnUrl ? { returnUrl } : {}),
-  };
-}
-
-/** The client IP as the edge saw it: first hop of `x-forwarded-for`, else
- *  `x-real-ip`, else "unknown" (which then shares one budget — acceptable for
- *  a fallback that should never happen behind Railway's proxy). */
-export function clientKey(forwardedFor: string | undefined, realIp: string | undefined): string {
-  const first = (forwardedFor ?? "").split(",")[0]?.trim();
-  if (first) return first;
-  const real = (realIp ?? "").trim();
-  return real || "unknown";
-}
-
-export interface RateLimiter {
-  /** true = allowed (and counted); false = over budget. */
-  allow(key: string, now?: number): boolean;
-  /** For tests and diagnostics. */
-  size(): number;
-}
-
-/** Fixed-window counter per key. `limit` events per `windowMs`; a key's
- *  window starts at its first event. Windows that have elapsed are pruned on
- *  the way past, so the map cannot grow without bound. */
-export function createRateLimiter(limit: number, windowMs: number): RateLimiter {
-  const windows = new Map<string, { startedAt: number; count: number }>();
-  let lastPrune = 0;
-  return {
-    allow(key, now = Date.now()) {
-      if (now - lastPrune > windowMs) {
-        for (const [k, w] of windows) if (now - w.startedAt > windowMs) windows.delete(k);
-        lastPrune = now;
-      }
-      const w = windows.get(key);
-      if (!w || now - w.startedAt > windowMs) {
-        windows.set(key, { startedAt: now, count: 1 });
-        return true;
-      }
-      w.count += 1;
-      return w.count <= limit;
-    },
-    size() {
-      return windows.size;
-    },
   };
 }

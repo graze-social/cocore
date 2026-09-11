@@ -31,7 +31,7 @@ function consoleBaseUrl(): string {
 }
 
 /** The key name for a pairing nobody named: what the CLI has always minted. */
-export function defaultPairKeyName(now: Date = new Date()): string {
+function defaultPairKeyName(now: Date = new Date()): string {
   return `paired machine (${now.toISOString().slice(0, 10)})`;
 }
 

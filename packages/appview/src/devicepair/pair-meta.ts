@@ -9,9 +9,9 @@
 
 import type { PairMeta } from "./pair-store.ts";
 
-export const APP_NAME_MAX = 40;
-export const KEY_NAME_MAX = 100;
-export const RETURN_URL_MAX = 2000;
+const APP_NAME_MAX = 40;
+const KEY_NAME_MAX = 100;
+const RETURN_URL_MAX = 2000;
 
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;

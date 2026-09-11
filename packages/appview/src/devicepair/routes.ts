@@ -44,7 +44,7 @@ function secretEquals(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-export interface DevicePairRateLimits {
+interface DevicePairRateLimits {
   /** Window every limit below is counted in. */
   windowMs: number;
   start: number;
@@ -55,7 +55,7 @@ export interface DevicePairRateLimits {
 /** Generous for a human, tight for a script: nobody pairs 30 machines in
  *  ten minutes, and 30 confirm attempts is far too few to guess an 8-char
  *  code from a 31-symbol alphabet. */
-export const DEFAULT_RATE_LIMITS: DevicePairRateLimits = {
+const DEFAULT_RATE_LIMITS: DevicePairRateLimits = {
   windowMs: 10 * 60 * 1000,
   start: 30,
   describe: 120,
@@ -101,7 +101,7 @@ function isProviderSession(v: unknown): v is ProviderSession {
 }
 
 /** The key name for a pairing nobody named: what the CLI has always minted. */
-export function defaultKeyName(now: Date = new Date()): string {
+function defaultKeyName(now: Date = new Date()): string {
   return `paired machine (${now.toISOString().slice(0, 10)})`;
 }
 
