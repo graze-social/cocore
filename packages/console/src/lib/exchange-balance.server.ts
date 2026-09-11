@@ -48,6 +48,48 @@ export async function getBalance(did: string): Promise<BalanceResponse> {
   return (await r.json()) as BalanceResponse;
 }
 
+/** The ledger's dispatch-admission verdict (packages/exchange token-balance
+ *  `checkAdmission`): `ok` when `balance >= priceCeilingTokens + tokenFloor`. */
+export interface AdmissionResponse {
+  ok: boolean;
+  balance: number;
+  required: number;
+  shortBy: number;
+  pendingGrant: boolean;
+}
+
+export async function checkAdmission(
+  did: string,
+  priceCeilingTokens: number,
+): Promise<AdmissionResponse> {
+  const r = await fetch(bridgeUrl("/xrpc/dev.cocore.exchange.checkAdmission"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ did, priceCeilingTokens }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!r.ok) {
+    throw new Error(
+      `checkAdmission(${did}) returned ${r.status}: ${await r.text().catch(() => "")}`,
+    );
+  }
+  const body = (await r.json()) as Partial<AdmissionResponse> | null;
+  // Shape-check before anyone trusts it: a proxy error page, a wrong route or
+  // a stubbed fetch must read as "ledger unreachable" (fail-open upstream),
+  // never as a verdict.
+  if (
+    !body ||
+    typeof body !== "object" ||
+    typeof body.ok !== "boolean" ||
+    typeof body.balance !== "number" ||
+    typeof body.required !== "number" ||
+    typeof body.shortBy !== "number"
+  ) {
+    throw new Error(`checkAdmission(${did}) returned a malformed verdict`);
+  }
+  return body as AdmissionResponse;
+}
+
 export interface LedgerEvent {
   did: string;
   kind: string;

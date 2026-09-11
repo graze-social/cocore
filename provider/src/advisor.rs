@@ -923,7 +923,7 @@ impl AdvisorClient {
                     // cell since we registered: tell the advisor, so its brokerage
                     // countersignature binds the same attestation the next
                     // receipt strong-refs. Piggybacks on the heartbeat cadence —
-                    // a refresh is ~hourly, so a heartbeat of delay is nothing.
+                    // a refresh is ~daily (23h), so a heartbeat of delay is nothing.
                     let live_uri = attestation.read().await.as_ref().map(|r| r.uri.clone());
                     if let Some(uri) = live_uri {
                         if uri != registered_attestation_uri {

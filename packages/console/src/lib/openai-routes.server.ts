@@ -20,6 +20,7 @@ import { isDid } from "@atcute/lexicons/syntax";
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
 import { runTraced } from "@/lib/o11y.server.ts";
+import { admit } from "@/lib/admission.server.ts";
 
 import { restoreAtprotoSessionEffect } from "@/integrations/auth/atproto.server.ts";
 import { appviewBackedSession, appviewSessionInfo } from "@/lib/appview-backed-session.server.ts";
@@ -310,6 +311,12 @@ export async function handleChatCompletions(request: Request): Promise<Response>
     ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
   };
 
+  // Admission floor (co/core terms): refuse a job the requester's balance
+  // cannot cover with `tokenFloor` headroom. Observe-only until
+  // COCORE_ENFORCE_ADMISSION is on; fail-open when the ledger is unreachable.
+  const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);
+  if (admission.refusal) return admission.refusal;
+
   if (parsed.stream) {
     return streamingResponse(id, parsed.model, runDispatch(inputs));
   }
@@ -385,6 +392,12 @@ export async function handlePrivateChatCompletions(request: Request): Promise<Re
     ...(parsed.toolChoice ? { toolChoice: parsed.toolChoice } : {}),
     ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
   };
+
+  // Admission floor (co/core terms): refuse a job the requester's balance
+  // cannot cover with `tokenFloor` headroom. Observe-only until
+  // COCORE_ENFORCE_ADMISSION is on; fail-open when the ledger is unreachable.
+  const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);
+  if (admission.refusal) return admission.refusal;
 
   if (parsed.stream) {
     return streamingResponse(id, parsed.model, runDispatch(inputs));
@@ -481,6 +494,12 @@ export async function handleVerifiedChatCompletions(request: Request): Promise<R
     ...(parsed.toolChoice ? { toolChoice: parsed.toolChoice } : {}),
     ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
   };
+
+  // Admission floor (co/core terms): refuse a job the requester's balance
+  // cannot cover with `tokenFloor` headroom. Observe-only until
+  // COCORE_ENFORCE_ADMISSION is on; fail-open when the ledger is unreachable.
+  const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);
+  if (admission.refusal) return admission.refusal;
 
   if (parsed.stream) {
     return streamingResponse(id, parsed.model, runDispatch(inputs));
