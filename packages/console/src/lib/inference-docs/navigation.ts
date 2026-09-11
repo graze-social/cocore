@@ -1,4 +1,9 @@
-export const INFERENCE_DOCS_SECTIONS = ["Getting started", "API reference", "Tool setup"] as const;
+export const INFERENCE_DOCS_SECTIONS = [
+  "Getting started",
+  "Build with co/core",
+  "API reference",
+  "Tool setup",
+] as const;
 
 export const COMMUNITY_TOOLS_PATH = "/docs/community-tools" as const;
 export const COMMUNITY_TOOLS_NAV_ID = "community-tools" as const;
@@ -8,6 +13,7 @@ export type InferenceDocsSection = (typeof INFERENCE_DOCS_SECTIONS)[number];
 export type InferenceDocsSlug =
   | "quickstart"
   | "api-reference"
+  | "connect-your-app"
   | "opencode"
   | "cursor"
   | "claude-code";
@@ -36,6 +42,13 @@ export const INFERENCE_DOCS_CATALOG: Array<InferenceDocsEntry> = [
     label: "Quickstart",
     title: "Quickstart",
     description: "Create an API key, then swap the base URL and key in your OpenAI client.",
+  },
+  {
+    slug: "connect-your-app",
+    section: "Build with co/core",
+    label: "Sign in with co/core",
+    title: "Sign in with co/core",
+    description: "Let your users connect their own co/core account; jobs run on their credits.",
   },
   {
     slug: "api-reference",
