@@ -41,17 +41,24 @@ import { err, ok, searchParams } from "./http-app.ts";
 // Lexicon `bytes` fields ship as base64 strings on the wire; decode them for
 // the schema-validation pass in verifyReceipt (the cryptographic verify runs
 // on the original string-bearing JSON so canonical bytes match what was signed).
+// Every `bytes` field of dev.cocore.compute.receipt must be listed here, or the
+// record is reported `lexicon-invalid` ("... must be a byte array") no matter
+// how sound it is — which is how every ADR-0004 receipt read as invalid.
 const BYTES_FIELDS = new Set(["enclaveSignature", "selfSignature"]);
-function decodeBytesFields(body: Record<string, unknown>): Record<string, unknown> {
+function b64ToBytes(v: unknown): unknown {
+  return typeof v === "string" ? Uint8Array.from(Buffer.from(v, "base64")) : v;
+}
+export function decodeBytesFields(body: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...body };
-  for (const k of BYTES_FIELDS) {
-    const v = out[k];
-    if (typeof v === "string") out[k] = Uint8Array.from(Buffer.from(v, "base64"));
-  }
+  for (const k of BYTES_FIELDS) out[k] = b64ToBytes(out[k]);
   if (Array.isArray(out["mdaCertChain"])) {
-    out["mdaCertChain"] = (out["mdaCertChain"] as unknown[]).map((b) =>
-      typeof b === "string" ? Uint8Array.from(Buffer.from(b, "base64")) : b,
-    );
+    out["mdaCertChain"] = (out["mdaCertChain"] as unknown[]).map(b64ToBytes);
+  }
+  // ADR-0004 brokerage witness: `brokerageCountersignature.sig` is `bytes`.
+  const cs = out["brokerageCountersignature"];
+  if (cs && typeof cs === "object" && !Array.isArray(cs)) {
+    const c = cs as Record<string, unknown>;
+    out["brokerageCountersignature"] = { ...c, sig: b64ToBytes(c["sig"]) };
   }
   return out;
 }
