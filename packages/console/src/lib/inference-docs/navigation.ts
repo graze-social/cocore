@@ -7,6 +7,7 @@ export type InferenceDocsSection = (typeof INFERENCE_DOCS_SECTIONS)[number];
 
 export type InferenceDocsSlug =
   | "quickstart"
+  | "connect-your-app"
   | "api-reference"
   | "opencode"
   | "cursor"
@@ -36,6 +37,14 @@ export const INFERENCE_DOCS_CATALOG: Array<InferenceDocsEntry> = [
     label: "Quickstart",
     title: "Quickstart",
     description: "Create an API key, then swap the base URL and key in your OpenAI client.",
+  },
+  {
+    slug: "connect-your-app",
+    section: "Getting started",
+    label: "Connect your app",
+    title: "Connect your app",
+    description:
+      "Sign in with co/core: let users connect their account to your app in one click, via device pairing.",
   },
   {
     slug: "api-reference",

@@ -28,6 +28,8 @@ tags:
     description: Public, unauthenticated discovery of what's being served.
   - name: Agent
     description: Status of a machine you operate (bearer-key authed).
+  - name: Connect
+    description: Sign in with co/core — device pairing that hands an application a key for a user's account.
 
 paths:
   /v1/chat/completions:
@@ -279,6 +281,97 @@ paths:
               schema: { type: string }
               description: "public, max-age=30, stale-while-revalidate=300"
 
+  /api/xrpc/dev.cocore.devicePair.start:
+    post:
+      tags: [Connect]
+      operationId: devicePairStart
+      summary: Start a pairing ("Sign in with co/core" for applications)
+      description: >
+        Begin an OAuth device-authorization style pairing. Send the user to
+        `verificationUri`; keep `deviceId` on your server and poll
+        `devicePair.poll` until they approve. An application passes `appDid`
+        (a DID with a `dev.cocore.app.registration` record): the approve screen
+        then shows the record's name as a verified application, and `returnUrl`
+        (matching one of the record's `returnUrls`, on a host that serves
+        `/.well-known/cocore-app.json` naming the DID) is where the browser is
+        sent after approval. Rate-limited per client IP. Full guide:
+        `/docs/inference/connect-your-app`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DevicePairStartRequest" }
+      responses:
+        "200":
+          description: The pairing attempt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DevicePairStart" }
+        "400":
+          description: "`appDid` is not a DID or has no registration record (`AppNotRegistered`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/XrpcError" }
+        "429":
+          description: Too many pairing attempts from this client.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/XrpcError" }
+
+  /api/xrpc/dev.cocore.devicePair.describe:
+    get:
+      tags: [Connect]
+      operationId: devicePairDescribe
+      summary: Who is behind a pairing code
+      description: >
+        Public read used by the approve screen. Echoes what `start` was given
+        (app name, key name, return URL) plus the resolved application identity
+        and whether its return host verified. Never returns the `deviceId`.
+      parameters:
+        - name: userCode
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The pairing's public description.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DevicePairDescribe" }
+        "404":
+          description: No pairing matches the code.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/XrpcError" }
+
+  /api/xrpc/dev.cocore.devicePair.poll:
+    get:
+      tags: [Connect]
+      operationId: devicePairPoll
+      summary: Poll a pairing for the granted key
+      description: >
+        `pending` until the user acts; `session` exactly once on approval
+        (carrying `{did, handle, apiKey, apiBase}`), then `consumed`. `denied`
+        is 403; `expired`/`consumed` are 410; an unknown `deviceId` is 404.
+        Verify `session.did` is the user you expected before storing `apiKey`.
+      parameters:
+        - name: deviceId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Pending, or the granted session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DevicePairPoll" }
+        "403":
+          description: The user denied the pairing.
+        "404":
+          description: Unknown `deviceId`.
+        "410":
+          description: Expired or already consumed.
+
   /api/agent/status:
     get:
       tags: [Agent]
@@ -324,6 +417,72 @@ components:
         the console at `/api-keys`. The key resolves to your DID server-side.
 
   schemas:
+    XrpcError:
+      type: object
+      properties:
+        error: { type: string, example: InvalidRequest }
+        message: { type: string }
+    DevicePairStartRequest:
+      type: object
+      properties:
+        appDid:
+          type: string
+          description: The requesting application's DID; must carry a `dev.cocore.app.registration` record.
+          example: did:plc:yourapp
+        keyName:
+          type: string
+          maxLength: 100
+          description: Name for the minted API key, so the user can recognise and revoke it.
+        returnUrl:
+          type: string
+          format: uri
+          description: Where to send the browser after approval. Must match one of the registration's `returnUrls`.
+        appName:
+          type: string
+          maxLength: 40
+          description: Self-declared name for requesters without `appDid`; shown as an unregistered request.
+    DevicePairStart:
+      type: object
+      required: [deviceId, userCode, verificationUri, pollIntervalSecs, expiresInSecs]
+      properties:
+        deviceId: { type: string, description: Server-side credential for `poll`. Never expose to a browser. }
+        userCode: { type: string, example: K7PX2M4Q }
+        verificationUri: { type: string, format: uri, example: "https://cocore.dev/devices/new?code=K7PX2M4Q" }
+        pollIntervalSecs: { type: integer, example: 3 }
+        expiresInSecs: { type: integer, example: 600 }
+    DevicePairDescribe:
+      type: object
+      required: [status, expiresInSecs]
+      properties:
+        status: { type: string, enum: [pending, approved, denied, expired, consumed] }
+        appName: { type: string }
+        keyName: { type: string }
+        returnUrl: { type: string, format: uri }
+        app:
+          type: object
+          required: [did, name, verified]
+          properties:
+            did: { type: string }
+            handle: { type: string }
+            name: { type: string }
+            website: { type: string, format: uri }
+            iconUrl: { type: string, format: uri }
+            verified: { type: boolean, description: The return host proved it belongs to the app's DID. }
+            verifiedHost: { type: string }
+        expiresInSecs: { type: integer }
+    DevicePairPoll:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [pending, session] }
+        session:
+          type: object
+          required: [did, handle, apiKey, apiBase]
+          properties:
+            did: { type: string }
+            handle: { type: string }
+            apiKey: { type: string, example: "cocore-…" }
+            apiBase: { type: string, format: uri, example: "https://cocore.dev" }
     ChatMessage:
       type: object
       required: [role]

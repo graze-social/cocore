@@ -291,10 +291,30 @@ export const API_DOCS_CATALOG: Array<ApiDocsCatalogEntry> = [
   p(
     "dev.cocore.devicePair.start",
     "Device pairing",
-    "Begin a device-pairing flow (OAuth device-authorization style). Returns a `deviceId` plus a short `userCode` to approve at the verification URI.",
+    "Begin a device-pairing flow (OAuth device-authorization style). Returns a `deviceId` plus a short `userCode` to approve at the verification URI. An application connecting on a user's behalf passes `appDid` (its `dev.cocore.app.registration` record names it), `keyName`, and a registered `returnUrl`.",
     "none",
-    [],
-    { autoRun: false },
+    [
+      { name: "appDid", type: "string", required: false },
+      { name: "keyName", type: "string", required: false },
+      { name: "returnUrl", type: "string", required: false },
+    ],
+    {
+      autoRun: false,
+      body: {
+        appDid: "did:plc:yourapp",
+        keyName: "Your App",
+        returnUrl: "https://yourapp.example/settings/connections",
+      },
+    },
+    { host: "appview" },
+  ),
+  q(
+    "dev.cocore.devicePair.describe",
+    "Device pairing",
+    "Describe a pending pairing by `userCode`: the requesting app's verified identity (`app`), the key name, the return URL, status, and time left. Public; never returns the `deviceId`.",
+    "none",
+    [{ name: "userCode", type: "string", required: true }],
+    { autoRun: false, params: { userCode: "K7PX2M4Q" } },
     { host: "appview" },
   ),
   q(

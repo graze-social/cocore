@@ -17,6 +17,9 @@ function sectionForNsid(
   if (nsid.startsWith("dev.cocore.account.")) {
     return "Account records";
   }
+  if (nsid.startsWith("dev.cocore.app.")) {
+    return "App records";
+  }
   return "Compute records";
 }
 

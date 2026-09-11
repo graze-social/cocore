@@ -21,7 +21,10 @@ import {
   HighlightedBlock,
   inferenceDocsSharedStyles,
 } from "@/components/inference-docs/shared.tsx";
-import { InferenceApiDocLink } from "@/components/inference-docs/inference-doc-link.tsx";
+import {
+  InferenceApiDocLink,
+  InferenceDocLink,
+} from "@/components/inference-docs/inference-doc-link.tsx";
 import { CopyToClipboardButton } from "@/design-system/copy-to-clipboard-button";
 import { Flex } from "@/design-system/flex";
 import { SegmentedControl, SegmentedControlItem } from "@/design-system/segmented-control";
@@ -106,12 +109,15 @@ export function InferenceQuickstartPage({ baseUrl }: { baseUrl: string }) {
         Building on top of AT Protocol? Skip key provisioning entirely: mint a service-auth token
         from the caller&apos;s PDS (
         <code {...stylex.props(docsStyles.codeInline)}>com.atproto.server.getServiceAuth</code> with{" "}
-        <code {...stylex.props(docsStyles.codeInline)}>aud=did:web:console.cocore.dev</code> and{" "}
+        <code {...stylex.props(docsStyles.codeInline)}>aud=did:web:cocore.dev</code> and{" "}
         <code {...stylex.props(docsStyles.codeInline)}>lxm=dev.cocore.inference.dispatch</code>) and
         pass it as the Bearer token. Inference then runs on behalf of the token&apos;s issuer DID.
         The DID must have connected co/core once so a session exists to publish the job to its PDS;
         otherwise the request returns{" "}
-        <code {...stylex.props(docsStyles.codeInline)}>401 onboarding_required</code>.
+        <code {...stylex.props(docsStyles.codeInline)}>401 onboarding_required</code>. Building an
+        app that acts for <em>other</em> people&apos;s accounts? Use{" "}
+        <InferenceDocLink slug="connect-your-app">Connect your app</InferenceDocLink> instead: their
+        PDS will not mint service auth for your client without a scope grant.
       </p>
       <p {...stylex.props(docsStyles.prose)}>
         Invalid or missing credentials return{" "}

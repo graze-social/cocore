@@ -21,6 +21,7 @@ export const LEXICON_DOCS_SECTIONS = [
   "Shared definitions",
   "Compute records",
   "Account records",
+  "App records",
 ] as const;
 
 export type LexiconDocsSection = (typeof LEXICON_DOCS_SECTIONS)[number];

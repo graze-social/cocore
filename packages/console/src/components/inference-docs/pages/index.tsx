@@ -9,6 +9,7 @@ import {
   InferenceDocsPage,
 } from "@/components/inference-docs/inference-docs-page.tsx";
 import { InferenceApiReferencePage } from "@/components/inference-docs/pages/api-reference.tsx";
+import { InferenceConnectYourAppPage } from "@/components/inference-docs/pages/connect-your-app.tsx";
 import { InferenceQuickstartPage } from "@/components/inference-docs/pages/quickstart.tsx";
 import {
   InferenceApiDocLink,
@@ -53,6 +54,13 @@ export function InferenceDocsOverviewPage({ baseUrl }: { baseUrl: string }) {
         </li>
       </ol>
 
+      <h2 {...stylex.props(docsStyles.h2)}>Building an app for other people?</h2>
+      <p {...stylex.props(docsStyles.prose)}>
+        Let your users connect their own co/core account in one click and run inference on their
+        credits: publish a registration record, serve a well-known file, and use the device-pairing
+        XRPC. See <InferenceDocLink slug="connect-your-app">Connect your app</InferenceDocLink>.
+      </p>
+
       <h2 {...stylex.props(docsStyles.h2)}>Using an editor or agent</h2>
       <p {...stylex.props(docsStyles.prose)}>
         OpenCode, Cursor, and Claude Code each need slightly different setup. See the{" "}
@@ -77,6 +85,8 @@ export function InferenceDocsSlugPage({
   switch (slug) {
     case "quickstart":
       return <InferenceQuickstartPage baseUrl={baseUrl} />;
+    case "connect-your-app":
+      return <InferenceConnectYourAppPage baseUrl={baseUrl} />;
     case "api-reference":
       return <InferenceApiReferencePage baseUrl={baseUrl} />;
     case "opencode":

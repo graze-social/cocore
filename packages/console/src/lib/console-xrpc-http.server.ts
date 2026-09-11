@@ -20,6 +20,7 @@
 import type { Did } from "@atcute/lexicons";
 import { Effect, Either } from "effect";
 
+import { appviewSessionInfo } from "@/lib/appview-backed-session.server.ts";
 import { handOffSessionToAppview } from "@/lib/appview-session-handoff.server.ts";
 import { runTraced } from "@/lib/o11y.server.ts";
 import { getAtprotoSessionForRequest } from "@/middleware/auth.server.ts";
@@ -227,8 +228,18 @@ export async function devicePairConfirmResponse(request: Request): Promise<Respo
     // approved never went through a callback. Push it now, best-effort, so an
     // application connecting on the user's behalf (Graze) gets a key that
     // works on the first inference call rather than a 401.
+    //
+    // ONLY when the AppView has no session for this DID. Refresh tokens are
+    // single-use and the AppView is the sole refresher once it owns a session:
+    // pushing the console's stored copy over a live AppView session hands it a
+    // refresh token that was already spent, and the very next restore fails
+    // with "Refresh token replayed" -- which is exactly what happened to the
+    // first Graze connection on 2026-09-11. A present session is left alone.
     if (upstream.ok && body.decision === "approve") {
-      await handOffSessionToAppview(auth.did);
+      const info = await appviewSessionInfo(auth.did);
+      if (info.checked && !info.present) {
+        await handOffSessionToAppview(auth.did);
+      }
     }
     return passthrough(upstream);
   }
