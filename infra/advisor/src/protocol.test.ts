@@ -131,3 +131,24 @@ describe("stream resume wire contract", () => {
     if (!result.ok) expect(result.reason).toContain(field);
   });
 });
+
+describe("attestation_refreshed wire contract", () => {
+  it("accepts the additive frame", () => {
+    const frame = {
+      type: "attestation_refreshed",
+      attestation_uri: "at://did:plc:test1/dev.cocore.compute.attestation/fresh",
+    };
+    expect(validateFrame(frame)).toEqual({ ok: true, msg: frame });
+  });
+
+  it.each([
+    [{ type: "attestation_refreshed" }],
+    [{ type: "attestation_refreshed", attestation_uri: "" }],
+    [{ type: "attestation_refreshed", attestation_uri: 7 }],
+  ])("rejects a frame without a usable attestation_uri (%j)", (frame) => {
+    expect(validateFrame(frame)).toEqual({
+      ok: false,
+      reason: "attestation_refreshed: attestation_uri",
+    });
+  });
+});

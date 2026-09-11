@@ -40,6 +40,14 @@ pub enum AdvisorMessage {
     AttestationChallenge(AttestationChallenge),
     /// Provider → advisor: signed challenge response.
     AttestationResponse(AttestationResponse),
+    /// Provider → advisor: this machine republished its attestation record
+    /// (the ~hourly re-attest before the 24h expiry). The advisor's ADR-0004
+    /// brokerage countersignature binds the attestation URI, and every
+    /// receipt strong-refs whatever attestation is live at publish time — so
+    /// the advisor has to learn the new URI or the witness and the receipt
+    /// name different records and `verifyReceipt` fails the countersignature.
+    /// Additive: an old advisor ignores the unknown frame.
+    AttestationRefreshed(AttestationRefreshed),
     /// Provider → advisor (→ requester): per-request ephemeral session key for
     /// the confidential tier. Minted fresh inside the measured engine and
     /// SE-signed over the requester's nonce + the active attestation CID, so a
@@ -129,6 +137,12 @@ pub struct HealthNotice {
     pub standing: HealthStanding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationRefreshed {
+    /// at://… of the attestation record receipts reference from now on.
+    pub attestation_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
