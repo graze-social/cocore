@@ -101,6 +101,26 @@ export interface ConnectionConfig {
    *  inevitable cut into a predictable, graceful cycle we control instead
    *  of an edge-initiated reset. 0 / unset disables. */
   maxConnectionMs?: number;
+  /** How long BEFORE {@link maxConnectionMs} to start looking for an idle
+   *  moment to recycle in. The recycle is advisor housekeeping on a timer, not
+   *  a deadline the requester agreed to: closing a socket with a job on it
+   *  kills that job outright on any provider without stream-resume support
+   *  (< 0.9.52), which is how the advisor's own scheduled maintenance turned
+   *  into a `provider-disconnected` 502 for the caller. So from
+   *  `maxConnectionMs - maxConnectionDrainMs` onward we re-check on
+   *  {@link recycleDrainPollMs} and close at the first moment the machine has
+   *  nothing in flight; at `maxConnectionMs` we close regardless.
+   *
+   *  Note this window comes OUT of the connection budget rather than extending
+   *  it — total socket lifetime is still capped at `maxConnectionMs`, so the
+   *  margin against the edge's own ~15-min cut is unchanged. Defaults to 180s
+   *  (longer than essentially any single job); 0 restores the old
+   *  close-on-the-dot behavior. */
+  maxConnectionDrainMs?: number;
+  /** Re-check cadence while a recycle is waiting for jobs to drain. Defaults
+   *  to 2s — short enough that the socket recycles promptly once the last job
+   *  completes, cheap enough to poll. */
+  recycleDrainPollMs?: number;
   /** APNs sender config for the code-identity challenge. Null/absent disables
    *  it: no challenges are sent and confidential eligibility is NOT gated on
    *  code-attestation (the pre-APNs behavior). Set exactly when the advisor has
@@ -187,16 +207,52 @@ export function handleConnection(
     // (clean close → backoff stays at the floor) instead of eating an
     // abrupt edge-initiated `1006` at the cap. Predictable, advisor-driven
     // recycling rather than at-the-mercy-of-the-edge resets.
-    recycleTimer = setTimeout(() => {
+    //
+    // But NEVER pull the rug out from under a job that's mid-flight if we can
+    // help it. On a provider without stream-resume (< 0.9.52) the close ends
+    // the session with `provider-disconnected`, which the caller sees as a
+    // 502 — the advisor's own maintenance failing a request that was running
+    // fine. So we start looking for an idle moment a few minutes EARLY and
+    // recycle in one; a machine that stays busy right through the window is
+    // still closed on the dot, because the edge's abrupt cut is worse.
+    const drainMs = Math.min(config.maxConnectionDrainMs ?? 180_000, config.maxConnectionMs);
+    const pollMs = config.recycleDrainPollMs ?? 2_000;
+    const hardDeadline = Date.now() + config.maxConnectionMs;
+
+    const attemptRecycle = (): void => {
+      const inflight =
+        registeredDid && registeredMachineId
+          ? sessions.inflightFor(registeredDid, registeredMachineId)
+          : 0;
+      const forced = Date.now() >= hardDeadline;
+      if (inflight > 0 && !forced) {
+        // Busy — hold the socket open and look again shortly.
+        recycleTimer = setTimeout(attemptRecycle, Math.min(pollMs, hardDeadline - Date.now()));
+        recycleTimer.unref();
+        return;
+      }
       console.error(
-        `[ws] recycling connection peer=${peer} did=${registeredDid ?? "?"} (pre-empting the edge connection cap)`,
+        `[ws] recycling connection peer=${peer} did=${registeredDid ?? "?"} machine=${registeredMachineId ?? "?"} (pre-empting the edge connection cap)` +
+          (inflight > 0 ? `; forced with ${inflight} job(s) still in flight` : ""),
       );
       close(1000, "recycle");
-    }, config.maxConnectionMs);
+    };
+
+    recycleTimer = setTimeout(attemptRecycle, config.maxConnectionMs - drainMs);
     recycleTimer.unref();
   }
 
+  // Set when the ADVISOR is the one hanging up (recycle / replaced), so the
+  // close handler can tell its own housekeeping apart from a provider that
+  // genuinely dropped. The close REASON can't carry this: the provider tears
+  // the TCP connection down rather than echoing our close frame, so the
+  // `close` event lands as `1006`/`""` every single time in production — which
+  // silently made the old `reason === "recycle"` test always false and had the
+  // advisor charging providers a failure for its own scheduled recycle.
+  let advisorClosing: string | null = null;
+
   const close = (code = 1000, reason = "normal"): void => {
+    if (reason === "recycle" || reason === "replaced") advisorClosing = reason;
     try {
       socket.close(code, reason);
     } catch {
@@ -712,6 +768,24 @@ export function handleConnection(
           });
         }
         if (!completion.accepted) return;
+        // A completion that produced NOTHING — no chunk ever relayed and zero
+        // output tokens — is a wedged engine wearing a success frame, not a
+        // served job. It reaches the caller as a 200 with an empty message,
+        // so every client ends up reimplementing stall detection. Count it
+        // against the machine's standing (it takes repeated, clustered
+        // failures to trip a cooldown, so a genuinely empty answer now and
+        // then is forgiven) and leave a log line the operator can find.
+        if (!completion.streamed && msg.tokens_out === 0) {
+          const tripped = registry.recordFailure(
+            registeredDid,
+            registeredMachineId,
+            "empty-completion",
+          );
+          console.error(
+            `[ws] empty completion did=${registeredDid} machine=${registeredMachineId} session=${msg.session_id}; accepted the job and produced no tokens${tripped ? ", repeated → cooldown" : ""}`,
+          );
+          return;
+        }
         // Count only the first valid terminal delivery; replayed completion is
         // answered from the tombstone and never reaches this branch.
         registry.recordCompletion(registeredDid, registeredMachineId);
@@ -772,10 +846,23 @@ export function handleConnection(
       const entry = registry.get(registeredDid, registeredMachineId);
       if (entry && entry.send === send) {
         const reasonStr = reason?.toString() ?? "";
-        const advisorInitiated = reasonStr === "replaced" || reasonStr === "recycle";
+        // Trust our OWN flag first; the wire reason is advisory at best (a
+        // provider that drops TCP instead of echoing the close frame gives us
+        // `1006`/`""` no matter what we sent).
+        const advisorInitiated =
+          advisorClosing !== null || reasonStr === "replaced" || reasonStr === "recycle";
         const { detached, closed } = sessions.detachForMachine(registeredDid, registeredMachineId);
         // Legacy sessions retain fail-fast behavior. Resume-capable sessions
         // are not failures unless their bounded grace actually expires.
+        if (advisorInitiated && closed > 0) {
+          // WE hung up on live work — in practice a recycle forced because the
+          // machine stayed busy through the whole drain window. The requester's
+          // job died, but that's on the advisor, so it must not cost the
+          // machine its standing.
+          console.error(
+            `[ws] advisor-initiated close (${advisorClosing ?? reasonStr}) ended ${closed} in-flight legacy session(s) did=${registeredDid} machine=${registeredMachineId}; NOT counted against the provider`,
+          );
+        }
         if (!advisorInitiated && closed > 0) {
           const tripped = registry.recordFailure(
             registeredDid,

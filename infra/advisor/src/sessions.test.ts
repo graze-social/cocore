@@ -117,11 +117,42 @@ test("resume reattaches the same invocation and suppresses replayed chunks", () 
     accepted: true,
     nextSeq: 2,
     resumeToken: "secret",
+    streamed: true,
   });
   expect(res.chunks.join("").match(/"type":"complete"/g)).toHaveLength(1);
   expect(sm.resume("s", "did:plc:p", "m", "secret", 2)).toEqual({
     status: "completed",
     nextSeq: 2,
+  });
+});
+
+test("complete reports whether the session ever streamed a chunk", () => {
+  // `streamed` is what lets the advisor tell a served job from a silent stall
+  // (accepted the work, finished it, produced nothing). Legacy sessions never
+  // advance nextSeq, so the sequence number can't stand in for this.
+  const sm = new SessionManager({ idleTimeoutMs: 10_000 });
+  const silent = fakeRes();
+  sm.open("s-silent", "did:plc:p", "m", "did:plc:r", asRes(silent));
+  expect(sm.complete("s-silent", { tokensIn: 7, tokensOut: 0, receiptUri: "at://r" })).toEqual({
+    accepted: true,
+    nextSeq: 0,
+    resumeToken: null,
+    streamed: false,
+  });
+
+  const served = fakeRes();
+  sm.open("s-served", "did:plc:p", "m", "did:plc:r", asRes(served));
+  sm.acceptChunk("s-served", 0, {
+    type: "chunk",
+    sessionId: "s-served",
+    seq: 0,
+    ciphertext: [1],
+  });
+  expect(sm.complete("s-served", { tokensIn: 7, tokensOut: 1, receiptUri: "at://r" })).toEqual({
+    accepted: true,
+    nextSeq: 0,
+    resumeToken: null,
+    streamed: true,
   });
 });
 
@@ -139,6 +170,7 @@ test("complete rejects a finalSeq that races ahead of a missing chunk", () => {
     accepted: false,
     nextSeq: 1,
     resumeToken: "secret",
+    streamed: true,
   });
   // No completion was written and the session is still live.
   expect(res.chunks.join("")).not.toContain('"type":"complete"');
@@ -148,6 +180,7 @@ test("complete rejects a finalSeq that races ahead of a missing chunk", () => {
     accepted: true,
     nextSeq: 1,
     resumeToken: "secret",
+    streamed: true,
   });
 });
 
@@ -288,6 +321,7 @@ test("resume replays a multi-chunk gap in order until completion", () => {
     accepted: true,
     nextSeq: 3,
     resumeToken: "tok",
+    streamed: true,
   });
   const sse = res.chunks.join("");
   expect(sse.match(/"type":"chunk"/g)).toHaveLength(3);

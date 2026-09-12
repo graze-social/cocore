@@ -257,6 +257,45 @@ describe("bufferedResponse error mapping", () => {
     assert.match(body.error.message, /before completion/i);
   });
 
+  test("a completion that produced nothing is an error, not an empty 200", async () => {
+    // The silent stall: the provider finishes the job having emitted no text
+    // and metered zero output tokens. Shaped like a success, useless as one —
+    // every client would otherwise have to detect the empty string itself.
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([{ kind: "complete", tokensIn: 591, tokensOut: 0, receiptUri: "at://x" }]),
+    );
+    assert.equal(res.status, 502);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "empty_completion");
+    assert.match(body.error.message, /without producing any output/i);
+  });
+
+  test("an empty answer that actually spent output tokens is still a 200", async () => {
+    // Only the conjunction (no text, no reasoning, no tool call, AND zero
+    // metered tokens) is the stall. A model that genuinely burned tokens and
+    // landed on an empty string served the request.
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([{ kind: "complete", tokensIn: 591, tokensOut: 4, receiptUri: "at://x" }]),
+    );
+    assert.equal(res.status, 200);
+  });
+
+  test("a reasoning-only completion is not mistaken for a stall", async () => {
+    const res = await bufferedResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([
+        { kind: "chunk", seq: 0, channel: "reasoning", text: "hmm" },
+        { kind: "complete", tokensIn: 591, tokensOut: 0, receiptUri: "at://x" },
+      ]),
+    );
+    assert.equal(res.status, 200);
+  });
+
   test("reasoning chunks surface as message.reasoning_content, separate from content", async () => {
     const res = await bufferedResponse(
       "chatcmpl-id",
@@ -477,6 +516,32 @@ describe("streamingResponse is an SSE stream", () => {
     const terminal = parseJson<{ error: { code: string; message: string } }>(data.at(-1)!);
     assert.equal(terminal.error.code, "advisor_transport");
     assert.match(terminal.error.message, /before completion/i);
+  });
+
+  test("a completion that produced nothing terminates the stream with an error", async () => {
+    const res = streamingResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([{ kind: "complete", tokensIn: 591, tokensOut: 0, receiptUri: "at://x" }]),
+    );
+    const data = await readSseData(res);
+    assert.equal(data.includes("[DONE]"), false);
+    const terminal = parseJson<{ error: { code: string; message: string } }>(data.at(-1)!);
+    assert.equal(terminal.error.code, "empty_completion");
+    assert.match(terminal.error.message, /without producing any output/i);
+  });
+
+  test("a stream that emitted text still terminates with stop + [DONE]", async () => {
+    const res = streamingResponse(
+      "chatcmpl-id",
+      "stub",
+      yieldEvents([
+        { kind: "chunk", seq: 0, channel: "content", text: "hi" },
+        { kind: "complete", tokensIn: 591, tokensOut: 0, receiptUri: "at://x" },
+      ]),
+    );
+    const data = await readSseData(res);
+    assert.equal(data.at(-1), "[DONE]");
   });
 
   test("reasoning chunks ride delta.reasoning_content, content rides delta.content", async () => {

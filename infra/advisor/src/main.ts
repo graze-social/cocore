@@ -88,6 +88,9 @@ const CONFIG = Effect.runSync(
     wsMaxConnectionMs: Config.integer("COCORE_ADVISOR_WS_MAX_CONNECTION_MS").pipe(
       Config.withDefault(840_000),
     ),
+    wsMaxConnectionDrainMs: Config.integer("COCORE_ADVISOR_WS_MAX_CONNECTION_DRAIN_MS").pipe(
+      Config.withDefault(180_000),
+    ),
     reprobeIntervalMs: Config.integer("COCORE_ADVISOR_REPROBE_INTERVAL_MS").pipe(
       Config.withDefault(5_000),
     ),
@@ -213,6 +216,15 @@ const WS_KEEPALIVE_MAX_MISSED = CONFIG.wsKeepaliveMaxMissed;
  *  provider reconnect on its graceful, backoff-resetting path instead.
  *  Set to 0 to disable (rely on the edge cap). */
 const WS_MAX_CONNECTION_MS = CONFIG.wsMaxConnectionMs;
+/** How long BEFORE {@link WS_MAX_CONNECTION_MS} the advisor starts hunting
+ *  for an idle moment to recycle in. The recycle is housekeeping on a timer,
+ *  not a deadline the requester signed up for — and on a provider without
+ *  stream-resume (< 0.9.52) closing the socket kills the job outright, which
+ *  the caller sees as a `provider-disconnected` 502. This window is carved OUT
+ *  of the connection budget, not added to it: total socket lifetime is still
+ *  capped at WS_MAX_CONNECTION_MS, so the margin against Railway's own ~15-min
+ *  cut is unchanged. 0 restores the old close-on-the-dot behavior. */
+const WS_MAX_CONNECTION_DRAIN_MS = CONFIG.wsMaxConnectionDrainMs;
 /** How often to re-probe machines currently in bad standing, to detect that
  *  one has self-righted and restore it to routing. Short so a recovered
  *  machine — especially the only one serving a model — rejoins within
@@ -662,6 +674,7 @@ async function main(): Promise<void> {
           keepaliveIntervalMs: WS_KEEPALIVE_INTERVAL_MS,
           keepaliveMaxMissed: WS_KEEPALIVE_MAX_MISSED,
           maxConnectionMs: WS_MAX_CONNECTION_MS,
+          maxConnectionDrainMs: WS_MAX_CONNECTION_DRAIN_MS,
           apns: apnsConfig,
           // C1: DID-bound registration. advisorDid unset → auth off.
           ...(ADVISOR_DID ? { advisorDid: ADVISOR_DID } : {}),
@@ -751,7 +764,7 @@ async function main(): Promise<void> {
   const boundAddr = http.address();
   const boundPort = boundAddr && typeof boundAddr === "object" ? boundAddr.port : PORT;
   console.error(
-    `advisor: http+ws on :${boundPort} (heartbeat-timeout=${HEARTBEAT_TIMEOUT_MS}ms, session-idle=${SESSION_IDLE_TIMEOUT_MS}ms, session-first-chunk=${SESSION_FIRST_CHUNK_TIMEOUT_MS}ms, session-resume-grace=${SESSION_RESUME_GRACE_MS}ms, rechallenge=${RECHALLENGE_INTERVAL_MS}ms, challenge-response-timeout=${CHALLENGE_RESPONSE_TIMEOUT_MS}ms, attestation-max-age=${ATTESTATION_MAX_AGE_MS}ms, ws-keepalive=${WS_KEEPALIVE_INTERVAL_MS}ms, ws-keepalive-max-missed=${WS_KEEPALIVE_MAX_MISSED}, ws-max-connection=${WS_MAX_CONNECTION_MS}ms, perMessageDeflate=off)`,
+    `advisor: http+ws on :${boundPort} (heartbeat-timeout=${HEARTBEAT_TIMEOUT_MS}ms, session-idle=${SESSION_IDLE_TIMEOUT_MS}ms, session-first-chunk=${SESSION_FIRST_CHUNK_TIMEOUT_MS}ms, session-resume-grace=${SESSION_RESUME_GRACE_MS}ms, rechallenge=${RECHALLENGE_INTERVAL_MS}ms, challenge-response-timeout=${CHALLENGE_RESPONSE_TIMEOUT_MS}ms, attestation-max-age=${ATTESTATION_MAX_AGE_MS}ms, ws-keepalive=${WS_KEEPALIVE_INTERVAL_MS}ms, ws-keepalive-max-missed=${WS_KEEPALIVE_MAX_MISSED}, ws-max-connection=${WS_MAX_CONNECTION_MS}ms, ws-max-connection-drain=${WS_MAX_CONNECTION_DRAIN_MS}ms, perMessageDeflate=off)`,
   );
   console.error(
     "advisor: WS connection-stability config tuned for Railway's edge (frequent keepalive under the idle cutoff, compression off, proactive recycle under the 15-min cap)",
