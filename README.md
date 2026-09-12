@@ -137,6 +137,14 @@ Either way the agent pairs to your identity, attests the machine, loads a
 local model, and starts publishing receipts as it earns. See
 [`docs/install-mac.md`](docs/install-mac.md) for the details.
 
+## Connecting your app ("Sign in with co/core")
+
+An application can connect its users' co/core accounts in one click — publish a
+`dev.cocore.app.registration` record on your app's account, serve a well-known
+file on your domain, and use the device-pairing XRPC. Users approve
+"Connect *Your App* to co/core" and come straight back. See
+[`docs/connect-with-cocore.md`](docs/connect-with-cocore.md).
+
 ## Choosing where (and how) a job runs
 
 The completions API and the in-app chat take optional routing controls beyond

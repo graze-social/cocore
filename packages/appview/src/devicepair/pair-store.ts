@@ -16,6 +16,8 @@
 
 import { randomBytes } from "node:crypto";
 
+import type { AppIdentity } from "./app-registration.ts";
+
 type PairStatus = "pending" | "approved" | "denied" | "expired" | "consumed";
 
 /** Session blob handed to a paired agent. The agent authenticates to its
@@ -41,6 +43,8 @@ export interface PairMeta {
   keyName?: string;
   /** Where to send the browser after approval. */
   returnUrl?: string;
+  /** The registered app behind the request, when `start` carried `appDid`. */
+  app?: AppIdentity;
 }
 
 export interface PairEntry {
@@ -60,6 +64,7 @@ export interface DescribeResult {
   appName?: string;
   keyName?: string;
   returnUrl?: string;
+  app?: AppIdentity;
   expiresInSecs: number;
 }
 
@@ -130,6 +135,7 @@ export class PairStore {
       ...(entry.meta.appName ? { appName: entry.meta.appName } : {}),
       ...(entry.meta.keyName ? { keyName: entry.meta.keyName } : {}),
       ...(entry.meta.returnUrl ? { returnUrl: entry.meta.returnUrl } : {}),
+      ...(entry.meta.app ? { app: entry.meta.app } : {}),
       expiresInSecs: remaining,
     };
   }

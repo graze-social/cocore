@@ -23,11 +23,23 @@ interface Props {
 }
 
 /** What `dev.cocore.devicePair.describe` says about the code: who is asking. */
+interface DescribedApp {
+  did: string;
+  handle?: string;
+  name: string;
+  website?: string;
+  iconUrl?: string;
+  verified: boolean;
+  verifiedHost?: string;
+}
+
 interface Described {
   status: "pending" | "approved" | "denied" | "expired" | "consumed";
   appName?: string;
   keyName?: string;
   returnUrl?: string;
+  /** Present when the requester is a registered application (`appDid`). */
+  app?: DescribedApp;
   expiresInSecs: number;
 }
 
@@ -83,6 +95,7 @@ export function PairConfirm({ initialCode }: Props) {
   }, [status, returnUrl]);
 
   const appName = described?.appName;
+  const app = described?.app;
 
   async function approve() {
     setStatus("approving");
@@ -162,6 +175,34 @@ export function PairConfirm({ initialCode }: Props) {
       {appName ? (
         <>
           <Heading1>Connect {appName} to co/core</Heading1>
+          {app ? (
+            <Body>
+              {app.verified ? (
+                <>
+                  Verified application: {app.handle ? `@${app.handle}` : app.did}
+                  {app.verifiedHost ? ` · ${app.verifiedHost}` : ""}
+                  {app.website ? (
+                    <>
+                      {" "}
+                      · <a href={app.website}>{new URL(app.website).host}</a>
+                    </>
+                  ) : null}
+                </>
+              ) : (
+                <>
+                  <strong>Unverified application</strong> ({app.handle ? `@${app.handle}` : app.did}
+                  ). co/core could not confirm this app controls a website, so it will not be sent
+                  your browser afterwards. Only continue if you started this from {appName}{" "}
+                  yourself.
+                </>
+              )}
+            </Body>
+          ) : (
+            <Body>
+              <strong>Unregistered request.</strong> This name was typed by whoever started the
+              pairing and has not been checked. Only continue if you started this yourself.
+            </Body>
+          )}
           <Body>
             <strong>{appName}</strong> is asking for an API key on your co/core account
             {described?.keyName ? (

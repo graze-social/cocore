@@ -193,6 +193,9 @@ step, while leaving a `revokedAt` audit marker behind.
 
 ## Connecting an application on a user's behalf
 
+> Full guide, including how to register your app so the approve screen shows a
+> verified identity: [`docs/connect-with-cocore.md`](connect-with-cocore.md).
+
 An application that wants to run inference for its users (Graze's Feed Pulse
 is the first) should not ask them to copy keys around, and cannot mint keys
 through their PDS unless its own OAuth client requested the `rpc` scope above.

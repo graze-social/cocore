@@ -7,27 +7,99 @@
       "description": "Describe a pending pairing attempt by its `userCode`, so the approve screen can say who is asking and for what. Public: it only echoes what the requester supplied at `start` (application name, key name, return URL) plus the attempt's status and remaining lifetime. It never returns the `deviceId` or a session.",
       "parameters": {
         "type": "params",
-        "required": ["userCode"],
-        "properties": { "userCode": { "type": "string", "description": "The code the requester displayed (case-insensitive)." } }
+        "required": [
+          "userCode"
+        ],
+        "properties": {
+          "userCode": {
+            "type": "string",
+            "description": "The code the requester displayed (case-insensitive)."
+          }
+        }
       },
       "output": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["status", "expiresInSecs"],
+          "required": [
+            "status",
+            "expiresInSecs"
+          ],
           "properties": {
-            "status": { "type": "string", "enum": ["pending", "approved", "denied", "expired", "consumed"] },
-            "appName": { "type": "string" },
-            "keyName": { "type": "string" },
-            "returnUrl": { "type": "string", "format": "uri" },
-            "expiresInSecs": { "type": "integer" }
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "approved",
+                "denied",
+                "expired",
+                "consumed"
+              ]
+            },
+            "appName": {
+              "type": "string"
+            },
+            "keyName": {
+              "type": "string"
+            },
+            "returnUrl": {
+              "type": "string",
+              "format": "uri"
+            },
+            "expiresInSecs": {
+              "type": "integer"
+            },
+            "app": {
+              "type": "object",
+              "required": [
+                "did",
+                "name",
+                "verified"
+              ],
+              "description": "The registered application behind this code, when `start` carried `appDid`. `verified` means the return host proved it belongs to the app's DID; an unverified app still gets a key if the user approves, but the browser is never sent to it.",
+              "properties": {
+                "did": {
+                  "type": "string",
+                  "format": "did"
+                },
+                "handle": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "website": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "iconUrl": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "verified": {
+                  "type": "boolean"
+                },
+                "verifiedHost": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
       "errors": [
-        { "name": "InvalidRequest", "description": "The `userCode` parameter is missing." },
-        { "name": "NotFound", "description": "No pairing attempt matches the `userCode`." },
-        { "name": "RateLimited", "description": "Too many describe calls from this client; retry later." }
+        {
+          "name": "InvalidRequest",
+          "description": "The `userCode` parameter is missing."
+        },
+        {
+          "name": "NotFound",
+          "description": "No pairing attempt matches the `userCode`."
+        },
+        {
+          "name": "RateLimited",
+          "description": "Too many describe calls from this client; retry later."
+        }
       ]
     }
   }

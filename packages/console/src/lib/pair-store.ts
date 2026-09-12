@@ -40,10 +40,24 @@ export interface ProviderSession {
 /** What the requester told us about itself at `start`. All optional; a bare
  *  `cocore agent pair` sends none of it. Validated by the route layer before it
  *  reaches the store. */
+/** The registered application behind a pairing (see the AppView's
+ *  app-registration.ts). Mirrored here for the legacy in-process store. */
+interface AppIdentity {
+  did: string;
+  handle?: string;
+  name: string;
+  website?: string;
+  iconUrl?: string;
+  verified: boolean;
+  verifiedHost?: string;
+}
+
 export interface PairMeta {
   appName?: string;
   keyName?: string;
   returnUrl?: string;
+  /** The registered app behind the request, when `start` carried `appDid`. */
+  app?: AppIdentity;
 }
 
 export interface PairEntry {
@@ -61,6 +75,7 @@ export interface DescribeResult {
   appName?: string;
   keyName?: string;
   returnUrl?: string;
+  app?: AppIdentity;
   expiresInSecs: number;
 }
 
@@ -134,6 +149,7 @@ export class PairStore {
       ...(entry.meta.appName ? { appName: entry.meta.appName } : {}),
       ...(entry.meta.keyName ? { keyName: entry.meta.keyName } : {}),
       ...(entry.meta.returnUrl ? { returnUrl: entry.meta.returnUrl } : {}),
+      ...(entry.meta.app ? { app: entry.meta.app } : {}),
       expiresInSecs: remaining,
     };
   }
