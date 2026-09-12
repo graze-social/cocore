@@ -290,7 +290,13 @@ interface DropHarness {
   sessions: SessionManager;
 }
 
-async function startDropHarness(opts: { maxConnectionMs?: number } = {}): Promise<DropHarness> {
+async function startDropHarness(
+  opts: {
+    maxConnectionMs?: number;
+    maxConnectionDrainMs?: number;
+    recycleDrainPollMs?: number;
+  } = {},
+): Promise<DropHarness> {
   const registry = new ProviderRegistry();
   const sessions = new SessionManager({ idleTimeoutMs: 10_000 });
   const server = createServer();
@@ -573,8 +579,10 @@ describe("provider mid-job socket drop", () => {
     }
   }, 5_000);
 
-  it("fails legacy sessions but preserves resumable sessions on advisor recycle", async () => {
-    const h = await startDropHarness({ maxConnectionMs: 150 });
+  it("fails legacy sessions but preserves resumable sessions when a recycle is forced", async () => {
+    // drain 0 = the old close-on-the-dot behavior, which is also what a
+    // machine that stays busy right through the drain window ends up with.
+    const h = await startDropHarness({ maxConnectionMs: 150, maxConnectionDrainMs: 0 });
     try {
       const ws = await registerProvider(h.url, "did:plc:recycle", true);
       const legacyRes = fakeSseRes();
@@ -604,6 +612,118 @@ describe("provider mid-job socket drop", () => {
       expect(resumableRes.writableEnded).toBe(false);
       expect(failSpy).not.toHaveBeenCalled();
       h.sessions.close("sess-resume");
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("holds the recycle open while a job is in flight, then recycles once idle", async () => {
+    // The recycle is advisor housekeeping on a timer. Firing it into a live
+    // job kills that job outright on a provider without stream-resume — the
+    // caller sees `provider-disconnected` for something the advisor did. So
+    // the recycle goes looking for an idle moment ahead of the hard deadline,
+    // and takes the first one.
+    const h = await startDropHarness({
+      maxConnectionMs: 5_000,
+      maxConnectionDrainMs: 4_900, // start hunting for an idle moment at ~100ms
+      recycleDrainPollMs: 20,
+    });
+    try {
+      const ws = await registerProvider(h.url, "did:plc:drain");
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-drain", "did:plc:drain", "a", "did:plc:req", res as any);
+
+      let closed = false;
+      const reason = new Promise<string>((resolve) => {
+        ws.once("close", (_c, r) => {
+          closed = true;
+          resolve(r.toString("utf-8"));
+        });
+      });
+
+      // Long past the drain deadline the socket is still up and the job is
+      // still alive: the in-flight session is holding the recycle off.
+      await new Promise((r) => setTimeout(r, 400));
+      expect(closed).toBe(false);
+      expect(h.sessions.has("sess-drain")).toBe(true);
+      expect(res.writableEnded).toBe(false);
+
+      // Job finishes → the next poll finds the machine idle and recycles
+      // immediately, rather than idling on until the hard deadline (~4.6s
+      // away — the bound that makes this assertion discriminating).
+      const completedAt = Date.now();
+      h.sessions.complete("sess-drain", { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+      expect(await reason).toBe("recycle");
+      expect(Date.now() - completedAt).toBeLessThan(500);
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 10_000);
+
+  it("counts a completion that produced no tokens against the machine", async () => {
+    // The silent stall: the provider takes the job, sends no chunk, and
+    // completes with zero output tokens. That is a wedged engine wearing a
+    // success frame — it must not clear the machine's standing, and it must
+    // not read as a served job.
+    const h = await startDropHarness();
+    try {
+      const ws = await registerProvider(h.url, "did:plc:silent");
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-empty", "did:plc:silent", "a", "did:plc:req", res as any);
+      const failSpy = vi.spyOn(h.registry, "recordFailure");
+      const okSpy = vi.spyOn(h.registry, "recordCompletion");
+
+      ws.send(
+        JSON.stringify({
+          type: "inference_complete",
+          session_id: "sess-empty",
+          tokens_in: 591,
+          tokens_out: 0,
+          receipt_uri: "at://receipt/empty",
+        }),
+      );
+
+      await vi.waitFor(() =>
+        expect(failSpy).toHaveBeenCalledWith("did:plc:silent", "a", "empty-completion"),
+      );
+      expect(okSpy).not.toHaveBeenCalled();
+      ws.close();
+    } finally {
+      await new Promise<void>((r) => h.server.close(() => r()));
+    }
+  }, 5_000);
+
+  it("still counts a completion that streamed tokens as a success", async () => {
+    const h = await startDropHarness();
+    try {
+      const ws = await registerProvider(h.url, "did:plc:served");
+      const res = fakeSseRes();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      h.sessions.open("sess-served", "did:plc:served", "a", "did:plc:req", res as any);
+      h.sessions.acceptChunk("sess-served", 0, {
+        type: "chunk",
+        sessionId: "sess-served",
+        seq: 0,
+        ciphertext: [1],
+      });
+      const failSpy = vi.spyOn(h.registry, "recordFailure");
+      const okSpy = vi.spyOn(h.registry, "recordCompletion");
+
+      ws.send(
+        JSON.stringify({
+          type: "inference_complete",
+          session_id: "sess-served",
+          tokens_in: 591,
+          tokens_out: 12,
+          receipt_uri: "at://receipt/good",
+        }),
+      );
+
+      await vi.waitFor(() => expect(okSpy).toHaveBeenCalledWith("did:plc:served", "a"));
+      expect(failSpy).not.toHaveBeenCalled();
+      ws.close();
     } finally {
       await new Promise<void>((r) => h.server.close(() => r()));
     }

@@ -225,6 +225,10 @@ export type DispatchErrorCode =
   | "advisor-rejected"
   | "advisor-transport"
   | "no-capacity"
+  /** The provider completed the job without producing a single token. A
+   *  success frame over a wedged engine — surfaced as an error so callers
+   *  don't have to detect an empty 200 themselves. */
+  | "empty-completion"
   | "unknown";
 
 /** Who ran a job, resolved from the provider's AppView footprint, so a

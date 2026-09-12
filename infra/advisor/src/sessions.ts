@@ -424,13 +424,30 @@ export class SessionManager {
     sessionId: string,
     summary: { tokensIn: number; tokensOut: number; receiptUri: string },
     finalSeq?: number,
-  ): { accepted: boolean; nextSeq: number; resumeToken: string | null } | null {
+  ): {
+    accepted: boolean;
+    nextSeq: number;
+    resumeToken: string | null;
+    /** Did this session ever relay a real chunk to the requester? A
+     *  completion with `streamed: false` means the provider took the job and
+     *  finished it without producing a single token — the "silent stall" that
+     *  otherwise reaches the caller as a perfectly-shaped 200 with an empty
+     *  message. Legacy sessions don't advance `nextSeq`, so this (not the
+     *  sequence number) is the reliable signal. */
+    streamed: boolean;
+  } | null {
     const entry = this.bySessionId.get(sessionId);
     if (!entry) return null;
+    const streamed = entry.lastChunkAt !== null;
     // Resume-capable completion is valid only after every produced chunk was
     // accepted. Legacy frames omit finalSeq and retain their old behavior.
     if (entry.resumeToken && finalSeq !== entry.nextSeq) {
-      return { accepted: false, nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+      return {
+        accepted: false,
+        nextSeq: entry.nextSeq,
+        resumeToken: entry.resumeToken,
+        streamed,
+      };
     }
     this.write(sessionId, {
       type: "complete",
@@ -471,7 +488,7 @@ export class SessionManager {
         timer,
       });
     }
-    return { accepted: true, nextSeq: entry.nextSeq, resumeToken: entry.resumeToken };
+    return { accepted: true, nextSeq: entry.nextSeq, resumeToken: entry.resumeToken, streamed };
   }
 
   /** A provider "still working" signal during a long generation (slow

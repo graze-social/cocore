@@ -664,6 +664,13 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
       return { status: 502, type: "server_error", code: "chunk_decrypt_failed" };
     case "advisor-rejected":
       return { status: 502, type: "server_error", code: "advisor_rejected" };
+    case "empty-completion":
+      // The provider reported success but produced nothing. 502 rather than a
+      // 200 with an empty message: it's a failed job, and every client would
+      // otherwise have to detect the empty-string case itself. Retryable — the
+      // advisor has already counted it against that machine, so a retry tends
+      // to land somewhere else.
+      return { status: 502, type: "server_error", code: "empty_completion" };
     case "advisor-transport":
       return { status: 502, type: "server_error", code: "advisor_transport" };
     case "no-capacity":
@@ -686,6 +693,9 @@ export function streamingResponse(
     async start(controller) {
       const send = (s: string) => controller.enqueue(encoder.encode(`data: ${s}\n\n`));
       let emittedToolCalls = false;
+      // Did the provider ever give us anything at all? Used to catch the
+      // silent stall — a `complete` on a stream that emitted nothing.
+      let emittedAnything = false;
       // OpenAI clients expect a leading role-only delta.
       send(chunkPayload(id, model, { role: "assistant" }, null));
 
@@ -698,6 +708,7 @@ export function streamingResponse(
               try {
                 const toolCalls = JSON.parse(ev.text);
                 emittedToolCalls = true;
+                emittedAnything = true;
                 send(chunkPayload(id, model, { tool_calls: toolCalls }, null));
               } catch {
                 // Malformed tool_call JSON — skip rather than crash the stream.
@@ -707,9 +718,30 @@ export function streamingResponse(
               // vLLM/DeepSeek convention; the answer rides delta.content.
               const delta =
                 ev.channel === "reasoning" ? { reasoning_content: ev.text } : { content: ev.text };
+              if (ev.text) emittedAnything = true;
               send(chunkPayload(id, model, delta, null));
             }
           } else if (ev.kind === "complete") {
+            // The silent stall, streaming edition: the provider finished the
+            // job having emitted nothing and metered zero output tokens.
+            // Terminate with the same mid-stream error frame a dispatch
+            // failure uses, rather than a `stop` that tells the client the
+            // empty response was the answer.
+            if (!emittedAnything && ev.tokensOut === 0) {
+              const mapped = dispatchErrorToHttpResponse("empty-completion");
+              send(
+                JSON.stringify({
+                  error: {
+                    message:
+                      "The provider completed the job without producing any output. Please retry.",
+                    type: mapped.type,
+                    code: mapped.code,
+                    param: null,
+                  },
+                }),
+              );
+              return;
+            }
             // The final chunk carries the x_cocore credit so a streaming
             // client gets the same "who ran it" metadata the buffered path
             // returns. If the stream emitted tool_call deltas, use the OpenAI
@@ -824,6 +856,23 @@ export async function bufferedResponse(
     return jsonError(
       mapped.status,
       "Inference stream ended before completion.",
+      mapped.type,
+      mapped.code,
+    );
+  }
+
+  // The silent stall: the provider completed the job having emitted nothing at
+  // all — no content, no reasoning, no tool call, zero output tokens. Shaped
+  // like a success, useless as one. Answer with an error so callers get a
+  // retryable signal instead of an empty string they have to recognize
+  // themselves. Deliberately conjunctive: a model that legitimately answers
+  // with only reasoning, or only a tool call, or an empty string after really
+  // spending tokens, is NOT this case.
+  if (!content && !reasoning && toolCallChunks.length === 0 && tokensOut === 0) {
+    const mapped = dispatchErrorToHttpResponse("empty-completion");
+    return jsonError(
+      mapped.status,
+      "The provider completed the job without producing any output. Please retry.",
       mapped.type,
       mapped.code,
     );
