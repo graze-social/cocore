@@ -10,6 +10,11 @@
         "schema": {
           "type": "object",
           "properties": {
+            "appDid": {
+              "type": "string",
+              "format": "did",
+              "description": "The requesting application's DID. When present the AppView reads the app's `dev.cocore.app.registration` record: the approve screen shows that record's `name` (the `appName` field is ignored) and `returnUrl` is honoured only if it matches one of the record's `returnUrls` AND the return host proves ownership via `/.well-known/cocore-app.json`. A DID with no registration record is rejected with InvalidRequest (AppNotRegistered)."
+            },
             "appName": {
               "type": "string",
               "maxLength": 40,
@@ -67,6 +72,10 @@
         {
           "name": "RateLimited",
           "description": "Too many pairing attempts from this client; retry later."
+        },
+        {
+          "name": "InvalidRequest",
+          "description": "`appDid` is not a DID, or has no `dev.cocore.app.registration` record (message begins `AppNotRegistered`)."
         }
       ]
     }

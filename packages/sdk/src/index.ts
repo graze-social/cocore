@@ -1,4 +1,5 @@
 export * from "./canonical.ts";
+export * from "./connect.ts";
 export * from "./firehose.ts";
 export * from "./mda.ts";
 export * from "./appattest.ts";

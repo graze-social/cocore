@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "dev.cocore.app.registration",
+  "description": "How an application announces itself to co/core so it can connect users' accounts with one click (\"Sign in with co/core\"). Published by the application on ITS OWN account (a did:plc or did:web with a repo), one record per DID at rkey `self` — there is no central app registry. When the app calls `dev.cocore.devicePair.start` with `appDid`, the AppView reads this record from the app's PDS: `name` is what the approve screen shows, and `returnUrls` are the only places the approve screen may send the browser afterwards. A return URL is additionally honoured only when its host proves it belongs to this DID by serving `https://<host>/.well-known/cocore-app.json` containing `{\"did\": \"<this DID>\"}` — so a record on a stranger's account cannot borrow a real app's domain.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["name", "returnUrls", "createdAt"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 40, "description": "Human name of the application, shown on the approve screen." },
+          "description": { "type": "string", "maxLength": 300, "description": "One sentence on what the app does with the connection. Plain text." },
+          "website": { "type": "string", "format": "uri", "maxLength": 2048, "description": "The app's home page, linked from the approve screen." },
+          "iconUrl": { "type": "string", "format": "uri", "maxLength": 2048, "description": "Square icon, https. Optional." },
+          "returnUrls": {
+            "type": "array",
+            "maxLength": 10,
+            "items": { "type": "string", "format": "uri", "maxLength": 2048 },
+            "description": "Where the approve screen may send the browser after approval. https only. A requested return URL must match one of these on origin and path (its query string may differ)."
+          },
+          "createdAt": { "type": "string", "format": "datetime" },
+          "updatedAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    }
+  }
+}
