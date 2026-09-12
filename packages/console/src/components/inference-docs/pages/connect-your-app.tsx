@@ -12,7 +12,7 @@ import {
 
 /**
  * "Sign in with co/core" — the device-pairing flow an application uses to let
- * its own users connect their co/core account in one click. Every request the
+ * its own users connect their atmosphere account in one click. Every request the
  * app then makes runs on the user's credits and leaves a signed receipt; the
  * app never sees the user's password and never holds their session.
  */
@@ -27,10 +27,10 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
     <InferenceDocsPage
       kicker="Build with co/core"
       title="Sign in with co/core"
-      description="Let your users connect their own co/core account to your app in one click. Jobs run on their credits, with a signed receipt for every one."
+      description="Let your users connect their own atmosphere account to your app in one click. Jobs run on their credits, with a signed receipt for every one."
     >
       <p {...stylex.props(docsStyles.prose)}>
-        Some apps want inference on <em>their user&apos;s</em> co/core account, not their own — a
+        Some apps want inference on <em>their user&apos;s</em> atmosphere account, not their own — a
         feed reader that summarizes each user&apos;s feed, an assistant that bills each user&apos;s
         balance. co/core&apos;s device pairing is the primitive for that: your app starts a pairing,
         sends the user to co/core to approve it, and receives a scoped API key bound to the
@@ -152,7 +152,7 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
   "name": "Your App",
   "website": "https://yourapp.example",
   "iconUrl": "https://yourapp.example/icon.svg",
-  "description": "What your app does with the user's co/core account.",
+  "description": "What your app does with the user's atmosphere account.",
   "returnUrls": ["https://yourapp.example/connected"]
 }
 
@@ -177,9 +177,9 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
           approves, start a new one.
         </li>
         <li {...stylex.props(inferenceDocsSharedStyles.bullet)}>
-          The key stops working if the user revokes it in their co/core account or their underlying
-          session lapses — handle a <code {...stylex.props(docsStyles.codeInline)}>401</code> by
-          asking them to reconnect.
+          The key stops working if the user revokes it in their atmosphere account or their
+          underlying session lapses — handle a{" "}
+          <code {...stylex.props(docsStyles.codeInline)}>401</code> by asking them to reconnect.
         </li>
       </ol>
     </InferenceDocsPage>
