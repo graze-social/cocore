@@ -17,9 +17,12 @@ import {
  * app never sees the user's password and never holds their session.
  */
 export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
-  // baseUrl is the inference origin (e.g. https://cocore.dev/v1); the pairing
-  // endpoints live one level up, under /api/xrpc on the same host.
-  const apiOrigin = baseUrl.replace(/\/v1\/?$/, "");
+  // baseUrl is the inference base (e.g. https://cocore.dev/api/v1). The pairing
+  // endpoints are siblings under /api/xrpc, and the approval screen is at the
+  // site root (/devices/new) — so strip the /api/v1 (or bare /v1) suffix to the
+  // site origin and rebuild both from there.
+  const origin = baseUrl.replace(/\/api\/v1\/?$/, "").replace(/\/v1\/?$/, "");
+  const pairBase = `${origin}/api/xrpc`;
   return (
     <InferenceDocsPage
       kicker="Build with co/core"
@@ -35,10 +38,8 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
       </p>
       <p {...stylex.props(docsStyles.prose)}>
         The whole flow is four HTTP calls against{" "}
-        <code {...stylex.props(docsStyles.codeInline)}>
-          {apiOrigin}/api/xrpc/dev.cocore.devicePair.*
-        </code>
-        . No SDK required.
+        <code {...stylex.props(docsStyles.codeInline)}>{pairBase}/dev.cocore.devicePair.*</code>. No
+        SDK required.
       </p>
 
       <h2 {...stylex.props(docsStyles.h2, docsStyles.h2First)}>1. Start a pairing</h2>
@@ -53,7 +54,7 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
       </p>
       <HighlightedBlock
         lang="bash"
-        code={`curl -X POST ${apiOrigin}/api/xrpc/dev.cocore.devicePair.start \\
+        code={`curl -X POST ${pairBase}/dev.cocore.devicePair.start \\
   -H 'content-type: application/json' \\
   -d '{
     "appName": "Your App",
@@ -65,7 +66,7 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
 # → {
 #   "deviceId": "…",            # secret; keep it on your server
 #   "userCode": "HB8G7HX7",     # show this to the user
-#   "verificationUri": "${apiOrigin}/devices/new?code=HB8G7HX7",
+#   "verificationUri": "${origin}/devices/new?code=HB8G7HX7",
 #   "pollIntervalSecs": 3,
 #   "expiresInSecs": 600
 # }`}
@@ -97,7 +98,7 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
       </p>
       <HighlightedBlock
         lang="bash"
-        code={`curl "${apiOrigin}/api/xrpc/dev.cocore.devicePair.poll?deviceId=DEVICE_ID"
+        code={`curl "${pairBase}/dev.cocore.devicePair.poll?deviceId=DEVICE_ID"
 
 # pending: { "status": "pending" }
 # denied:  { "status": "denied" }   (410 expired / consumed are terminal too)
@@ -114,7 +115,7 @@ export function ConnectYourAppPage({ baseUrl }: { baseUrl: string }) {
       <p {...stylex.props(docsStyles.prose)}>
         Store <code {...stylex.props(docsStyles.codeInline)}>apiKey</code> encrypted, keyed to the
         user. Then it is an ordinary co/core key: call{" "}
-        <code {...stylex.props(docsStyles.codeInline)}>{baseUrl}/v1/chat/completions</code> with it
+        <code {...stylex.props(docsStyles.codeInline)}>{baseUrl}/chat/completions</code> with it
         (see the <InferenceDocLink slug="quickstart">quickstart</InferenceDocLink>). Each response
         carries an <code {...stylex.props(docsStyles.codeInline)}>x_cocore</code> block with the
         provider and a receipt URI, and the job is billed to the user, not to you.
