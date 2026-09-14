@@ -36,6 +36,7 @@
 #   2  uv install failed
 #   3  pip install vllm-mlx failed
 #   4  venv verification failed (packages installed but don't import)
+#   5  another bootstrap held the venv lock for 45 minutes
 #
 # Readiness marker:
 #   This script writes `$COCORE_PYTHON_VENV/.cocore-venv-ready` as its
@@ -62,6 +63,54 @@ COCORE_UV="${COCORE_UV:-}"
 # mutating packages. See "Readiness marker" in the header.
 readonly READY_MARKER_NAME=".cocore-venv-ready"
 ready_marker() { printf '%s/%s' "$COCORE_PYTHON_VENV" "$READY_MARKER_NAME"; }
+
+# Venv recipe. BUMP THIS whenever the package set or a version floor in
+# install_packages changes. The number is written into the readiness marker
+# (`"recipe":N`), and the agent — which embeds this exact script — re-runs it
+# at startup when the marker on disk carries an older recipe (or none: venvs
+# provisioned before recipes existed). That is how a dependency fix reaches
+# machines that were provisioned long ago: the tray only runs this script when
+# the venv is *absent*, so without the recipe check a stale venv would keep its
+# packages forever (as every venv built 2026-07-03 → 09-14 did with the
+# mlx-vlm 0.6.4 Qwen3.5 corruption, see install_packages).
+#
+#   1 — (implicit) markers written before this constant existed
+#   2 — 2026-09-14: mlx-vlm>=0.6.5 / vllm-mlx>=0.4.1 floors, transformers!=5.13.*
+readonly VENV_RECIPE=2
+
+# Single-writer lock. Both the tray (Set up runtime) and the agent (stale-recipe
+# repair) run this script, and two concurrent `uv pip install`s into one venv
+# can corrupt it. The lock holds the writer's pid; a holder that is gone is a
+# stale lock and is taken over. Waiting is bounded so a wedged holder can't
+# block provisioning forever.
+readonly BOOTSTRAP_LOCK_NAME=".cocore-venv-bootstrap.lock"
+bootstrap_lock() { printf '%s/%s' "$COCORE_PYTHON_VENV" "$BOOTSTRAP_LOCK_NAME"; }
+acquire_bootstrap_lock() {
+  local lock waited=0 holder
+  lock="$(bootstrap_lock)"
+  mkdir -p "$COCORE_PYTHON_VENV"
+  while :; do
+    if ( set -o noclobber; printf '%s\n' "$$" > "$lock" ) 2>/dev/null; then
+      # shellcheck disable=SC2064
+      trap "rm -f '$lock'" EXIT
+      return 0
+    fi
+    holder="$(cat "$lock" 2>/dev/null || true)"
+    if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+      note "removing stale bootstrap lock (holder ${holder:-unknown} is gone)"
+      rm -f "$lock"
+      continue
+    fi
+    if (( waited == 0 )); then
+      note "another bootstrap (pid $holder) is provisioning this venv; waiting for it"
+    fi
+    if (( waited >= 2700 )); then
+      err "bootstrap lock held by pid $holder for 45 minutes; giving up"
+      exit 5
+    fi
+    sleep 5; waited=$((waited + 5))
+  done
+}
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -201,8 +250,8 @@ verify() {
     # Publishing the marker here — after the check, never before — is what
     # makes it trustworthy: its presence means a real import succeeded on
     # this interpreter, not merely that files were copied.
-    printf '{"schema":1,"completedAt":"%s","python":"%s"}\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$py" > "$(ready_marker)"
+    printf '{"schema":1,"recipe":%s,"completedAt":"%s","python":"%s"}\n' \
+      "$VENV_RECIPE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$py" > "$(ready_marker)"
     note "readiness marker: $(ready_marker)"
   else
     # Hard failure, not a warning: a venv that installed but doesn't import
@@ -226,6 +275,7 @@ main() {
     err "vllm-mlx is macOS / Apple Silicon only; refusing to bootstrap on $(uname -s)"
     exit 1
   fi
+  acquire_bootstrap_lock
   ensure_uv
   install_python
   create_venv
