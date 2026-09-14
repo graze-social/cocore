@@ -103,3 +103,41 @@ describe("createAppResolver", () => {
     expect(await resolver.resolve("not-a-did")).toBeNull();
   });
 });
+
+describe("createAppResolver caching", () => {
+  const pdsFor = async () => "https://pds.example";
+  const recordUrl = "https://pds.example/xrpc/com.atproto.repo.getRecord";
+
+  it("does not cache a timeout or network error as 'not registered'", async () => {
+    let calls = 0;
+    const f = fakeFetch({
+      [recordUrl]: () => {
+        calls += 1;
+        if (calls === 1) throw new Error("socket hang up");
+        return json({ value: RECORD });
+      },
+    });
+    let t = 1_000;
+    const resolver = createAppResolver({ fetch: f, resolvePds: pdsFor, now: () => t });
+    expect(await resolver.resolve(APP)).toBeNull();
+    t += 1; // well inside REGISTRATION_MISS_TTL_MS
+    expect((await resolver.resolve(APP))?.name).toBe("Graze");
+    expect(calls).toBe(2);
+  });
+
+  it("does cache a definitive RecordNotFound", async () => {
+    let calls = 0;
+    const f = fakeFetch({
+      [recordUrl]: () => {
+        calls += 1;
+        return json({ error: "RecordNotFound" }, 400);
+      },
+    });
+    let t = 1_000;
+    const resolver = createAppResolver({ fetch: f, resolvePds: pdsFor, now: () => t });
+    expect(await resolver.resolve(APP)).toBeNull();
+    t += 1;
+    expect(await resolver.resolve(APP)).toBeNull();
+    expect(calls).toBe(1);
+  });
+});
