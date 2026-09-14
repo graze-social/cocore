@@ -144,15 +144,44 @@ install_packages() {
   # uv pip install needs the venv activated; we pass --python pointing
   # at the venv's interpreter to make it scope to that venv.
   #
-  # transformers is CONSTRAINED, not floated: transformers 5.13.0 broke
-  # mlx-lm's tokenizer registration (`AutoTokenizer.register("NewlineTokenizer",
-  # ...)` with a string key → `AttributeError: 'str' object has no attribute
-  # '__module__'` at import), which kills every engine spawn on a fresh
-  # install. Because this script re-runs idempotently, the constraint also
-  # REPAIRS an already-broken venv by downgrading it. Lift the ceiling once
-  # mlx-lm registers its tokenizer with a real config class upstream.
+  # Dependency floors, and why each exists. These are the ONLY version
+  # constraints in this script; everything else floats to latest.
+  #
+  #   mlx-vlm>=0.6.5 — mlx-vlm 0.6.4's Qwen3.5 sanitize() adds +1.0 to every
+  #     RMSNorm weight unconditionally. That conversion is correct for raw
+  #     HF checkpoints but MLX-format checkpoints (all of mlx-community/*)
+  #     already store the shifted value, so every norm gets shifted TWICE
+  #     and the model emits deterministic garbage from the first token
+  #     (Blaizzy/mlx-vlm#1521, #1526; fixed by #1528 in 0.6.5). vllm-mlx
+  #     0.4.1 raised its own floor to 0.6.5 for exactly this reason.
+  #   vllm-mlx>=0.4.1 — the first release whose own metadata requires
+  #     mlx-vlm>=0.6.5. Stating the floor here too means a resolver can
+  #     never satisfy "vllm-mlx" with 0.4.0 + 0.6.4 again.
+  #   transformers!=5.13.* — transformers 5.13.0 broke mlx-lm's tokenizer
+  #     registration (`AutoTokenizer.register("NewlineTokenizer", ...)` with a
+  #     string key → `AttributeError: 'str' object has no attribute
+  #     '__module__'` at import), which killed every engine spawn. 5.14+ is
+  #     fine (verified: vllm-mlx 0.4.1 + mlx-vlm 0.7.0 + mlx-lm 0.31.3 +
+  #     transformers 5.17.0 import cleanly). This used to be a CEILING
+  #     (`transformers<5.13`) — and that ceiling was the root cause of the
+  #     garbage-output bug above: mlx-vlm>=0.6.5 requires transformers>=5.14,
+  #     so the ceiling forced uv back onto mlx-vlm 0.6.4 + vllm-mlx 0.4.0,
+  #     the exact pair upstream had already excluded as corrupt.
+  #
+  # Because this script re-runs idempotently, the floors also REPAIR an
+  # already-provisioned venv: `uv pip install` upgrades anything that no
+  # longer satisfies them and leaves everything else alone.
+  #
+  # When `COCORE_VLLM_MLX_VERSION` pins vllm-mlx explicitly, that pin wins
+  # over the vllm-mlx floor (the operator asked for it), but the mlx-vlm
+  # floor still applies.
+  local vllm_spec="$pkg"
+  if [[ -z "$COCORE_VLLM_MLX_VERSION" ]]; then
+    vllm_spec="vllm-mlx>=0.4.1"
+  fi
   if ! "$COCORE_UV" pip install --python "$COCORE_PYTHON_VENV/bin/python" \
-        "$pkg" mlx-lm uvicorn hf_transfer "transformers<5.13" >&2; then
+        "$vllm_spec" "mlx-vlm>=0.6.5" mlx-lm uvicorn hf_transfer \
+        "transformers!=5.13.*" >&2; then
     err "uv pip install $pkg failed"
     exit 3
   fi

@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import signal
 import stat
 import sys
@@ -100,6 +101,130 @@ import vllm_mlx.server as srv  # noqa: E402
 # server before request handling starts.
 import cocore_lfm_tool_parser as _lfm_tool_parser  # noqa: E402,F401
 _lfm_tool_parser.LFMToolParser.register_streaming_markers(srv)
+
+
+# ---------------------------------------------------------------------------
+# Known-corrupt dependency stacks.
+#
+# A venv can import perfectly and still serve garbage. The instance that
+# taught us this: mlx-vlm 0.6.4's Qwen3.5 sanitize() adds +1.0 to every
+# RMSNorm weight unconditionally — right for a raw HF checkpoint, wrong for an
+# MLX-format one (all of mlx-community/*), whose norms already carry the
+# shift. Every norm ends up shifted twice and the model emits deterministic
+# garbage from the first token ("o</user。\nc\n\n<think>..."), which the
+# HTTP layer happily returns as a 200 with finish_reason "stop". Fixed by
+# Blaizzy/mlx-vlm#1528 in 0.6.5; vllm-mlx 0.4.1 raised its floor to match.
+#
+# scripts/bootstrap-python-venv.sh now floors mlx-vlm at 0.6.5, but a venv
+# provisioned before that floor existed keeps the corrupt pair until the
+# installer is re-run. This guard is the backstop: refuse to load a model we
+# KNOW will come out as garbage on the installed stack, and say why on stderr
+# (the Rust agent surfaces the ring buffer in its startup-failure message),
+# instead of serving nonsense under a valid receipt.
+# ---------------------------------------------------------------------------
+
+# Oldest mlx-vlm whose Qwen3.5 loader is correct for MLX-format checkpoints.
+QWEN35_MIN_MLX_VLM = (0, 6, 5)
+
+
+def _parse_version(text: str) -> tuple[int, ...]:
+    """Leading numeric components of a version string: "0.7.0rc0" -> (0, 7, 0).
+
+    Stops at the first component that doesn't start with digits, so
+    pre-release / local suffixes never raise. Good enough for a floor check;
+    we deliberately avoid depending on `packaging` here.
+    """
+    parts: list[int] = []
+    for piece in text.split("."):
+        m = re.match(r"\d+", piece)
+        if not m:
+            break
+        parts.append(int(m.group()))
+    return tuple(parts)
+
+
+def _installed_version(dist: str) -> "str | None":
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover - py<3.8 is not supported anyway
+        return None
+    try:
+        return version(dist)
+    except PackageNotFoundError:
+        return None
+
+
+def _model_type_of(config: dict) -> str:
+    """The HF `model_type`, looking inside `text_config` for multimodal configs
+    that only declare it there."""
+    mt = config.get("model_type")
+    if not mt:
+        mt = (config.get("text_config") or {}).get("model_type")
+    return str(mt or "")
+
+
+def _load_model_config(model: str) -> dict:
+    """Read the model's config.json — from a local directory, or via the HF
+    cache (downloading only that one small file if it isn't cached yet).
+
+    Runs under the same HF_* env the agent set for the real weight download,
+    so tokens / mirrors / offline mode all apply.
+    """
+    local = Path(model)
+    if local.is_dir():
+        with open(local / "config.json", encoding="utf-8") as fh:
+            return json.load(fh)
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(model, "config.json")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def qwen35_norm_shift_hazard(model_type: str, mlx_vlm_version: "str | None") -> "str | None":
+    """Operator-facing reason this (model family, mlx-vlm) pair is known to
+    produce garbage, or None when it is fine to load.
+
+    Pure function so it can be unit-tested without a venv or a model.
+    """
+    if not model_type.startswith("qwen3_5"):
+        return None
+    if mlx_vlm_version is None:
+        # Not installed at all — vllm-mlx will fail its own import loudly,
+        # which is a better error than anything we could invent here.
+        return None
+    if _parse_version(mlx_vlm_version) >= QWEN35_MIN_MLX_VLM:
+        return None
+    floor = ".".join(str(n) for n in QWEN35_MIN_MLX_VLM)
+    return (
+        f"mlx-vlm {mlx_vlm_version} double-shifts the RMSNorm weights of "
+        f"MLX-format {model_type} checkpoints and produces garbage output "
+        f"(Blaizzy/mlx-vlm#1528). Need mlx-vlm>={floor}. Re-run the runtime "
+        f"setup (scripts/bootstrap-python-venv.sh, or the tray's Set up runtime) "
+        f"to upgrade the venv."
+    )
+
+
+def _refuse_known_corrupt_stack(model: str) -> None:
+    """Exit (status 5) before loading when the installed stack is known to
+    render this model as garbage. Never blocks a load on our own probe
+    failing — an unreadable config just means we skip the check."""
+    try:
+        model_type = _model_type_of(_load_model_config(model))
+    except Exception as exc:  # noqa: BLE001 - a diagnostic, never a gate
+        print(
+            f"[cocore-engine] could not read config.json for {model!r} to check "
+            f"for known-bad dependency versions ({exc.__class__.__name__}); continuing",
+            flush=True,
+        )
+        return
+    reason = qwen35_norm_shift_hazard(model_type, _installed_version("mlx-vlm"))
+    if reason is None:
+        return
+    msg = f"[cocore-engine] REFUSING to load {model!r}: {reason}"
+    print(msg, flush=True)
+    print(msg, file=sys.stderr, flush=True)
+    raise SystemExit(5)
 
 
 def _unlink_if_owned(socket_path: Path, owned_ino: "int | None") -> None:
@@ -302,6 +427,9 @@ def main() -> None:
         f"{' (vision/mllm)' if args.vision else ''}...",
         flush=True,
     )
+    # Known-corrupt stack check runs BEFORE the multi-GB load so a stale venv
+    # fails in a second with a clear message rather than serving garbage.
+    _refuse_known_corrupt_stack(args.model)
     srv.load_model(args.model, force_mllm=args.vision)
 
     if args.default_chat_template_kwargs:
