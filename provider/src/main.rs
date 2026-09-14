@@ -3149,6 +3149,12 @@ fn build_engines(
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("stub"))
         .collect();
 
+    // Before the first engine spawn, bring a stale venv up to the embedded
+    // bootstrap recipe (once per process). See "Venv recipe repair" above.
+    if !configured.is_empty() {
+        repair_venv_once(&venv_python);
+    }
+
     // Per-model scheduling: narrow to the models whose time window is open
     // right now (a model with no per-model window stays on). Applied here —
     // the single point every build flows through (startup, whole-app window
@@ -3619,6 +3625,259 @@ fn is_python_env_broken(last_err: Option<&str>) -> bool {
     // exactly so it classifies even if a future wrapper reorders imports.
     let transformers_register_break = e.contains("'str' object has no attribute '__module__'");
     import_traceback || transformers_register_break
+}
+
+// ---------------------------------------------------------------------------
+// Venv recipe repair.
+//
+// The tray only runs `scripts/bootstrap-python-venv.sh` when the venv looks
+// ABSENT, so a venv provisioned long ago keeps whatever packages it got —
+// including a dependency set that imports cleanly and serves garbage (every
+// venv built 2026-07-03 → 09-14 carried mlx-vlm 0.6.4, which double-shifts
+// Qwen3.5 norm weights). The script now carries a `VENV_RECIPE` number and
+// writes it into the readiness marker; the agent embeds the same script and,
+// once per process before the first engine spawn, re-runs it when the marker
+// on disk is older (or missing: pre-recipe venvs). The script is idempotent,
+// takes its own lock (so a concurrent tray-driven run is waited for, not
+// raced), and only touches packages that no longer satisfy its floors.
+// ---------------------------------------------------------------------------
+
+/// The venv bootstrap script, embedded so the running agent can repair a stale
+/// venv without depending on where (or whether) the app bundle keeps a copy.
+const VENV_BOOTSTRAP_SCRIPT: &str = include_str!("../../scripts/bootstrap-python-venv.sh");
+
+/// Filename the script's single-writer lock uses inside the venv root.
+const VENV_BOOTSTRAP_LOCK: &str = ".cocore-venv-bootstrap.lock";
+
+/// Recipe number declared by a bootstrap script (`readonly VENV_RECIPE=N`).
+fn venv_recipe_in_script(script: &str) -> Option<u32> {
+    script.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("readonly VENV_RECIPE=")?;
+        rest.trim().parse::<u32>().ok()
+    })
+}
+
+/// The recipe the embedded script provisions. A script without the constant
+/// is recipe 1 (the pre-recipe world), so the check degrades to a no-op.
+fn embedded_venv_recipe() -> u32 {
+    venv_recipe_in_script(VENV_BOOTSTRAP_SCRIPT).unwrap_or(1)
+}
+
+/// Recipe recorded in the readiness marker JSON. `None` = no marker at all.
+/// A marker without a `recipe` field was written by a pre-recipe script → 1.
+fn venv_marker_recipe_from_json(marker: &str) -> u32 {
+    serde_json::from_str::<serde_json::Value>(marker)
+        .ok()
+        .and_then(|v| v.get("recipe").and_then(|r| r.as_u64()))
+        .map(|r| r as u32)
+        .unwrap_or(1)
+}
+
+fn venv_root_of(venv_python: &std::path::Path) -> Option<std::path::PathBuf> {
+    venv_python
+        .parent() // .../python/bin
+        .and_then(|p| p.parent()) // .../python
+        .map(|p| p.to_path_buf())
+}
+
+fn venv_marker_recipe(venv_python: &std::path::Path) -> Option<u32> {
+    let root = venv_root_of(venv_python)?;
+    std::fs::read_to_string(root.join(VENV_READY_MARKER))
+        .ok()
+        .map(|m| venv_marker_recipe_from_json(&m))
+}
+
+/// Whether another bootstrap currently holds the venv lock (live pid inside).
+fn venv_bootstrap_in_progress(venv_python: &std::path::Path) -> bool {
+    let Some(root) = venv_root_of(venv_python) else {
+        return false;
+    };
+    let Ok(pid) = std::fs::read_to_string(root.join(VENV_BOOTSTRAP_LOCK)) else {
+        return false;
+    };
+    let Ok(pid) = pid.trim().parse::<i32>() else {
+        return false;
+    };
+    // kill(pid, 0) == 0 → alive. EPERM also means "exists".
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Pure decision: repair when the venv exists, nobody else is provisioning it,
+/// and its marker recipe (1 when the marker is missing or pre-recipe) is
+/// older than the embedded script's.
+fn venv_needs_repair(
+    python_exists: bool,
+    marker_recipe: Option<u32>,
+    embedded_recipe: u32,
+    installer_running: bool,
+) -> bool {
+    python_exists && !installer_running && marker_recipe.unwrap_or(1) < embedded_recipe
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VenvRepair {
+    NotNeeded,
+    Skipped(String),
+    Repaired,
+    Failed(String),
+}
+
+/// Re-run the embedded bootstrap against the venv when its recipe is stale.
+/// Blocks for the duration of the install (minutes on a cold cache, seconds
+/// when everything already satisfies the floors). Never fatal: a failure is
+/// logged and the caller proceeds — the engine wrapper independently refuses
+/// to load models the stale stack is known to corrupt.
+fn repair_venv_if_stale(venv_python: &std::path::Path) -> VenvRepair {
+    let want = embedded_venv_recipe();
+    let have = venv_marker_recipe(venv_python);
+    let running = venv_bootstrap_in_progress(venv_python);
+    if !venv_needs_repair(venv_python.exists(), have, want, running) {
+        if running {
+            return VenvRepair::Skipped("another bootstrap holds the venv lock".to_string());
+        }
+        return VenvRepair::NotNeeded;
+    }
+    let Some(root) = venv_root_of(venv_python) else {
+        return VenvRepair::Skipped("venv path has no root".to_string());
+    };
+    let Some(state_dir) = root.parent() else {
+        return VenvRepair::Skipped("venv root has no parent".to_string());
+    };
+    let script = state_dir.join("bootstrap-python-venv.sh");
+    if let Err(e) = std::fs::write(&script, VENV_BOOTSTRAP_SCRIPT) {
+        return VenvRepair::Failed(format!("writing {}: {e}", script.display()));
+    }
+    tracing::warn!(
+        have = have.unwrap_or(1),
+        want,
+        venv = %root.display(),
+        "python environment recipe is stale; re-running the venv bootstrap to repair it \
+         (engine start waits for this — minutes on a cold cache)"
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg(&script)
+        .env("COCORE_PYTHON_VENV", &root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // uv lives in ~/.local/bin on a script-provisioned machine; the agent's
+    // launchd environment doesn't carry the user's PATH.
+    if let Some(home) = dirs::home_dir() {
+        let extra = format!("{}/.local/bin", home.display());
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env(
+            "PATH",
+            format!("{extra}:{path}:/usr/local/bin:/opt/homebrew/bin"),
+        );
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return VenvRepair::Failed(format!("spawning bootstrap: {e}")),
+    };
+    // Stream the script's phase lines (content-safe: package names, versions,
+    // progress) into the agent log so an operator can see what is happening.
+    let tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let mut drains = vec![];
+    for (name, reader) in [
+        (
+            "stdout",
+            child
+                .stdout
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+        ),
+        (
+            "stderr",
+            child
+                .stderr
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+        ),
+    ] {
+        let Some(reader) = reader else { continue };
+        let tail = tail.clone();
+        drains.push(std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(reader)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let clean: String = line
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\t')
+                    .collect();
+                let clean = clean
+                    .replace("[1m", "")
+                    .replace("[0m", "")
+                    .replace("[33m", "")
+                    .replace("[31m", "");
+                let clean = clean.trim().to_string();
+                if clean.is_empty() {
+                    continue;
+                }
+                tracing::info!(stream = name, "venv bootstrap: {clean}");
+                let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+                if t.len() >= 20 {
+                    t.pop_front();
+                }
+                t.push_back(clean);
+            }
+        }));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60 * 60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                break Err("venv bootstrap ran for over an hour; killed".to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(e) => break Err(format!("waiting for bootstrap: {e}")),
+        }
+    };
+    for d in drains {
+        let _ = d.join();
+    }
+    match status {
+        Ok(st) if st.success() => {
+            tracing::info!(
+                recipe = want,
+                marker = ?venv_marker_recipe(venv_python),
+                "venv bootstrap finished; python environment repaired"
+            );
+            VenvRepair::Repaired
+        }
+        Ok(st) => {
+            let t = tail.lock().unwrap_or_else(|p| p.into_inner());
+            VenvRepair::Failed(format!(
+                "bootstrap exited with {st}; last output:\n{}",
+                t.iter().cloned().collect::<Vec<_>>().join("\n")
+            ))
+        }
+        Err(e) => VenvRepair::Failed(e),
+    }
+}
+
+/// Run [`repair_venv_if_stale`] at most once per agent process. `build_engines`
+/// is re-entered on every model-list change and health rebuild; the repair
+/// belongs to startup, not to every rebuild.
+fn repair_venv_once(venv_python: &std::path::Path) {
+    static ATTEMPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ATTEMPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    match repair_venv_if_stale(venv_python) {
+        VenvRepair::NotNeeded | VenvRepair::Repaired => {}
+        VenvRepair::Skipped(why) => tracing::info!(why, "skipped venv recipe repair"),
+        VenvRepair::Failed(detail) => tracing::warn!(
+            detail = %detail,
+            "venv recipe repair failed; continuing with the existing environment \
+             (models the stale stack is known to corrupt will refuse to load)"
+        ),
+    }
 }
 
 /// Filename of the readiness marker `scripts/bootstrap-python-venv.sh`
@@ -4237,6 +4496,11 @@ mod desired_tier_cache_tests {
 #[cfg(test)]
 mod vision_fault_tests {
     use super::is_vision_config_failure;
+    use crate::{
+        embedded_venv_recipe, repair_venv_if_stale, venv_bootstrap_in_progress, venv_marker_recipe,
+        venv_marker_recipe_from_json, venv_needs_repair, venv_recipe_in_script, VenvRepair,
+        VENV_BOOTSTRAP_LOCK, VENV_BOOTSTRAP_SCRIPT,
+    };
 
     #[test]
     fn detects_mlx_vlm_visionconfig_failure() {
@@ -4426,6 +4690,89 @@ mod vision_fault_tests {
                 "mlx_lm".to_string()
             ])
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedded_script_declares_the_recipe_and_the_lock_name() {
+        // The agent's repair logic is only as good as its coupling to the
+        // script it embeds: the recipe constant must parse, and the lock file
+        // the script takes must be the one the agent looks for.
+        assert!(
+            embedded_venv_recipe() >= 2,
+            "got {}",
+            embedded_venv_recipe()
+        );
+        assert!(VENV_BOOTSTRAP_SCRIPT
+            .contains(&format!("BOOTSTRAP_LOCK_NAME=\"{VENV_BOOTSTRAP_LOCK}\"")));
+        assert!(VENV_BOOTSTRAP_SCRIPT.contains("\"recipe\":%s"));
+    }
+
+    #[test]
+    fn recipe_parsing_from_script_and_marker() {
+        assert_eq!(
+            venv_recipe_in_script("x\nreadonly VENV_RECIPE=7\n"),
+            Some(7)
+        );
+        assert_eq!(venv_recipe_in_script("no constant here"), None);
+        assert_eq!(venv_marker_recipe_from_json("{\"schema\":1}"), 1);
+        assert_eq!(
+            venv_marker_recipe_from_json("{\"schema\":1,\"recipe\":2}"),
+            2
+        );
+        assert_eq!(venv_marker_recipe_from_json("not json"), 1);
+    }
+
+    #[test]
+    fn repair_decision() {
+        // stale marker → repair
+        assert!(venv_needs_repair(true, Some(1), 2, false));
+        // no marker at all (pre-recipe venv) → repair
+        assert!(venv_needs_repair(true, None, 2, false));
+        // current → leave alone
+        assert!(!venv_needs_repair(true, Some(2), 2, false));
+        assert!(!venv_needs_repair(true, Some(3), 2, false));
+        // no interpreter → the installer's job, not ours
+        assert!(!venv_needs_repair(false, None, 2, false));
+        // someone else is provisioning → wait, don't race
+        assert!(!venv_needs_repair(true, Some(1), 2, true));
+    }
+
+    #[test]
+    fn marker_recipe_is_read_from_the_venv_root() {
+        let (root, py) = fake_venv("#!/bin/sh\nexit 0\n", true);
+        assert_eq!(venv_marker_recipe(&py), Some(1));
+        std::fs::write(root.join(VENV_READY_MARKER), "{\"schema\":1,\"recipe\":2}").unwrap();
+        assert_eq!(venv_marker_recipe(&py), Some(2));
+        std::fs::remove_file(root.join(VENV_READY_MARKER)).unwrap();
+        assert_eq!(venv_marker_recipe(&py), None);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lock_with_dead_pid_does_not_count_as_in_progress() {
+        let (root, py) = fake_venv("#!/bin/sh\nexit 0\n", true);
+        assert!(!venv_bootstrap_in_progress(&py));
+        std::fs::write(root.join(VENV_BOOTSTRAP_LOCK), "999999999\n").unwrap();
+        assert!(!venv_bootstrap_in_progress(&py));
+        std::fs::write(
+            root.join(VENV_BOOTSTRAP_LOCK),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(venv_bootstrap_in_progress(&py));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn repair_is_not_needed_for_a_current_marker() {
+        let (root, py) = fake_venv("#!/bin/sh\nexit 0\n", true);
+        std::fs::write(
+            root.join(VENV_READY_MARKER),
+            format!("{{\"schema\":1,\"recipe\":{}}}", embedded_venv_recipe()),
+        )
+        .unwrap();
+        assert_eq!(repair_venv_if_stale(&py), VenvRepair::NotNeeded);
         std::fs::remove_dir_all(root).ok();
     }
 
