@@ -183,6 +183,12 @@ export function createAppResolver(deps: AppResolverDeps = {}): AppResolver {
         if (now() - cached.at < ttl) return cached.value;
       }
       let value: AppRegistration | null = null;
+      // Only a definitive answer is cached. A DID that would not resolve, a PDS
+      // that timed out, or a network error is NOT "no record": caching that
+      // null for REGISTRATION_MISS_TTL_MS turned a single slow PDS fetch into a
+      // minute of AppNotRegistered for a correctly registered app (Graze,
+      // 2026-09-14), and every start() in that minute failed for its users.
+      let definitive = false;
       try {
         const pds = await resolvePds(did);
         if (pds) {
@@ -193,12 +199,15 @@ export function createAppResolver(deps: AppResolverDeps = {}): AppResolver {
           if (res.ok) {
             const body = (await res.json()) as { value?: unknown };
             value = parseRegistration(did, body.value);
+            definitive = true;
+          } else if (res.status === 400 || res.status === 404) {
+            definitive = true; // the PDS answered: RecordNotFound / no such repo
           }
         }
       } catch {
         value = null;
       }
-      registrations.set(did, { at: now(), value });
+      if (value || definitive) registrations.set(did, { at: now(), value });
       return value;
     },
 
