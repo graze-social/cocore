@@ -43,6 +43,36 @@ export function bridgeHeaders(extra?: Record<string, string>): Record<string, st
   };
 }
 
+/** The console's service DID, derived from CONSOLE_PUBLIC_URL exactly as
+ *  routes/[.]well-known.did[.]json.ts derives the `id` it publishes.
+ *
+ *  🔴 Why this is derived and not a literal. Until 2026-09-15 the default here
+ *  was the literal `did:web:console.cocore.dev` while the published document
+ *  said `did:web:cocore.dev` (CONSOLE_PUBLIC_URL is https://cocore.dev since
+ *  the cocore.dev cutover). That combination is a deadlock, and it silently
+ *  broke every third-party service-auth call:
+ *
+ *    aud did:web:cocore.dev          -> 401 BadJwtAudience here
+ *    aud did:web:console.cocore.dev  -> accepted here, but a PDS cannot
+ *                                       resolve that DID, because
+ *                                       console.cocore.dev/.well-known/did.json
+ *                                       declares id did:web:cocore.dev and a
+ *                                       did:web document whose id does not
+ *                                       match the DID being resolved is invalid
+ *
+ *  Both verified against production on 2026-09-15. Deriving both ends from one
+ *  URL makes the pair impossible to get wrong again. docs/api-keys.md already
+ *  documents did:web:cocore.dev#cocore_console, which is now what we accept. */
+function consoleDidFromPublicUrl(): string {
+  const url = process.env["CONSOLE_PUBLIC_URL"] ?? "https://console.cocore.dev";
+  try {
+    // host with `:port` becomes `%3Aport` per the did:web spec.
+    return `did:web:${new URL(url).host.replace(":", "%3A")}`;
+  } catch {
+    return "did:web:console.cocore.dev";
+  }
+}
+
 export function cocoreConfig(): CocoreConfig {
   return {
     bridgeUrl: process.env["COCORE_BRIDGE_URL"] ?? "http://localhost:8080",
@@ -53,9 +83,13 @@ export function cocoreConfig(): CocoreConfig {
     // override with COCORE_EXCHANGE_DID=did:web:exchange.local
     // (or whatever resolves locally).
     exchangeDid: process.env["COCORE_EXCHANGE_DID"] ?? "did:web:console.cocore.dev:exchange",
-    // Defaults to the production console DID. In local dev, override
-    // with COCORE_CONSOLE_DID=did:web:127.0.0.1%3A3000 (or whatever
-    // matches the host a requester's PDS will proxy to).
-    consoleDid: process.env["COCORE_CONSOLE_DID"] ?? "did:web:console.cocore.dev",
+    // DERIVED from CONSOLE_PUBLIC_URL, the same source /.well-known/did.json
+    // uses for the `id` it publishes. These two MUST agree: the verifier
+    // compares an inbound JWT's `aud` against this, while a requester's PDS
+    // resolves the DID by fetching our document and checking its `id`. When
+    // they disagree, nothing can call us at all — see the note below.
+    // Override with COCORE_CONSOLE_DID only when the two cannot be derived
+    // from one URL (local dev: did:web:127.0.0.1%3A3000).
+    consoleDid: process.env["COCORE_CONSOLE_DID"] ?? consoleDidFromPublicUrl(),
   };
 }
