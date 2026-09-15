@@ -1928,7 +1928,13 @@ async fn cmd_serve(
         }))
     };
 
-    let (engines, engine_fault, tool_call_models) = build_engines(profile.ram_gb);
+    let BuiltEngines {
+        registry: engines,
+        fault: engine_fault,
+        tool_call_models,
+        structured_output_models,
+        model_capacity,
+    } = build_engines(profile.ram_gb);
 
     // Stop the progress monitor and record the outcome for the tray: clear
     // the marker on success (tray shows normal serving), or write the fault
@@ -2245,6 +2251,13 @@ async fn cmd_serve(
         } else {
             Some(tool_call_models.clone())
         },
+        // Structured output: every vllm-mlx model plus attached models whose
+        // response_format canary passed. Always sent (possibly empty) so the
+        // advisor can tell "verified none" from "legacy agent".
+        structured_output_models: Some(structured_output_models.clone()),
+        // Admission ceiling per model (running + queued) — absent when only
+        // `stub` is loaded, since the stub engine is not gated.
+        model_capacity,
         // Echo our binary version live so the advisor can route version-gated
         // jobs (e.g. image input requires a release that supports messages-v1).
         binary_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -2438,9 +2451,7 @@ async fn cmd_serve(
                                 // The fault (if any) was already published on the
                                 // initial provider record; the in-window reload only
                                 // needs the registry.
-                                let (eng, _fault, _tool_call_models) =
-                                    build_engines(provider_record.ramGB);
-                                eng
+                                build_engines(provider_record.ramGB).registry
                             }
                         };
                         let close_in = window.seconds_until_close().max(1);
@@ -3021,16 +3032,49 @@ fn pick_confidential_native_model(
 /// for `start()` to arbitrate. Set `COCORE_IGNORE_RAM_FLOOR=1` to bypass
 /// the guard (e.g. a machine the operator knows can run a model the
 /// conservative floor rejects).
-fn build_engines(
-    ram_gb: u32,
-) -> (
-    cocore_provider::engines::EngineRegistry,
-    Option<EngineFault>,
-    Vec<String>,
-) {
+/// What `build_engines` hands the serve loop: the registry plus the
+/// capability facts the Register frame advertises about it.
+struct BuiltEngines {
+    registry: cocore_provider::engines::EngineRegistry,
+    fault: Option<EngineFault>,
+    /// Models whose engine passed the forced-tool startup canary.
+    tool_call_models: Vec<String>,
+    /// Models whose engine is verified to honour `response_format: json_schema`
+    /// (every vllm-mlx subprocess model; attached models only after their
+    /// canary). Advertised so the advisor can steer schema jobs correctly.
+    structured_output_models: Vec<String>,
+    /// Per-model running+queued ceiling of the admission gate every real
+    /// engine is wrapped in; `None` when only `stub` is registered.
+    model_capacity: Option<u32>,
+}
+
+impl BuiltEngines {
+    fn stub_only(fault: Option<EngineFault>) -> Self {
+        use cocore_provider::engines::stub::StubEngine;
+        let mut registry = cocore_provider::engines::EngineRegistry::new();
+        registry.register("stub", std::sync::Arc::new(StubEngine));
+        Self {
+            registry,
+            fault,
+            tool_call_models: vec![],
+            structured_output_models: vec![],
+            model_capacity: None,
+        }
+    }
+}
+
+fn build_engines(ram_gb: u32) -> BuiltEngines {
+    use cocore_provider::engines::admission::Gated;
+    use cocore_provider::engines::attached::{AttachedEngine, EngineMap};
     use cocore_provider::engines::stub::StubEngine;
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
+    // Every real engine below is wrapped in a single-flight admission gate
+    // (1 running + 1 queued); this is the ceiling the Register frame
+    // advertises so the advisor routes around a saturated machine.
+    let gate_capacity =
+        cocore_provider::engines::admission::AdmissionGate::new(1, 1).advertised_capacity();
+    let mut structured_output_models: Vec<String> = vec![];
 
     // A confidential machine's native engine failed to come up. Surfaced as
     // the serve's engineFault so the console shows an honest "couldn't serve
@@ -3107,22 +3151,65 @@ fn build_engines(
         }
     }
 
+    // Attached engines (issue #204): models the operator serves through an
+    // OpenAI-compatible server they already run (mei, mlx_lm.server,
+    // llama-server, ...). `COCORE_ENGINE_MAP` or `~/.cocore/engine-map`. A
+    // malformed map is a fault, not a silent fallback to vllm-mlx.
+    let mut engine_map_fault: Option<EngineFault> = None;
+    let engine_map = match EngineMap::from_env_or_file() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "engine map is invalid; ignoring attached engines");
+            engine_map_fault = Some(EngineFault {
+                code: "engine-map-invalid".to_string(),
+                message: format!(
+                    "The attached-engine map (COCORE_ENGINE_MAP or ~/.cocore/engine-map) could not \
+                     be parsed: {e}. Entries look like `model-id=http://127.0.0.1:8024`, one per \
+                     line or comma-separated. No attached model is being served until it is fixed."
+                ),
+                models: vec![],
+                at: chrono::Utc::now(),
+            });
+            EngineMap::default()
+        }
+    };
+
     let raw = std::env::var("COCORE_INFERENCE_MODELS")
         .or_else(|_| std::env::var("COCORE_INFERENCE_MODEL"))
         .unwrap_or_default();
-    if raw.trim().is_empty() {
+
+    let configured: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        // Never route the built-in `stub` through the vLLM subprocess loader: it
+        // isn't a HuggingFace repo, so the subprocess `snapshot_download("stub")`
+        // 404s ("RepositoryNotFoundError"), exits status 1, and the recovery loop
+        // burns 3 retries + a WARN on every restart (bug report br_5051054f). The
+        // `stub` engine is always registered separately below.
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("stub"))
+        // A model in the engine map is served by its attached server, never
+        // ALSO by a vllm-mlx child — even if the operator listed it in both
+        // places (the tray writes COCORE_INFERENCE_MODELS from its picker).
+        .filter(|s| !engine_map.contains(s))
+        .collect();
+    let mut attached: Vec<String> = engine_map.models();
+
+    if configured.is_empty() && attached.is_empty() {
         tracing::info!(
-            "no inference models configured (set COCORE_INFERENCE_MODELS to enable real inference; this agent will serve `stub` only)"
+            "no inference models configured (set COCORE_INFERENCE_MODELS or COCORE_ENGINE_MAP to enable real inference; this agent will serve `stub` only)"
         );
         // On a confidential machine the subprocess set is intentionally empty
         // (inference runs in-process), so a native failure is the fault to
         // surface here. On best-effort machines `native_fault` is `None`.
-        return (registry, native_fault, vec![]);
+        return BuiltEngines::stub_only(native_fault.or(engine_map_fault));
     }
 
     // Resolve the venv interpreter once. The install script writes it
-    // to `~/.cocore/python/bin/python` via `uv venv`.
-    let Some(home) = dirs::home_dir() else {
+    // to `~/.cocore/python/bin/python` via `uv venv`. Only the subprocess
+    // engines need it; a machine whose every model is attached serves
+    // without any Python at all.
+    let home = dirs::home_dir();
+    if home.is_none() && !configured.is_empty() {
         tracing::warn!("no $HOME; cannot locate venv python; serving stub only");
         let fault = EngineFault {
             code: "no-home".to_string(),
@@ -3134,20 +3221,11 @@ fn build_engines(
             models: vec![],
             at: chrono::Utc::now(),
         };
-        return (registry, Some(fault), vec![]);
-    };
-    let venv_python = home.join(".cocore/python/bin/python");
-
-    let configured: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        // Never route the built-in `stub` through the vLLM subprocess loader: it
-        // isn't a HuggingFace repo, so the subprocess `snapshot_download("stub")`
-        // 404s ("RepositoryNotFoundError"), exits status 1, and the recovery loop
-        // burns 3 retries + a WARN on every restart (bug report br_5051054f). The
-        // `stub` engine is always registered separately below.
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("stub"))
-        .collect();
+        return BuiltEngines::stub_only(Some(fault));
+    }
+    let venv_python = home
+        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+        .join(".cocore/python/bin/python");
 
     // Before the first engine spawn, bring a stale venv up to the embedded
     // bootstrap recipe (once per process). See "Venv recipe repair" above.
@@ -3165,6 +3243,7 @@ fn build_engines(
     } else {
         let active = schedules.active_now(&configured);
         tracing::info!(active = ?active, "per-model schedule: loading the models whose window is open now");
+        attached = schedules.active_now(&attached);
         active
     };
 
@@ -3272,7 +3351,12 @@ fn build_engines(
                 if engine.verified_tool_calls() {
                     tool_call_models.push(model.clone());
                 }
-                registry.register(model.clone(), std::sync::Arc::new(engine));
+                // vllm-mlx constrains decoding for `response_format` natively.
+                structured_output_models.push(model.clone());
+                registry.register(
+                    model.clone(),
+                    std::sync::Arc::new(Gated::single_flight(std::sync::Arc::new(engine))),
+                );
             }
             Err(EngineStartFailure::VenvIncomplete(missing)) => {
                 for m in missing {
@@ -3303,8 +3387,54 @@ fn build_engines(
         }
     }
 
-    if failed.is_empty() && too_large.is_empty() {
-        return (registry, None, tool_call_models);
+    // Attached engines: the server is already running (or should be); prove
+    // it answers, run the capability canaries, and proxy. No venv, no RAM
+    // floor (the operator sized the server), same admission gate.
+    let mut attached_failed: Vec<String> = vec![];
+    let mut attached_last_err: Option<String> = None;
+    for model in &attached {
+        let Some(target) = engine_map.get(model) else {
+            continue;
+        };
+        let engine = AttachedEngine::new(model.clone(), target.clone());
+        match engine.start() {
+            Ok(()) => {
+                tracing::info!(model = %model, target = %target, "attached inference engine ready");
+                if engine.verified_tool_calls() {
+                    tool_call_models.push(model.clone());
+                }
+                if engine.verified_structured_output() {
+                    structured_output_models.push(model.clone());
+                }
+                registry.register(
+                    model.clone(),
+                    std::sync::Arc::new(Gated::single_flight(std::sync::Arc::new(engine))),
+                );
+            }
+            Err(e) => {
+                // Keep the "inference engine load failed" phrase stable —
+                // `models_cli::match_log_line` and the tray match on it.
+                tracing::warn!(model = %model, target = %target, error = %e, reason = "attached-unreachable", "inference engine load failed");
+                attached_last_err = Some(e.to_string());
+                attached_failed.push(model.clone());
+            }
+        }
+    }
+
+    let model_capacity = if registry.loaded_models().len() > 1 {
+        Some(gate_capacity)
+    } else {
+        None
+    };
+
+    if failed.is_empty() && too_large.is_empty() && attached_failed.is_empty() {
+        return BuiltEngines {
+            registry,
+            fault: engine_map_fault,
+            tool_call_models,
+            structured_output_models,
+            model_capacity,
+        };
     }
 
     // The fault's `models` field lists every model that won't be served
@@ -3313,6 +3443,7 @@ fn build_engines(
     // from `supportedModels`.
     let mut all_unserved = failed.clone();
     all_unserved.extend(too_large.iter().cloned());
+    all_unserved.extend(attached_failed.iter().cloned());
 
     // Build a curated, content-safe fault for the console. Detailed
     // tracebacks already went to `tracing` inside the recovery loop;
@@ -3545,6 +3676,26 @@ fn build_engines(
             models: all_unserved,
             at: chrono::Utc::now(),
         }
+    } else if !attached_failed.is_empty() {
+        tracing::warn!(
+            models = ?attached_failed,
+            last_error = %attached_last_err.as_deref().unwrap_or("(none captured)"),
+            "attached inference engine(s) unreachable; not advertising them"
+        );
+        EngineFault {
+            code: "attached-engine-unreachable".to_string(),
+            message: format!(
+                "The attached inference server for [{}] did not answer: {}. The agent does \
+                 not start or manage that server — start it yourself (for example `mei \
+                 --model-dir ... --served-model-id <model>` on the port named in your \
+                 engine map), check it answers `curl http://127.0.0.1:<port>/v1/models`, \
+                 then start serving again. Other configured models are unaffected.",
+                attached_failed.join(", "),
+                attached_last_err.as_deref().unwrap_or("no response"),
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
     } else {
         // Only RAM-floor skips — nothing actually tried to load.
         tracing::warn!(
@@ -3569,7 +3720,13 @@ fn build_engines(
         }
     };
 
-    (registry, Some(fault), tool_call_models)
+    BuiltEngines {
+        registry,
+        fault: Some(fault),
+        tool_call_models,
+        structured_output_models,
+        model_capacity,
+    }
 }
 
 /// How a single model's load ultimately failed, after recovery.

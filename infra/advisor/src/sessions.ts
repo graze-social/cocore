@@ -41,6 +41,11 @@ export interface SessionEntry {
    *  idle-timeout flags the specific sour machine rather than the whole
    *  identity (a DID can have several machines). */
   providerMachineId: string;
+  /** Model the job was dispatched for, so per-model in-flight counts can
+   *  be compared against the provider's per-model admission ceiling.
+   *  Undefined for sessions opened by callers that predate the field; those
+   *  count toward every model's load (conservative). */
+  model: string | undefined;
   /** Requester DID — informational; advisor doesn't enforce
    *  anything about it in v0. */
   requesterDid: string;
@@ -147,6 +152,7 @@ export class SessionManager {
     res: SseResponse,
     receivedAt?: number,
     resumeToken?: string,
+    model?: string,
   ): SessionEntry {
     if (this.known(sessionId)) {
       throw new Error("session_id is already active or recently completed");
@@ -164,6 +170,7 @@ export class SessionManager {
     const entry: SessionEntry = {
       providerDid,
       providerMachineId,
+      model,
       requesterDid,
       createdAt: now,
       requestReceivedAt: receivedAt ?? now,
@@ -218,10 +225,14 @@ export class SessionManager {
    *  as in-flight from `open` until `complete`/`close`, so a wedged machine
    *  (job accepted, gone silent) keeps an elevated count until its idle
    *  timer fires — which is exactly when we want to route away from it. */
-  inflightFor(providerDid: string, providerMachineId: string): number {
+  inflightFor(providerDid: string, providerMachineId: string, model?: string): number {
     let n = 0;
     for (const e of this.bySessionId.values()) {
-      if (e.providerDid === providerDid && e.providerMachineId === providerMachineId) n += 1;
+      if (e.providerDid !== providerDid || e.providerMachineId !== providerMachineId) continue;
+      // With a model given, count that model's sessions plus any session
+      // whose model is unknown (legacy opener) — never under-count load.
+      if (model !== undefined && e.model !== undefined && e.model !== model) continue;
+      n += 1;
     }
     return n;
   }

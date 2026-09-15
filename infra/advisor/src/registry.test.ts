@@ -10,6 +10,8 @@ import {
   ProviderRegistry,
   SILENT_FAILURE_DISPATCH_THRESHOLD,
   STRIKE_RESET_MS,
+  supportsStructuredOutputFor,
+  hasCapacityFor,
 } from "./registry.ts";
 
 const noop = (): void => {};
@@ -915,5 +917,101 @@ describe("ProviderRegistry.setAttestationUri (attestation_refreshed)", () => {
     expect(
       r.setAttestationUri(DID, "ghost", "at://did:plc:test1/dev.cocore.compute.attestation/x"),
     ).toBe(false);
+  });
+});
+
+describe("structured-output gating and admission capacity (attached engines)", () => {
+  const noop = () => {};
+  const noopSend = () => {};
+  const noopPing = () => Promise.resolve(true);
+
+  it("maps structured_output_models and model_capacity from the Register frame", () => {
+    const r = new ProviderRegistry();
+    r.upsert(
+      { ...baseReg, structured_output_models: ["llama-3.2"], model_capacity: 2 },
+      noop,
+      noopSend,
+      noopPing,
+      1000,
+    );
+    const e = r.get(DID, MID)!;
+    expect(e.structuredOutputModels).toEqual(["llama-3.2"]);
+    expect(e.modelCapacity).toBe(2);
+    expect(supportsStructuredOutputFor(e, "llama-3.2")).toBe(true);
+    expect(supportsStructuredOutputFor(e, "qwen-x")).toBe(false);
+    expect(hasCapacityFor(e, 0)).toBe(true);
+    expect(hasCapacityFor(e, 1)).toBe(true);
+    expect(hasCapacityFor(e, 2)).toBe(false);
+  });
+
+  it("a legacy Register (neither field) is capable of everything and never saturated", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noop, noopSend, noopPing, 1000);
+    const e = r.get(DID, MID)!;
+    expect(e.structuredOutputModels).toBeUndefined();
+    expect(e.modelCapacity).toBeNull();
+    expect(supportsStructuredOutputFor(e, "llama-3.2")).toBe(true);
+    expect(supportsStructuredOutputFor(e, undefined)).toBe(true);
+    expect(hasCapacityFor(e, 1_000)).toBe(true);
+  });
+
+  it("a zero or non-numeric model_capacity is treated as absent", () => {
+    const r = new ProviderRegistry();
+    r.upsert({ ...baseReg, model_capacity: 0 }, noop, noopSend, noopPing, 1000);
+    expect(r.get(DID, MID)!.modelCapacity).toBeNull();
+    r.upsert(
+      { ...baseReg, model_capacity: "two" as unknown as number },
+      noop,
+      noopSend,
+      noopPing,
+      1000,
+    );
+    expect(r.get(DID, MID)!.modelCapacity).toBeNull();
+  });
+
+  it("pickCandidates(requireStructuredOutput) keeps verified and legacy machines, drops unverified ones", () => {
+    const r = new ProviderRegistry();
+    r.upsert(
+      { ...baseReg, provider_did: "did:plc:verified", structured_output_models: ["llama-3.2"] },
+      noop,
+      noopSend,
+      noopPing,
+      1000,
+    );
+    r.upsert(
+      { ...baseReg, provider_did: "did:plc:unverified", structured_output_models: [] },
+      noop,
+      noopSend,
+      noopPing,
+      1000,
+    );
+    r.upsert({ ...baseReg, provider_did: "did:plc:legacy" }, noop, noopSend, noopPing, 1000);
+    for (const did of ["did:plc:verified", "did:plc:unverified", "did:plc:legacy"]) {
+      r.markAttested(did, MID);
+    }
+    const without = r.pickCandidates(
+      "llama-3.2",
+      true,
+      Number.POSITIVE_INFINITY,
+      2000,
+      null,
+      false,
+      false,
+    );
+    expect(without.map((e) => e.did).sort()).toEqual(
+      ["did:plc:legacy", "did:plc:unverified", "did:plc:verified"].sort(),
+    );
+    const withSchema = r.pickCandidates(
+      "llama-3.2",
+      true,
+      Number.POSITIVE_INFINITY,
+      2000,
+      null,
+      false,
+      true,
+    );
+    expect(withSchema.map((e) => e.did).sort()).toEqual(
+      ["did:plc:legacy", "did:plc:verified"].sort(),
+    );
   });
 });

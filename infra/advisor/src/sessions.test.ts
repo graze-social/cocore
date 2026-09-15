@@ -346,3 +346,32 @@ test("resume grace expiry records a machine failure via the production handler",
   expect(spy).toHaveBeenCalledWith("did:plc:p", "m", "resume-expired");
   expect(sm.has("s-exp")).toBe(false);
 });
+
+test("inflightFor counts per model when asked, and unknown-model sessions count toward every model", () => {
+  const sm = new SessionManager({ idleTimeoutMs: 60_000 });
+  sm.open("a1", "did:plc:p", "m", "did:plc:r", asRes(fakeRes()), undefined, undefined, "model-a");
+  sm.open("a2", "did:plc:p", "m", "did:plc:r", asRes(fakeRes()), undefined, undefined, "model-a");
+  sm.open("b1", "did:plc:p", "m", "did:plc:r", asRes(fakeRes()), undefined, undefined, "model-b");
+  // Opened by a caller that predates the model field.
+  sm.open("legacy", "did:plc:p", "m", "did:plc:r", asRes(fakeRes()));
+  sm.open(
+    "other-machine",
+    "did:plc:p",
+    "m2",
+    "did:plc:r",
+    asRes(fakeRes()),
+    undefined,
+    undefined,
+    "model-a",
+  );
+
+  expect(sm.inflightFor("did:plc:p", "m")).toBe(4);
+  expect(sm.inflightFor("did:plc:p", "m", "model-a")).toBe(3); // a1, a2, legacy
+  expect(sm.inflightFor("did:plc:p", "m", "model-b")).toBe(2); // b1, legacy
+  expect(sm.inflightFor("did:plc:p", "m", "model-c")).toBe(1); // legacy only
+  expect(sm.inflightFor("did:plc:p", "m2", "model-a")).toBe(1);
+
+  sm.complete("a1", { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+  expect(sm.inflightFor("did:plc:p", "m", "model-a")).toBe(2);
+  for (const id of ["a2", "b1", "legacy", "other-machine"]) sm.close(id, "cleanup");
+});

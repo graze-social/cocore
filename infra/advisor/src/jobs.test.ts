@@ -106,6 +106,21 @@ function fakeProvider(
   return { sent, machineId, close: () => registry.remove(did, machineId) };
 }
 
+/** A throwaway SSE sink for pre-opening synthetic in-flight sessions. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function fakeSink(): any {
+  return {
+    statusCode: 0,
+    writableEnded: false,
+    setHeader() {},
+    flushHeaders() {},
+    write() {
+      return true;
+    },
+    end() {},
+  };
+}
+
 async function readSseLines(url: string, body: object): Promise<string[]> {
   const resp = await fetch(url, {
     method: "POST",
@@ -563,6 +578,207 @@ describe("POST /jobs", () => {
     h.sessions.complete("s1", { tokensIn: 1, tokensOut: 2, receiptUri: "at://r1" });
     h.sessions.complete("s2", { tokensIn: 1, tokensOut: 2, receiptUri: "at://r2" });
     await Promise.all([job1, job2]);
+  });
+
+  it("skips a machine whose per-model admission ceiling is reached and routes to a sibling with room", async () => {
+    // Two machines serve "stub" and both report the single-flight ceiling
+    // every shipped engine has (1 running + 1 queued = 2). Fill A to its
+    // ceiling with two in-flight sessions; the next job must land on B even
+    // though A is the freshest heartbeat.
+    const a = fakeProvider(h.registry, "did:plc:cap", "pub-a", true, "machine-a", {
+      model_capacity: 2,
+    });
+    const b = fakeProvider(h.registry, "did:plc:cap", "pub-b", true, "machine-b", {
+      model_capacity: 2,
+    });
+    h.registry.get("did:plc:cap", "machine-a")!.lastSeen = Date.now() + 10_000;
+
+    const j1 = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://j1",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+      sessionId: "cap-1",
+    });
+    await vi.waitFor(
+      () => expect(a.sent.filter((m) => m.type === "inference_request").length).toBe(1),
+      { timeout: 2_000 },
+    );
+    // Least-loaded routing would now send job 2 to B (0 < 1). Pin it back onto
+    // A by giving B a synthetic in-flight session, so A reaches its ceiling.
+    h.sessions.open(
+      "cap-b-busy",
+      "did:plc:cap",
+      "machine-b",
+      "did:plc:x",
+      fakeSink(),
+      undefined,
+      undefined,
+      "stub",
+    );
+    const j2 = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://j2",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+      sessionId: "cap-2",
+    });
+    await vi.waitFor(
+      () => expect(a.sent.filter((m) => m.type === "inference_request").length).toBe(2),
+      { timeout: 2_000 },
+    );
+    expect(h.sessions.inflightFor("did:plc:cap", "machine-a", "stub")).toBe(2);
+
+    // A is saturated (2/2). Job 3 goes to B (1/2) despite A being freshest.
+    const j3 = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://j3",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+      sessionId: "cap-3",
+    });
+    await vi.waitFor(
+      () => expect(b.sent.filter((m) => m.type === "inference_request").length).toBe(1),
+      { timeout: 2_000 },
+    );
+    expect(a.sent.filter((m) => m.type === "inference_request").length).toBe(2);
+
+    // Everyone is now at 2/2: the next job is refused with no-capacity (503)
+    // instead of being dispatched to a machine that would refuse it.
+    const resp = await fetch(`${h.url}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jobUri: "at://j4",
+        requesterDid: "did:plc:requester",
+        requesterPubKey: "req-pub",
+        model: "stub",
+        maxTokensOut: 32,
+        ciphertext: [1, 2, 3],
+        sessionId: "cap-4",
+      }),
+    });
+    expect(resp.status).toBe(503);
+    const j = (await resp.json()) as { error: string };
+    expect(j.error).toMatch(/at capacity/);
+    expect(a.sent.filter((m) => m.type === "inference_request").length).toBe(2);
+    expect(b.sent.filter((m) => m.type === "inference_request").length).toBe(1);
+
+    for (const id of ["cap-1", "cap-2", "cap-3"]) {
+      h.sessions.complete(id, { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+    }
+    h.sessions.close("cap-b-busy", "test-cleanup");
+    await Promise.all([j1, j2, j3]);
+  });
+
+  it("a machine that reports no capacity is never treated as saturated", async () => {
+    const legacy = fakeProvider(h.registry, "did:plc:legacy-cap", "pub-l");
+    for (const n of [1, 2, 3]) {
+      h.sessions.open(
+        `legacy-busy-${n}`,
+        "did:plc:legacy-cap",
+        legacy.machineId,
+        "did:plc:x",
+        fakeSink(),
+        undefined,
+        undefined,
+        "stub",
+      );
+    }
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+    });
+    await vi.waitFor(
+      () => expect(legacy.sent.some((m) => m.type === "inference_request")).toBe(true),
+      { timeout: 2_000 },
+    );
+    h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+    for (const n of [1, 2, 3]) h.sessions.close(`legacy-busy-${n}`, "test-cleanup");
+    await linesP;
+  });
+
+  const SCHEMA = { name: "answer", strict: true, schema: { type: "object" } };
+
+  it("routes an outputSchema job only to a machine verified for structured output on the model", async () => {
+    // A new-style agent that ran the canary and did NOT pass for "stub"
+    // (an attached server that ignores response_format), made freshest so
+    // schema-blind routing would pick it.
+    const prose = fakeProvider(h.registry, "did:plc:prose", "pub-prose", true, undefined, {
+      structured_output_models: [],
+    });
+    const constrained = fakeProvider(h.registry, "did:plc:constrained", "pub-c", true, undefined, {
+      structured_output_models: ["stub"],
+    });
+    h.registry.get("did:plc:prose", prose.machineId)!.lastSeen = Date.now() + 10_000;
+
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+      outputSchema: SCHEMA,
+    });
+    await vi.waitFor(
+      () => expect(constrained.sent.some((m) => m.type === "inference_request")).toBe(true),
+      { timeout: 2_000 },
+    );
+    expect(prose.sent.some((m) => m.type === "inference_request")).toBe(false);
+    h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+    await linesP;
+  });
+
+  it("a legacy agent (no structured_output_models) still receives outputSchema jobs", async () => {
+    const legacy = fakeProvider(h.registry, "did:plc:legacy-schema", "pub-ls");
+    const linesP = readSseLines(`${h.url}/jobs`, {
+      jobUri: "at://job",
+      requesterDid: "did:plc:requester",
+      requesterPubKey: "req-pub",
+      model: "stub",
+      maxTokensOut: 32,
+      ciphertext: [1, 2, 3],
+      outputSchema: SCHEMA,
+    });
+    await vi.waitFor(
+      () => expect(legacy.sent.some((m) => m.type === "inference_request")).toBe(true),
+      { timeout: 2_000 },
+    );
+    h.sessions.complete("test-session", { tokensIn: 1, tokensOut: 1, receiptUri: "at://r" });
+    await linesP;
+  });
+
+  it("503s an outputSchema job with a schema-specific error when no verified machine serves the model", async () => {
+    fakeProvider(h.registry, "did:plc:prose-only", "pub-po", true, undefined, {
+      structured_output_models: [],
+    });
+    const resp = await fetch(`${h.url}/jobs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jobUri: "at://x",
+        requesterDid: "did:plc:requester",
+        requesterPubKey: "req-pub",
+        model: "stub",
+        maxTokensOut: 32,
+        ciphertext: [1, 2, 3],
+        outputSchema: SCHEMA,
+      }),
+    });
+    expect(resp.status).toBe(503);
+    const j = (await resp.json()) as { error: string };
+    expect(j.error).toMatch(/structured output/);
   });
 
   it("targetMachineId pins dispatch to one specific machine under a did", async () => {

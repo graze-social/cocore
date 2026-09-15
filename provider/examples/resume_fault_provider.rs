@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
         apns_device_token: None,
         supports_tool_calls: Some(false),
         tool_call_models: None,
+        structured_output_models: None,
+        model_capacity: None,
         binary_version: Some(env!("CARGO_PKG_VERSION").into()),
         secure_enclave_available: Some(false),
         enc_scheme: Some("x25519".into()),

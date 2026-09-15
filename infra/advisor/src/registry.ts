@@ -201,6 +201,13 @@ export interface ProviderEntry {
    *  provider predates per-model reporting and callers should fall back to
    *  `supportsToolCalls`; present means only the listed models are verified. */
   toolCallModels: string[] | undefined;
+  /** Per-model verified structured-output (`response_format: json_schema`)
+   *  capability. Undefined = legacy agent, assume every advertised model;
+   *  present = only the listed models honour a schema. */
+  structuredOutputModels: string[] | undefined;
+  /** Per-model in-flight ceiling the provider's admission gate enforces
+   *  (running + queued). Null = legacy agent with no gate. */
+  modelCapacity: number | null;
   /** Highest supported stream-resume protocol version; 0 means legacy. */
   streamResumeVersion: number;
   /** Epoch ms the advisor last marked this machine unhealthy — it
@@ -289,6 +296,28 @@ function isCoolingDown(rec: FailureRecord | undefined, now: number): boolean {
  *  agree with the filter that picks who actually gets the job, or a request
  *  that passes the gate can still land on a machine whose vLLM was started
  *  without tool calling and reject mid-stream. */
+/** Whether machine `e` may take a job that carries an `outputSchema` for
+ *  `model`. Legacy agents (no `structured_output_models` on the Register
+ *  frame) are assumed capable for every advertised model — that is exactly
+ *  what the advisor assumed before the field existed. New agents are taken
+ *  at their word: only the listed models constrain decoding; an attached
+ *  server that ignored the canary's `response_format` is NOT listed and must
+ *  not receive schema jobs it would answer with free prose. */
+export function supportsStructuredOutputFor(e: ProviderEntry, model: string | undefined): boolean {
+  if (!Array.isArray(e.structuredOutputModels)) return true;
+  return model === undefined
+    ? e.structuredOutputModels.length > 0
+    : e.structuredOutputModels.includes(model);
+}
+
+/** Whether machine `e` has room for one more job on `model`, given
+ *  `inflight` sessions currently open against it for that model. A machine
+ *  that does not report a capacity is never considered saturated. */
+export function hasCapacityFor(e: ProviderEntry, inflight: number): boolean {
+  if (e.modelCapacity === null) return true;
+  return inflight < e.modelCapacity;
+}
+
 export function supportsToolCallsFor(e: ProviderEntry, model: string | undefined): boolean {
   if (Array.isArray(e.toolCallModels)) {
     return model === undefined ? e.toolCallModels.length > 0 : e.toolCallModels.includes(model);
@@ -499,6 +528,11 @@ export class ProviderRegistry {
       registrationAuthenticated: true,
       supportsToolCalls: reg.supports_tool_calls ?? false,
       toolCallModels: reg.tool_call_models,
+      structuredOutputModels: reg.structured_output_models,
+      modelCapacity:
+        typeof reg.model_capacity === "number" && reg.model_capacity > 0
+          ? Math.floor(reg.model_capacity)
+          : null,
       streamResumeVersion: reg.stream_resume_version ?? 0,
       // A fresh register is a clean slate — clear any prior bad standing.
       unhealthyAt: null,
@@ -561,6 +595,7 @@ export class ProviderRegistry {
     now: number = Date.now(),
     minProviderVersion: string | null = null,
     requireToolCalls = false,
+    requireStructuredOutput = false,
   ): ProviderEntry[] {
     const candidates = [...this.byKey.values()].filter((e) => {
       // Owner stopped this machine from the console — route it nothing.
@@ -584,6 +619,9 @@ export class ProviderRegistry {
       // Job carries `tools` → only a machine whose engine passed the
       // forced-tool canary for this model may take it.
       if (requireToolCalls && !supportsToolCallsFor(e, model)) return false;
+      // Job carries `outputSchema` → only a machine whose engine is verified
+      // to constrain decoding for this model may take it.
+      if (requireStructuredOutput && !supportsStructuredOutputFor(e, model)) return false;
       // No model requested → any attested machine is fine.
       if (!model) return true;
       // M2: an explicit advertised model set is REQUIRED to be routed a model.

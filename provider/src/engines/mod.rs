@@ -34,10 +34,78 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub mod admission;
+pub mod attached;
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
+pub mod openai_http;
 pub mod stub;
 pub mod subprocess;
+
+/// A request an engine declined to RUN, as opposed to one that ran and
+/// failed. The distinction matters at the receipt boundary: a rejected job
+/// never touched the model, so the advisor path must not publish (or bill)
+/// a completion receipt for it — it surfaces a sealed error to the requester
+/// and completes the session with no receipt, exactly like a model miss.
+///
+/// Engines return these through `anyhow::Error`; use [`rejection_of`] to
+/// recover the typed value from an error chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineRejection {
+    /// Every slot on this engine (running + queued) is taken. Single-flight
+    /// backends (vllm-mlx's `SimpleEngine`, mei) can only ever run one
+    /// generation at a time; the admission gate turns "a second request
+    /// would fail 20s later writing its body" (issue #202) into an
+    /// immediate, typed refusal.
+    Busy {
+        model: String,
+        in_flight: u32,
+        capacity: u32,
+    },
+    /// The request carries `response_format: json_schema` but this engine
+    /// failed (or never ran) the structured-output canary, so it would serve
+    /// unconstrained prose as if it were schema-valid JSON.
+    StructuredOutputUnsupported { model: String },
+}
+
+impl std::fmt::Display for EngineRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineRejection::Busy {
+                model,
+                in_flight,
+                capacity,
+            } => write!(
+                f,
+                "engine busy: model '{model}' has {in_flight}/{capacity} slots in use; retry on another provider or shortly"
+            ),
+            EngineRejection::StructuredOutputUnsupported { model } => write!(
+                f,
+                "model '{model}' on this provider does not support structured output (response_format json_schema); route to a provider that advertises it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineRejection {}
+
+impl EngineRejection {
+    /// Stable machine-readable code, mirrored in the sealed error text so a
+    /// client can match on it without parsing prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EngineRejection::Busy { .. } => "engine-busy",
+            EngineRejection::StructuredOutputUnsupported { .. } => "structured-output-unsupported",
+        }
+    }
+}
+
+/// Recover a typed rejection from an `anyhow` chain, if that is what the
+/// engine returned.
+pub fn rejection_of(err: &anyhow::Error) -> Option<&EngineRejection> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<EngineRejection>())
+}
 
 /// A directory of engines keyed by the NSID the requester names in
 /// `chat.completions { model: ... }`.

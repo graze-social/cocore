@@ -178,6 +178,26 @@ Full reference: the OpenAPI spec at
 (also rendered at `console.cocore.dev/docs`) and the lexicon notes in
 [`lexicons/README.md`](lexicons/README.md).
 
+## Bring your own engine
+
+The agent spawns [`vllm-mlx`](https://github.com/waybarrios/vllm-mlx) for each
+model you pick, and that is still the zero-config default. If a different
+server runs your hardware better — [`mei`](https://github.com/tijs/mei) on an
+M1, `mlx_lm.server`, `llama-server` — run it yourself and **attach** it:
+
+```
+# ~/.cocore/engine-map   (or COCORE_ENGINE_MAP="model=url,...")
+mlx-community/Qwen3.6-35B-A3B-4bit = http://127.0.0.1:8024
+```
+
+The agent proves the server answers, runs the same tool-calling canary it runs
+on vllm-mlx plus a structured-output canary, advertises only what passed, and
+proxies jobs to it. A model in the map is never also spawned under vllm-mlx,
+and a machine whose every model is attached needs no Python at all. Attached
+engines are best-effort tier, exactly like the vllm-mlx child. Details, the
+admission gate that goes with it, and the mei recipe:
+[`docs/attached-engine.md`](docs/attached-engine.md).
+
 ## What's in here
 
 The lexicon is the source of truth. Everything else exists to make it

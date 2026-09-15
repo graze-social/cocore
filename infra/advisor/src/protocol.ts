@@ -66,6 +66,20 @@ export interface Register {
    *  present, tool-capability gating should require the requested model to be
    *  listed. Additive. */
   tool_call_models?: string[];
+  /** Model ids whose engine is verified to honour `response_format:
+   *  json_schema` (vllm-mlx constrains decoding natively; an attached
+   *  OpenAI-compatible server is listed only after the provider's startup
+   *  structured-output canary passed). When absent the agent predates the
+   *  field and every advertised model is assumed capable — the historical
+   *  behaviour. When present (even empty), a job carrying `outputSchema`
+   *  must find its model listed. Additive. */
+  structured_output_models?: string[];
+  /** Per-model in-flight ceiling (running + queued) the provider's admission
+   *  gate accepts before refusing a job with `engine-busy`. The advisor skips
+   *  a machine whose in-flight count for the requested model has reached it,
+   *  so the job lands on a machine with room instead of being refused after
+   *  dispatch. Absent = no gate (legacy agent, unlimited). Additive. */
+  model_capacity?: number;
   /** This agent binary's version (e.g. `0.9.32`), echoed live so the advisor
    *  can route version-gated jobs (a request needing a feature only present
    *  from some release is steered to machines at/above a minimum version).
