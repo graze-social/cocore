@@ -54,7 +54,9 @@
 #                            no TTY is attached)
 #   COCORE_PYTHON_VENV       venv root (default: $HOME/.cocore/python)
 #   COCORE_SKIP_VENV         1 to skip the venv bootstrap if you've
-#                            already got a working one
+#                            already got a working one — or if every model
+#                            you serve is attached to your own server via
+#                            ~/.cocore/engine-map (docs/attached-engine.md)
 #   COCORE_SKIP_PICKER       1 to skip the interactive picker and use
 #                            the default for the detected RAM.
 #   COCORE_SKIP_PAIR         1 to skip pairing (binary + plist installed

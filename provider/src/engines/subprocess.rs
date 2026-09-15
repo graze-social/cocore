@@ -69,7 +69,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -77,9 +76,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+use crate::engines::openai_http;
+#[cfg(test)]
+use crate::engines::ThinkTagSplitter;
 use crate::engines::{
-    model_prefills_think, DeltaChannel, Engine, GenerateRequest, GenerateResponse, ThinkTagSplitter,
+    model_prefills_think, DeltaChannel, Engine, GenerateRequest, GenerateResponse,
 };
+#[cfg(test)]
+use std::io::{Read, Write};
 
 /// Max stderr/stdout lines retained per stream for engine-crash
 /// diagnostics. The agent NEVER logs child output during normal
@@ -410,26 +414,11 @@ const READY_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Sized for a multi-tens-of-GB download on a slow link.
 const READY_HARD_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Per-request HTTP timeout against the subprocess. Inference can take
-/// 30+ seconds for long completions on a small Mac; 300s is the same
-/// ceiling vllm-mlx's `--timeout` uses by default.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Idle timeout between streamed body reads, applied only AFTER the
-/// engine has started emitting the response body. The wait for the
-/// *first* token is governed by `HTTP_TIMEOUT` instead (see
-/// `http_post_stream_uds`): a large tool-schema prompt can spend well
-/// over a minute in prefill on slow hardware before the first SSE byte,
-/// and that must not be mistaken for a mid-stream stall.
-const HTTP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Granularity at which the streaming read loop wakes to re-evaluate its
-/// time budgets. The socket read timeout is set to this short slice so a
-/// `WouldBlock`/`TimedOut` wakeup lets us decide whether we're still
-/// within the first-token (`HTTP_TIMEOUT`) or idle
-/// (`HTTP_STREAM_IDLE_TIMEOUT`) budget rather than bailing on the first
-/// quiet slice.
-const HTTP_STREAM_READ_POLL: Duration = Duration::from_secs(5);
+// The HTTP time budgets (`HTTP_TIMEOUT`, `HTTP_STREAM_IDLE_TIMEOUT`,
+// `HTTP_STREAM_READ_POLL`) live with the shared OpenAI-compatible client in
+// `openai_http` so the subprocess and attached engines cannot drift apart.
+#[cfg(test)]
+use crate::engines::openai_http::HTTP_STREAM_READ_POLL;
 
 /// vLLM/vllm-mlx tool-calling launch configuration.
 ///
@@ -555,20 +544,7 @@ pub struct SubprocessEngine {
     verified_tool_calls: Mutex<bool>,
 }
 
-fn tool_canary_passed(resp: &serde_json::Value) -> bool {
-    resp.pointer("/choices/0/message/tool_calls")
-        .and_then(|v| v.as_array())
-        .is_some_and(|calls| {
-            calls.iter().any(|call| {
-                call.pointer("/function/name").and_then(|v| v.as_str()) == Some("report_status")
-                    && call
-                        .pointer("/function/arguments")
-                        .and_then(|v| v.as_str())
-                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                        == Some(serde_json::json!({ "status": "ok" }))
-            })
-        })
-}
+use crate::engines::openai_http::tool_canary_passed;
 
 impl SubprocessEngine {
     /// Construct an engine bound to `model_id`. Does not spawn the
@@ -1001,40 +977,7 @@ impl SubprocessEngine {
     /// This keeps cocore out of the model/parser business: vLLM performs all
     /// formatting/parsing, and cocore only advertises what the backend proves.
     fn verify_tool_call_support(&self) -> Result<bool> {
-        let body = serde_json::json!({
-            "model": self.model_id.as_str(),
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a tool-calling canary. When a tool is forced, return exactly that tool call and no prose."
-                },
-                {
-                    "role": "user",
-                    "content": "Call report_status with status set to ok."
-                }
-            ],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "report_status",
-                        "description": "Report the tool-calling canary status.",
-                        "strict": true,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "status": { "type": "string" }
-                            },
-                            "required": ["status"],
-                            "additionalProperties": false
-                        }
-                    }
-                }
-            ],
-            "tool_choice": { "type": "function", "function": { "name": "report_status" } },
-            "max_tokens": 96,
-            "temperature": 0,
-        });
+        let body = openai_http::tool_canary_body(&self.model_id);
         let body_bytes = Zeroizing::new(serde_json::to_vec(&body)?);
         let resp_bytes = self.http_post_uds("/v1/chat/completions", &body_bytes)?;
         let resp: serde_json::Value = serde_json::from_slice(&resp_bytes).with_context(|| {
@@ -1052,29 +995,10 @@ impl SubprocessEngine {
     /// else (connect refused, 503, timeout) is treated as "not yet"
     /// and the caller retries.
     fn probe_ready(&self) -> bool {
-        // Short timeouts here — we're inside a polling loop and don't
-        // want a single hung probe to eat into the stall window.
         let Ok(mut stream) = UnixStream::connect(&self.socket_path) else {
             return false;
         };
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let req = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        if stream.write_all(req).is_err() {
-            return false;
-        }
-        let _ = stream.flush();
-        let mut buf = [0u8; 256];
-        let n = match stream.read(&mut buf) {
-            Ok(n) if n > 0 => n,
-            _ => return false,
-        };
-        // Look at the status line. `HTTP/1.1 2xx ...`.
-        let s = match std::str::from_utf8(&buf[..n]) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        s.starts_with("HTTP/1.1 2") || s.starts_with("HTTP/1.0 2")
+        openai_http::probe_models_ready(&mut stream, "localhost")
     }
 
     /// Best-effort liveness check. True when the child is running and
@@ -1095,9 +1019,9 @@ impl SubprocessEngine {
         }
     }
 
-    /// Synchronous HTTP/1.1 POST against the UDS. Hand-rolled to avoid
-    /// pulling in `hyperlocal` / `hyper` just for one route — the
-    /// agent binary already keeps a tight dep surface.
+    /// Synchronous HTTP/1.1 POST against the UDS. The client itself lives in
+    /// `openai_http` (shared with the attached engine); only the connect is
+    /// transport-specific.
     fn http_post_uds(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
         let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
             format!(
@@ -1105,177 +1029,18 @@ impl SubprocessEngine {
                 self.socket_path.display()
             )
         })?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
-
-        let req_head = format!(
-            "POST {path} HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            body.len()
-        );
-        stream
-            .write_all(req_head.as_bytes())
-            .context("writing HTTP request head")?;
-        stream
-            .write_all(body)
-            .context("writing HTTP request body")?;
-        stream.flush().ok();
-
-        let mut all = Vec::new();
-        stream
-            .read_to_end(&mut all)
-            .context("reading HTTP response")?;
-
-        // Find end-of-headers.
-        let hdr_end = all
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| anyhow!("no header/body separator in response"))?;
-        let headers = &all[..hdr_end];
-        let body_start = hdr_end + 4;
-        let body_bytes = &all[body_start..];
-
-        // Parse status line.
-        let status_line = std::str::from_utf8(headers)
-            .ok()
-            .and_then(|s| s.lines().next())
-            .ok_or_else(|| anyhow!("non-UTF8 response headers"))?;
-        let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
-        let status = parts
-            .get(1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .ok_or_else(|| anyhow!("could not parse status from {status_line:?}"))?;
-        if !(200..300).contains(&status) {
-            // Do NOT log the response body — vllm-mlx's error
-            // responses frequently echo back the request payload
-            // (including the prompt) in the `error.message` field
-            // and putting that into an anyhow chain would leak it
-            // through the agent's error log. Status + length is
-            // enough to triage; a structured replay against the
-            // engine reproduces the body when needed.
-            bail!(
-                "engine returned HTTP {status} ({} body bytes elided to avoid content logging)",
-                body_bytes.len()
-            );
-        }
-        Ok(body_bytes.to_vec())
+        openai_http::http_post(&mut stream, "localhost", path, body)
     }
 
-    /// Render a message's content into the OpenAI `chat.completions`
-    /// shape the engine server accepts. A text-only message keeps the
-    /// scalar-string form (byte-identical to the historical text path);
-    /// a message with images becomes the array-of-parts form, with each
-    /// image emitted as an `image_url` data URI — exactly what mlx-vlm's
-    /// OpenAI-compatible server consumes.
-    fn render_content(m: &crate::engines::Message) -> serde_json::Value {
-        use crate::engines::ContentPart;
-        if !m.has_images() {
-            return serde_json::Value::String(m.content_text());
-        }
-        let parts: Vec<serde_json::Value> = m
-            .content
-            .iter()
-            .map(|p| match p {
-                ContentPart::Text(text) => serde_json::json!({ "type": "text", "text": text }),
-                ContentPart::Image { mime, data_b64 } => serde_json::json!({
-                    "type": "image_url",
-                    "image_url": { "url": format!("data:{mime};base64,{data_b64}") },
-                }),
-            })
-            .collect();
-        serde_json::Value::Array(parts)
-    }
-
+    // Request/response codec. These are thin delegates kept under the
+    // engine's namespace so the (extensive) tests below read unchanged; the
+    // implementations moved to `openai_http` when the attached engine arrived.
+    #[cfg(test)]
     fn build_chat_body(request: &GenerateRequest, stream: bool) -> Result<serde_json::Value> {
-        let messages: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let mut msg = serde_json::json!({
-                    "role": m.role,
-                    "content": Self::render_content(m),
-                });
-                // Include tool_calls on assistant messages that have them.
-                if let Some(tool_calls) = &m.tool_calls {
-                    msg["tool_calls"] = serde_json::json!(tool_calls
-                        .iter()
-                        .map(|tc| serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function_name,
-                                "arguments": tc.function_arguments,
-                            }
-                        }))
-                        .collect::<Vec<_>>());
-                }
-                // Include tool_call_id on tool-role messages.
-                if let Some(id) = &m.tool_call_id {
-                    msg["tool_call_id"] = serde_json::json!(id);
-                }
-                msg
-            })
-            .collect();
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "stream": stream,
-        });
-        if let Some(t) = request.temperature {
-            body["temperature"] = serde_json::json!(t);
-        }
-        if let Some(p) = request.top_p {
-            body["top_p"] = serde_json::json!(p);
-        }
-        // Structured output: when the requester supplied a JSON Schema,
-        // pass it to vllm-mlx as an OpenAI-compatible `response_format`
-        // so the engine constrains decoding. The `guided_json` value is
-        // already shaped as `{ name, strict, schema }` — we wrap it in
-        // the `response_format.json_schema` envelope vllm-mlx expects.
-        if let Some(schema) = &request.guided_json {
-            body["response_format"] = serde_json::json!({
-                "type": "json_schema",
-                "json_schema": schema
-            });
-        }
-        // Tool calling: forward tools and tool_choice to the engine as
-        // OpenAI-compatible fields so the model can invoke functions.
-        if let Some(tools) = &request.tools {
-            body["tools"] = tools.clone();
-        }
-        if let Some(choice) = &request.tool_choice {
-            body["tool_choice"] = choice.clone();
-        }
-        Ok(body)
+        openai_http::build_chat_body(request, stream)
     }
 
-    fn find_header_end(buf: &[u8]) -> Option<usize> {
-        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-    }
-
-    fn parse_http_status(headers: &[u8]) -> Result<u16> {
-        let s = std::str::from_utf8(headers).context("response headers not UTF-8")?;
-        let line = s
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("empty HTTP response"))?;
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-        parts
-            .get(1)
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| anyhow!("could not parse status from {line:?}"))
-    }
-
-    /// Drain complete `data:` lines from an SSE body buffer. Returns
-    /// when the buffer ends mid-line so the caller can read more bytes.
-    ///
-    /// The boolean return value reports whether this call emitted at least
-    /// one meaningful, user-visible delta (content, reasoning, or tool_calls).
+    #[cfg(test)]
     fn process_sse_buffer(
         buf: &mut Vec<u8>,
         cursor: &mut usize,
@@ -1283,84 +1048,7 @@ impl SubprocessEngine {
         on_data: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
         tokens: &mut (u64, u64),
     ) -> Result<bool> {
-        let mut emitted_delta = false;
-        while *cursor < buf.len() {
-            let rest = &buf[*cursor..];
-            let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let mut line = &rest[..nl];
-            *cursor += nl + 1;
-            if line.ends_with(b"\r") {
-                line = &line[..line.len() - 1];
-            }
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(s) = std::str::from_utf8(line) else {
-                continue;
-            };
-            let Some(data) = s.strip_prefix("data: ") else {
-                continue;
-            };
-            if data == "[DONE]" {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            // Reasoning ("thinking") arrives on a sibling field in
-            // vLLM/DeepSeek-style servers; forward it verbatim on the
-            // Reasoning channel.
-            if let Some(reasoning) = v
-                .pointer("/choices/0/delta/reasoning_content")
-                .or_else(|| v.pointer("/choices/0/delta/reasoning"))
-                .and_then(|c| c.as_str())
-            {
-                if !reasoning.is_empty() {
-                    emitted_delta = true;
-                    on_data(DeltaChannel::Reasoning, reasoning)?;
-                }
-            }
-            // Tool calls arrive as structured `tool_calls` deltas —
-            // forward the raw JSON array on the ToolCall channel so the
-            // provider can seal and forward it. The client reassembles
-            // the fragments into complete tool calls.
-            if let Some(tool_calls) = v.pointer("/choices/0/delta/tool_calls") {
-                if !tool_calls.is_null() {
-                    let json = serde_json::to_string(tool_calls).unwrap_or_default();
-                    if !json.is_empty() {
-                        emitted_delta = true;
-                        on_data(DeltaChannel::ToolCall, &json)?;
-                    }
-                }
-            }
-            // The answer text may itself carry inline <think>...</think>
-            // markers (local MLX models that don't use a reasoning field);
-            // the splitter separates those, buffering across deltas.
-            if let Some(content) = v
-                .pointer("/choices/0/delta/content")
-                .and_then(|c| c.as_str())
-            {
-                if !content.is_empty() {
-                    emitted_delta = true;
-                    splitter.push(content, on_data)?;
-                }
-            }
-            if let Some(u) = v.get("usage") {
-                if let Some(p) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                    tokens.0 = p;
-                }
-                if let Some(c) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
-                    tokens.1 = c;
-                }
-            }
-        }
-        if *cursor > 8192 {
-            buf.drain(..*cursor);
-            *cursor = 0;
-        }
-        Ok(emitted_delta)
+        openai_http::process_sse_buffer(buf, cursor, splitter, on_data, tokens)
     }
 
     fn http_post_stream_uds(
@@ -1376,126 +1064,14 @@ impl SubprocessEngine {
                 self.socket_path.display()
             )
         })?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        // Poll in short slices; the loop below converts a quiet slice into a
-        // first-token vs. mid-stream-stall decision against the budgets above.
-        stream.set_read_timeout(Some(HTTP_STREAM_READ_POLL))?;
-
-        let req_head = format!(
-            "POST {path} HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            body.len()
-        );
-        stream
-            .write_all(req_head.as_bytes())
-            .context("writing HTTP request head")?;
-        stream
-            .write_all(body)
-            .context("writing HTTP request body")?;
-        stream.flush().ok();
-
-        let mut buf = Vec::new();
-        let mut read_buf = [0u8; 4096];
-        let mut header_end: Option<usize> = None;
-        let mut body_cursor = 0usize;
-        let mut tokens = (0u64, 0u64);
-        let mut splitter = if start_in_reasoning {
-            ThinkTagSplitter::new_in_reasoning()
-        } else {
-            ThinkTagSplitter::new()
-        };
-
-        let started = Instant::now();
-        let mut last_progress = Instant::now();
-        let mut meaningful_stream_started = false;
-
-        loop {
-            let n = match stream.read(&mut read_buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                // A read interrupted by a signal is not an error — re-arm.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // The socket read timeout (`SO_RCVTIMEO`) expired with no
-                // bytes this slice. Rust maps that to `WouldBlock` on Unix
-                // (EAGAIN, "Resource temporarily unavailable", os error 35)
-                // and `TimedOut` on Windows — both mean the same thing here.
-                // Decide whether we're still within budget or genuinely stuck.
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if meaningful_stream_started {
-                        if last_progress.elapsed() > HTTP_STREAM_IDLE_TIMEOUT {
-                            bail!(
-                                "engine stream stalled (no bytes for {}s)",
-                                HTTP_STREAM_IDLE_TIMEOUT.as_secs()
-                            );
-                        }
-                    } else if started.elapsed() > HTTP_TIMEOUT {
-                        // Still waiting for the first token. Tool-enabled
-                        // requests carry the full tool schemas, so prefill of
-                        // a big prompt on slow hardware can legitimately run
-                        // for minutes before the first SSE byte; allow the
-                        // same ceiling the non-streaming path uses.
-                        bail!(
-                            "engine produced no output within {}s",
-                            HTTP_TIMEOUT.as_secs()
-                        );
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let read_at = Instant::now();
-            buf.extend_from_slice(&read_buf[..n]);
-
-            if header_end.is_none() {
-                if let Some(end) = Self::find_header_end(&buf) {
-                    let status = Self::parse_http_status(&buf[..end.saturating_sub(4)])?;
-                    if !(200..300).contains(&status) {
-                        bail!(
-                            "engine returned HTTP {status} (streaming body elided to avoid content logging)"
-                        );
-                    }
-                    header_end = Some(end);
-                    body_cursor = end;
-                } else {
-                    // Headers still incomplete — keep reading. (uvicorn flushes
-                    // the response head before the model's first token, so a
-                    // long prefill gap lands AFTER this point, not here.)
-                    continue;
-                }
-            }
-            // Do not treat every SSE body byte as meaningful stream progress:
-            // vLLM/vllm-mlx often emits an initial role/empty chunk, then goes
-            // quiet while it finishes a buffered tool call. Stay on the longer
-            // first-token budget until we see content, reasoning, or tool_calls.
-            // Once meaningful output has started, any subsequent body byte is
-            // progress for the mid-stream idle timer.
-            let emitted_delta = Self::process_sse_buffer(
-                &mut buf,
-                &mut body_cursor,
-                &mut splitter,
-                on_delta,
-                &mut tokens,
-            )?;
-            if emitted_delta {
-                meaningful_stream_started = true;
-            }
-            if meaningful_stream_started {
-                last_progress = read_at;
-            }
-        }
-        // Flush any partial <think> marker held at end of stream.
-        splitter.finish(on_delta)?;
-
-        Ok(tokens)
+        openai_http::http_post_stream(
+            &mut stream,
+            "localhost",
+            path,
+            body,
+            start_in_reasoning,
+            on_delta,
+        )
     }
 }
 
@@ -1593,36 +1169,10 @@ impl Engine for SubprocessEngine {
     }
 
     fn generate_once(&self, request: &GenerateRequest) -> Result<GenerateResponse> {
-        let body = Self::build_chat_body(request, false)?;
+        let body = openai_http::build_chat_body(request, false)?;
         let body_bytes = Zeroizing::new(serde_json::to_vec(&body)?);
-
         let resp_bytes = self.http_post_uds("/v1/chat/completions", &body_bytes)?;
-        let resp: serde_json::Value = serde_json::from_slice(&resp_bytes).with_context(|| {
-            format!(
-                "parsing engine JSON response ({} body bytes elided to avoid content logging)",
-                resp_bytes.len()
-            )
-        })?;
-
-        let text = resp
-            .pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tokens_in = resp
-            .pointer("/usage/prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let tokens_out = resp
-            .pointer("/usage/completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        Ok(GenerateResponse {
-            text,
-            tokens_in,
-            tokens_out,
-        })
+        openai_http::parse_once_response(&resp_bytes)
     }
 
     fn generate_stream(
@@ -1630,7 +1180,7 @@ impl Engine for SubprocessEngine {
         request: &GenerateRequest,
         on_delta: &mut dyn FnMut(DeltaChannel, &str) -> Result<()>,
     ) -> Result<GenerateResponse> {
-        let body = Self::build_chat_body(request, true)?;
+        let body = openai_http::build_chat_body(request, true)?;
         let body_bytes = Zeroizing::new(serde_json::to_vec(&body)?);
         let (tokens_in, tokens_out) = self.http_post_stream_uds(
             "/v1/chat/completions",

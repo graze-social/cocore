@@ -52,6 +52,15 @@
         <string>@@INFERENCE_MODELS@@</string>
         <key>COCORE_PYTHON_VENV</key>
         <string>@@PYTHON_VENV@@</string>
+        <!-- Attached engines (optional): serve a model through an
+             OpenAI-compatible server you run yourself (mei, mlx_lm.server,
+             llama-server) instead of the vllm-mlx child. Either set
+             COCORE_ENGINE_MAP here — `model-id=http://127.0.0.1:8024`,
+             comma-separated — or, without touching this plist, list the
+             same entries one per line in ~/.cocore/engine-map. A model in
+             the map is never spawned under vllm-mlx, and a machine whose
+             every model is attached needs no Python venv at all. See
+             docs/attached-engine.md. -->
         <!-- LaunchAgents inherit a minimal environment that defaults
              to ASCII. Several tokenizer / chat-template files vllm-mlx
              ships have non-ASCII characters (Gemma 3 in particular),

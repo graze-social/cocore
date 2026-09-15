@@ -32,7 +32,7 @@ import { err } from "@cocore/o11y/http";
 import type { BrokerageAuthority } from "./brokerage.ts";
 import { dispatchOutcome } from "./metrics.ts";
 import type { AdvisorMessage, InferenceRequest } from "./protocol.ts";
-import { supportsToolCallsFor } from "./registry.ts";
+import { hasCapacityFor, supportsStructuredOutputFor, supportsToolCallsFor } from "./registry.ts";
 import type { ProviderEntry, ProviderRegistry } from "./registry.ts";
 import type { SseResponse } from "./sessions.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -302,6 +302,7 @@ async function selectProvider(
   // on a sibling machine serving the same model WITHOUT tool calling enabled,
   // whose vLLM then rejects the request mid-stream.
   const wantsToolCalls = Array.isArray(job.tools) && job.tools.length > 0;
+  const wantsStructuredOutput = job.outputSchema !== undefined && job.outputSchema !== null;
 
   // Build the candidate list. A pinned `targetProviderDid` restricts
   // dispatch to that owner's machines (optionally a single machine via
@@ -349,6 +350,9 @@ async function selectProvider(
       if (wantsToolCalls && !supportsToolCallsFor(m, job.model || undefined)) {
         return false;
       }
+      if (wantsStructuredOutput && !supportsStructuredOutputFor(m, job.model || undefined)) {
+        return false;
+      }
       return true;
     });
     if (eligible.length === 0) {
@@ -363,11 +367,13 @@ async function selectProvider(
         status: 503,
         error: wantsToolCalls
           ? `provider ${job.targetProviderDid} has no machine with verified tool-calling for this model available`
-          : job.minProviderVersion
-            ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
-            : allCooling
-              ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
-              : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
+          : wantsStructuredOutput
+            ? `provider ${job.targetProviderDid} has no machine with verified structured output (response_format) for this model available`
+            : job.minProviderVersion
+              ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
+              : allCooling
+                ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
+                : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
       };
     }
     eligible.sort((a, b) => b.lastSeen - a.lastSeen);
@@ -380,6 +386,7 @@ async function selectProvider(
       Date.now(),
       job.minProviderVersion ?? null,
       wantsToolCalls,
+      wantsStructuredOutput,
     );
     if (candidates.length === 0) {
       return {
@@ -387,9 +394,11 @@ async function selectProvider(
         status: 503,
         error: wantsToolCalls
           ? "no attested providers with verified tool-calling for this model available"
-          : job.minProviderVersion
-            ? `no attested providers at version >= ${job.minProviderVersion} available`
-            : "no attested providers available",
+          : wantsStructuredOutput
+            ? "no attested providers with verified structured output (response_format) for this model available"
+            : job.minProviderVersion
+              ? `no attested providers at version >= ${job.minProviderVersion} available`
+              : "no attested providers available",
       };
     }
   }
@@ -406,9 +415,27 @@ async function selectProvider(
   // behave exactly as before. The eligibility + preflight guarantees are
   // untouched — every candidate here is already attested, active, healthy,
   // and model-matching, and still gets a liveness ping before dispatch.
-  candidates = [...candidates].sort((a, b) => {
-    const loadA = ctx.sessions.inflightFor(a.did, a.machineId);
-    const loadB = ctx.sessions.inflightFor(b.did, b.machineId);
+  const modelForLoad = job.model || undefined;
+  // Saturation: a provider that reports a per-model admission ceiling
+  // (`model_capacity`) will REFUSE a job once that many are in flight for the
+  // model — single-flight engines such as vllm-mlx and mei run one
+  // generation at a time and hold one in a queue. Dispatching to it anyway
+  // just hands the requester a typed `engine-busy` error after the fact, so
+  // drop saturated machines here. If every machine is saturated we report
+  // no-capacity (503) rather than pick one that will refuse.
+  const withRoom = candidates.filter((c) =>
+    hasCapacityFor(c, ctx.sessions.inflightFor(c.did, c.machineId, modelForLoad)),
+  );
+  if (withRoom.length === 0) {
+    return {
+      kind: "error",
+      status: 503,
+      error: `every provider for this model is at capacity (${candidates.length} busy); retry shortly`,
+    };
+  }
+  candidates = withRoom.sort((a, b) => {
+    const loadA = ctx.sessions.inflightFor(a.did, a.machineId, modelForLoad);
+    const loadB = ctx.sessions.inflightFor(b.did, b.machineId, modelForLoad);
     if (loadA !== loadB) return loadA - loadB;
     return b.lastSeen - a.lastSeen;
   });
@@ -486,6 +513,7 @@ function dispatch(
     sink,
     receivedAt,
     resumeToken,
+    job.model || undefined,
   );
 
   // ADR-0004: countersign this dispatch so the receipt can prove a trusted

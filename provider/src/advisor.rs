@@ -21,7 +21,7 @@
 
 use crate::canonical::to_canonical_bytes;
 use crate::crypto::{EncryptionKey, ProviderKeypair};
-use crate::engines::{DeltaChannel, Engine, EngineRegistry};
+use crate::engines::{rejection_of, DeltaChannel, Engine, EngineRegistry};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
 use crate::pds::{effective_tool_calls, PdsClient, ProBonoPolicy};
@@ -2175,7 +2175,58 @@ async fn handle_inference_request_inner(
     };
     let (engine_tokens_in, engine_tokens_out) = match engine_result {
         Ok(resp) => (resp.tokens_in, resp.tokens_out),
+        // The engine REFUSED the job (admission gate full, structured output
+        // not verified) before generation began. That is not a completed job:
+        // no receipt is published and nothing is billed — issue #202's
+        // "do not publish or settle a normal inference receipt when
+        // generation never began". The requester gets a sealed, typed error
+        // and a completion with no receipt, exactly like a model miss.
         Err(e) => {
+            if seq == 0 {
+                if let Some(rejection) = rejection_of(&e) {
+                    tracing::info!(
+                        code = rejection.code(),
+                        engine = engine.name(),
+                        model = %req.model,
+                        session_id = %session_id,
+                        "engine refused the job before generation; completing without a receipt"
+                    );
+                    let err = format!("[cocore provider] {}: {}", rejection.code(), rejection);
+                    if let Ok(ct) = ctx
+                        .encryption
+                        .seal_to(&req.requester_pub_key, err.as_bytes())
+                    {
+                        push_frame(
+                            live_tx.as_ref(),
+                            &mut collected,
+                            AdvisorMessage::InferenceChunk(InferenceChunk {
+                                session_id: session_id.clone(),
+                                seq: 0,
+                                channel: ChunkChannel::Content,
+                                ciphertext: ct,
+                            }),
+                        );
+                    }
+                    push_frame(
+                        live_tx.as_ref(),
+                        &mut collected,
+                        AdvisorMessage::InferenceComplete(InferenceComplete {
+                            session_id,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            receipt_uri: String::new(),
+                            final_seq: None,
+                            receipt_commit_rev: None,
+                            receipt_commit_cid: None,
+                        }),
+                    );
+                    return if live_tx.is_some() {
+                        Vec::new()
+                    } else {
+                        collected
+                    };
+                }
+            }
             tracing::warn!(
                 error = %e,
                 engine = engine.name(),
@@ -3817,6 +3868,148 @@ mod tests {
                 assert!(c.receipt_uri.is_empty(), "publish failure => empty URI");
             }
             other => panic!("expected InferenceComplete, got {other:?}"),
+        }
+    }
+
+    /// A PDS stand-in that only counts connection attempts, so a test can
+    /// tell "publish attempted" from "publish skipped".
+    fn counting_pds() -> (PdsClient, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                use std::io::Write;
+                let _ = conn.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let pds = PdsClient::new(Session {
+            did: "did:plc:test".into(),
+            handle: "test.example".into(),
+            api_key: "cocore-fake".into(),
+            api_base: format!("http://127.0.0.1:{port}"),
+        });
+        (pds, hits)
+    }
+
+    /// An engine that refuses every job with a typed rejection.
+    struct RefusingEngine(crate::engines::EngineRejection);
+    impl Engine for RefusingEngine {
+        fn name(&self) -> &'static str {
+            "refusing"
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn generate_once(
+            &self,
+            _r: &crate::engines::GenerateRequest,
+        ) -> anyhow::Result<crate::engines::GenerateResponse> {
+            Err(self.0.clone().into())
+        }
+    }
+
+    fn schema_request(
+        requester_kp: &ProviderKeypair,
+        provider_kp: &ProviderKeypair,
+        model: &str,
+    ) -> InferenceRequest {
+        let ct = requester_kp
+            .seal_to(&provider_kp.public_key_b64(), b"hello")
+            .unwrap();
+        InferenceRequest {
+            job_uri: "at://did:plc:requester/dev.cocore.compute.job/rrr".into(),
+            job_cid: Some("bafyjob".into()),
+            requester_did: "did:plc:requester".into(),
+            requester_pub_key: requester_kp.public_key_b64(),
+            model: model.into(),
+            max_tokens_out: 4,
+            ciphertext: ct,
+            input_format: None,
+            session_id: "refused".into(),
+            resume_token: None,
+            nonce: None,
+            attestation_cid: None,
+            output_schema: None,
+            tools: None,
+            tool_choice: None,
+            tool_choice_function: None,
+            brokerage_countersignature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_rejection_completes_without_touching_the_pds() {
+        use std::sync::atomic::Ordering;
+        let signer = load_or_create_identity().unwrap();
+        let provider_kp = fresh_keypair();
+        let requester_kp = fresh_keypair();
+        let attestation = StrongRef {
+            uri: "at://did:plc:test/dev.cocore.compute.attestation/aaa".into(),
+            cid: "bafyatt".into(),
+        };
+
+        // Control: the stub engine on the same inputs DOES attempt a publish.
+        let (pds, hits) = counting_pds();
+        let engines = stub_registry();
+        let cx = ctx(&*signer, &provider_kp, &pds, Some(&attestation), &engines);
+        let _ = handle_inference_request(schema_request(&requester_kp, &provider_kp, "stub"), &cx)
+            .await;
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "control: a completed job publishes a receipt"
+        );
+
+        // Refused jobs: sealed typed error, completion, and ZERO PDS traffic.
+        for rejection in [
+            crate::engines::EngineRejection::Busy {
+                model: "m".into(),
+                in_flight: 2,
+                capacity: 2,
+            },
+            crate::engines::EngineRejection::StructuredOutputUnsupported { model: "m".into() },
+        ] {
+            let (pds, hits) = counting_pds();
+            let mut engines = EngineRegistry::new();
+            engines.register("m", Arc::new(RefusingEngine(rejection.clone())));
+            let cx = ctx(&*signer, &provider_kp, &pds, Some(&attestation), &engines);
+            let replies =
+                handle_inference_request(schema_request(&requester_kp, &provider_kp, "m"), &cx)
+                    .await;
+            assert_eq!(
+                replies.len(),
+                2,
+                "one error chunk + one completion, got {replies:?}"
+            );
+            let AdvisorMessage::InferenceChunk(chunk) = &replies[0] else {
+                panic!("expected error chunk first, got {:?}", replies[0]);
+            };
+            let text = requester_kp
+                .open_from(&provider_kp.public_key_b64(), &chunk.ciphertext)
+                .unwrap();
+            let text = String::from_utf8(text).unwrap();
+            assert!(
+                text.starts_with(&format!("[cocore provider] {}:", rejection.code())),
+                "{text}"
+            );
+            match &replies[1] {
+                AdvisorMessage::InferenceComplete(c) => {
+                    assert!(c.receipt_uri.is_empty());
+                    assert_eq!((c.tokens_in, c.tokens_out), (0, 0));
+                }
+                other => panic!("expected InferenceComplete, got {other:?}"),
+            }
+            // Give any stray publish a moment to show up, then assert none did.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "a refused job must not publish a receipt"
+            );
         }
     }
 }

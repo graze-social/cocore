@@ -104,7 +104,7 @@ pub async fn run(cmd: ModelsCmd) -> Result<()> {
             // machine disappears from the model page with no error
             // anywhere. `stub` is always addable; everything else
             // needs the venv.
-            check_model_addable(&m, venv_python_present())?;
+            check_model_addable(&m, venv_python_present() || attached_in_engine_map(&m))?;
             let mut current = read_current()?;
             if current.contains(&m) {
                 println!("'{m}' is already in the list; no change.");
@@ -422,8 +422,8 @@ fn delete_env_var(plist: &Path, key: &str) -> Result<()> {
 /// triggered by a different missing dependency.
 ///
 /// The `stub` engine doesn't need the venv; it's always addable.
-fn check_model_addable(model: &str, venv_present: bool) -> Result<()> {
-    if model == "stub" || venv_present {
+fn check_model_addable(model: &str, venv_present_or_attached: bool) -> Result<()> {
+    if model == "stub" || venv_present_or_attached {
         return Ok(());
     }
     anyhow::bail!(
@@ -435,8 +435,22 @@ fn check_model_addable(model: &str, venv_present: bool) -> Result<()> {
          curl -fsSL cocore.dev/agent | sh\n\
          \n\
          (Re-running the installer is idempotent — it won't redo work\n\
-         that's already done.)"
+         that's already done.)\n\
+         \n\
+         Serving this model through your own OpenAI-compatible server\n\
+         instead (mei, mlx_lm.server, llama-server)? Add it to\n\
+         ~/.cocore/engine-map as `{model} = http://127.0.0.1:<port>` —\n\
+         attached models need no venv. See docs/attached-engine.md."
     )
+}
+
+/// True when the operator's engine map (`COCORE_ENGINE_MAP` or
+/// `~/.cocore/engine-map`) routes `model` to an attached OpenAI-compatible
+/// server — such a model is served without the Python venv.
+fn attached_in_engine_map(model: &str) -> bool {
+    cocore_provider::engines::attached::EngineMap::from_env_or_file()
+        .map(|m| m.contains(model))
+        .unwrap_or(false)
 }
 
 /// True when the venv `uv` provisions during install exists and looks

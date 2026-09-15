@@ -224,6 +224,21 @@ pub struct Register {
     /// tool-capability gating should require the requested model to be listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_models: Option<Vec<String>>,
+    /// Model ids whose engines are verified to honour `response_format:
+    /// json_schema`. The vllm-mlx subprocess engine always constrains
+    /// decoding; an attached engine (`COCORE_ENGINE_MAP`) is listed only
+    /// after its startup structured-output canary passed. Absent on agents
+    /// that predate the field — advisors treat that as "every advertised
+    /// model", preserving the old routing. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_models: Option<Vec<String>>,
+    /// Per-model in-flight ceiling this machine accepts before its admission
+    /// gate refuses a job with `engine-busy` (running + queued slots; 2 for
+    /// every single-flight backend we ship). The advisor uses it to skip a
+    /// saturated machine instead of dispatching a job that would be refused.
+    /// Absent = no gate (legacy agent). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_capacity: Option<u32>,
     /// Version string of this agent binary (`env!("CARGO_PKG_VERSION")`,
     /// e.g. `0.9.32`), echoed live so the advisor can route version-gated
     /// jobs — a request that needs a feature only present from some release
