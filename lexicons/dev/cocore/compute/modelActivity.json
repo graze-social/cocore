@@ -4,35 +4,76 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Aggregate receipt activity per model and per time window. Walks the most-recent indexed receipts (capped at 5000), groups by `body.model`, and tallies requests + tokens across the hour/day/week/month windows, with per-provider breakdowns.",
+      "description": "Aggregate receipt activity per model and per time window. Walks the most-recent indexed receipts (capped at 5000), groups by `body.model`, and tallies requests + tokens across the hour/day/week/month windows, with per-provider breakdowns. The scan cap is reported back as `scanned`/`scanLimit`/`truncated` so consumers can tell an exact total from a lower bound; `oldestScannedAt` is the earliest receipt that contributed to any window.",
       "output": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["generatedAt", "models"],
+          "required": [
+            "generatedAt",
+            "models"
+          ],
           "properties": {
-            "generatedAt": { "type": "string", "format": "datetime" },
+            "generatedAt": {
+              "type": "string",
+              "format": "datetime"
+            },
             "models": {
               "type": "array",
               "items": {
                 "type": "object",
-                "required": ["modelId", "totals", "byProvider"],
+                "required": [
+                  "modelId",
+                  "totals",
+                  "byProvider"
+                ],
                 "properties": {
-                  "modelId": { "type": "string" },
-                  "totals": { "type": "ref", "ref": "dev.cocore.defs#activityWindows" },
+                  "modelId": {
+                    "type": "string"
+                  },
+                  "totals": {
+                    "type": "ref",
+                    "ref": "dev.cocore.defs#activityWindows"
+                  },
                   "byProvider": {
                     "type": "array",
                     "items": {
                       "type": "object",
-                      "required": ["did", "stats"],
+                      "required": [
+                        "did",
+                        "stats"
+                      ],
                       "properties": {
-                        "did": { "type": "string", "format": "did" },
-                        "stats": { "type": "ref", "ref": "dev.cocore.defs#activityWindows" }
+                        "did": {
+                          "type": "string",
+                          "format": "did"
+                        },
+                        "stats": {
+                          "type": "ref",
+                          "ref": "dev.cocore.defs#activityWindows"
+                        }
                       }
                     }
                   }
                 }
               }
+            },
+            "scanned": {
+              "type": "integer",
+              "description": "Number of indexed receipts this scan walked."
+            },
+            "scanLimit": {
+              "type": "integer",
+              "description": "Cap the scan applied (receipts are walked newest-first)."
+            },
+            "truncated": {
+              "type": "boolean",
+              "description": "True when the scan filled its cap, so older receipts exist that these totals do not include. The wider windows (week/month) are then lower bounds."
+            },
+            "oldestScannedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Earliest receipt timestamp that contributed to any window, so a consumer can state the coverage of the counts. Absent when nothing counted."
             }
           }
         }

@@ -45,6 +45,7 @@ export function NavbarDiscoverMenu({ profileId }: { profileId?: string | null })
         ) : null}
         {profileId ? <NavbarRouterLink to="/friends">friends</NavbarRouterLink> : null}
         <NavbarRouterLink to="/models">models</NavbarRouterLink>
+        <NavbarRouterLink to="/models/capacity">capacity</NavbarRouterLink>
         <NavbarRouterLink to="/leaderboard">leaderboard</NavbarRouterLink>
         <NavbarRouterLink to="/explore">explore</NavbarRouterLink>
       </NavbarMenuList>
