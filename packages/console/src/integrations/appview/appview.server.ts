@@ -168,6 +168,17 @@ interface AppviewModelActivityEntry {
 export type AppviewModelActivityResponse = {
   generatedAt: string;
   models: AppviewModelActivityEntry[];
+  /** How many indexed receipts the AppView's scan walked, and the cap it
+   *  applied. Optional: an older AppView deploy omits them. */
+  scanned?: number;
+  scanLimit?: number;
+  /** True when the scan filled its cap, so the wider windows (week/month)
+   *  are lower bounds rather than exact counts. Consumers that report a 7d
+   *  figure should say so — see model-supply-demand.server.ts. */
+  truncated?: boolean;
+  /** Earliest receipt that contributed to any window, so a caller can state
+   *  the coverage of the counts it renders. */
+  oldestScannedAt?: string | null;
 };
 
 export type AppviewVerifyReceiptResponse = {

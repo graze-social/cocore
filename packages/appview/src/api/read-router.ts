@@ -35,6 +35,7 @@ import { verifyReceipt, verifySettlementChain } from "@cocore/sdk/validate";
 
 import { hydrateDids } from "../bsky-hydrate.ts";
 import type { Store } from "../store.ts";
+import { aggregateModelActivity, MODEL_ACTIVITY_SCAN_LIMIT } from "./model-activity.ts";
 import { clampInt, parseIntOr } from "./query.ts";
 import { err, ok, searchParams } from "./http-app.ts";
 
@@ -279,71 +280,15 @@ export function buildReadRouter(
           return ok(modelActivityCache.body);
         }
         // Aggregate receipt activity per model + per time window (1h/24h/7d/
-        // 30d), with per-provider counts, over the 5000 most-recent receipts.
-        const now = Date.now();
-        const windows = {
-          hour: now - 60 * 60_000,
-          day: now - 24 * 60 * 60_000,
-          week: now - 7 * 24 * 60 * 60_000,
-          month: now - 30 * 24 * 60 * 60_000,
-        } as const;
-        type Window = keyof typeof windows;
-        const emptyStats = (): Record<Window, { requests: number; tokens: number }> => ({
-          hour: { requests: 0, tokens: 0 },
-          day: { requests: 0, tokens: 0 },
-          week: { requests: 0, tokens: 0 },
-          month: { requests: 0, tokens: 0 },
-        });
-        const byModel = new Map<string, ReturnType<typeof emptyStats>>();
-        const byModelProvider = new Map<string, Map<string, ReturnType<typeof emptyStats>>>();
-        const rows = store.listByCollection("dev.cocore.compute.receipt", 5000);
-        for (const row of rows) {
-          const body = row.body as {
-            model?: string;
-            tokens?: { in?: number; out?: number };
-            completedAt?: string;
-          };
-          const model = body.model;
-          if (typeof model !== "string" || model.length === 0) continue;
-          const completedAtMs = body.completedAt ? Date.parse(body.completedAt) : Number.NaN;
-          const tsMs = Number.isFinite(completedAtMs)
-            ? completedAtMs
-            : Date.parse(row.indexedAt ?? "");
-          if (!Number.isFinite(tsMs)) continue;
-          const tokens = (body.tokens?.in ?? 0) + (body.tokens?.out ?? 0);
-          let modelStats = byModel.get(model);
-          if (!modelStats) {
-            modelStats = emptyStats();
-            byModel.set(model, modelStats);
-          }
-          let providerMap = byModelProvider.get(model);
-          if (!providerMap) {
-            providerMap = new Map();
-            byModelProvider.set(model, providerMap);
-          }
-          let providerStats = providerMap.get(row.repo);
-          if (!providerStats) {
-            providerStats = emptyStats();
-            providerMap.set(row.repo, providerStats);
-          }
-          for (const w of ["hour", "day", "week", "month"] as Window[]) {
-            if (tsMs >= windows[w]) {
-              modelStats[w].requests += 1;
-              modelStats[w].tokens += tokens;
-              providerStats[w].requests += 1;
-              providerStats[w].tokens += tokens;
-            }
-          }
-        }
-        const models = Array.from(byModel.entries()).map(([modelId, stats]) => ({
-          modelId,
-          totals: stats,
-          byProvider: Array.from(byModelProvider.get(modelId)?.entries() ?? []).map(([did, s]) => ({
-            did,
-            stats: s,
-          })),
-        }));
-        const body = { generatedAt: new Date().toISOString(), models };
+        // 30d), with per-provider counts, over the most-recent receipts. The
+        // arithmetic lives in model-activity.ts so it can be tested without a
+        // store; the response reports its own scan coverage so a consumer can
+        // tell a truncated week total from an exact one.
+        const rows = store.listByCollection(
+          "dev.cocore.compute.receipt",
+          MODEL_ACTIVITY_SCAN_LIMIT,
+        );
+        const body = aggregateModelActivity(rows, Date.now(), MODEL_ACTIVITY_SCAN_LIMIT);
         modelActivityCache = { at: Date.now(), body };
         return ok(body);
       }).pipe(Effect.withSpan("appview.modelActivity")),

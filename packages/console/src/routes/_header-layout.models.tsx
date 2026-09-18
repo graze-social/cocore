@@ -917,6 +917,9 @@ function ModelsPage() {
           </div>
         </Flex>
         <Page.Actions>
+          <ButtonLink to="/models/capacity" preload="intent" variant="outline" size="sm">
+            capacity
+          </ButtonLink>
           <ButtonLink to="/docs/inference" preload="intent" variant="outline" size="sm">
             API docs
           </ButtonLink>
