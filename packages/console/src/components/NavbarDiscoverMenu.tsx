@@ -44,7 +44,13 @@ export function NavbarDiscoverMenu({ profileId }: { profileId?: string | null })
           </NavbarRouterLink>
         ) : null}
         {profileId ? <NavbarRouterLink to="/friends">friends</NavbarRouterLink> : null}
-        <NavbarRouterLink to="/models">models</NavbarRouterLink>
+        {/* `exact` because /models/capacity is a path descendant of /models.
+            TanStack's default (fuzzy) active matching would underline BOTH
+            items whenever you're on the capacity page. The parent "discover"
+            trigger still highlights for either — see isDiscoverPath. */}
+        <NavbarRouterLink to="/models" activeOptions={{ exact: true }}>
+          models
+        </NavbarRouterLink>
         <NavbarRouterLink to="/models/capacity">capacity</NavbarRouterLink>
         <NavbarRouterLink to="/leaderboard">leaderboard</NavbarRouterLink>
         <NavbarRouterLink to="/explore">explore</NavbarRouterLink>
