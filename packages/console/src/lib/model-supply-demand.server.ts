@@ -35,7 +35,7 @@ import { runTraced } from "@/lib/o11y.server.ts";
  *  AppView scans the most-recent N receipts, so on a busy network a 7d total
  *  can be a lower bound; we pass that through instead of letting the page
  *  present a truncated number as an exact one. */
-export interface DemandCoverage {
+interface DemandCoverage {
   /** Receipts the AppView's scan walked. null when it didn't report. */
   scanned: number | null;
   /** True when the scan hit its cap — the window totals are lower bounds. */

@@ -362,7 +362,10 @@ describe("buildSupplyDemand states", () => {
   });
 
   test("a model with demand but no live supply still gets a row", () => {
-    const snapshot = build([machine("did:plc:a", "m1", ["qwen"])], demand([{ modelId: "gone", day: [3, 30] }]));
+    const snapshot = build(
+      [machine("did:plc:a", "m1", ["qwen"])],
+      demand([{ modelId: "gone", day: [3, 30] }]),
+    );
     const gone = row(snapshot, "gone");
     assert.equal(gone.advertising, 0);
     assert.equal(gone.healthy, 0);
@@ -582,10 +585,10 @@ describe("buildSupplyDemand against the live fleet shape", () => {
     assert.equal(qwen35.state, "steady");
 
     // "needs help" first: stranded demand, then the hottest served model.
-    assert.deepEqual(snapshot.rows.slice(0, 2).map((r) => r.modelId), [
-      "google/gemma-4-12b",
-      "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    ]);
+    assert.deepEqual(
+      snapshot.rows.slice(0, 2).map((r) => r.modelId),
+      ["google/gemma-4-12b", "mlx-community/Qwen2.5-7B-Instruct-4bit"],
+    );
     assert.equal(snapshot.totals.machines, 6);
     assert.equal(snapshot.totals.healthyMachines, 5);
   });
@@ -619,7 +622,12 @@ describe("windowFullyCovered", () => {
 
   test("a truncated scan that didn't reach back a full day undercounts even 24h", () => {
     assert.equal(
-      windowFullyCovered({ truncated: true, oldestScannedAt: ago(0.25), window: "day", nowMs: NOW }),
+      windowFullyCovered({
+        truncated: true,
+        oldestScannedAt: ago(0.25),
+        window: "day",
+        nowMs: NOW,
+      }),
       false,
     );
   });

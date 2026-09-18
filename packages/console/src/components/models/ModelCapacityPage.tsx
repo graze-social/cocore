@@ -20,13 +20,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Link as RouterLink } from "@tanstack/react-router";
 import type { ReactElement } from "react";
 
-import {
-  DEFAULT_CAPACITY_WINDOW,
-  modelCapacityQueryOptions,
-} from "@/components/models/model-capacity.functions.ts";
+import { modelCapacityQueryOptions } from "@/components/models/model-capacity.functions.ts";
 import { Alert } from "@/design-system/alert";
 import { Badge } from "@/design-system/badge";
-import { Card, CardDescription, CardHeader, CardTitle } from "@/design-system/card";
+import { Card, CardBody, CardDescription, CardHeader, CardTitle } from "@/design-system/card";
 import { Flex } from "@/design-system/flex";
 import { Page } from "@/design-system/page";
 import { SegmentedControl, SegmentedControlItem } from "@/design-system/segmented-control";
@@ -223,10 +220,14 @@ const styles = stylex.create({
 function Stat({ value, label }: { value: string | null; label: string }): ReactElement {
   return (
     <Card size="md" style={styles.statCard}>
-      <Flex direction="column" gap="xs">
-        <span {...stylex.props(styles.statValue)}>{value ?? "—"}</span>
-        <span {...stylex.props(styles.statLabel)}>{label}</span>
-      </Flex>
+      {/* Card itself only declares the --card-* custom properties; the padding
+          lives on CardHeader/CardBody/CardFooter. A bare child gets none. */}
+      <CardBody>
+        <Flex direction="column" gap="xs">
+          <span {...stylex.props(styles.statValue)}>{value ?? "—"}</span>
+          <span {...stylex.props(styles.statLabel)}>{label}</span>
+        </Flex>
+      </CardBody>
     </Card>
   );
 }
@@ -254,9 +255,7 @@ export function ModelCapacityPage({
   // React Aria's TableBody needs at least one item to render a row, so an
   // empty result is carried by a sentinel the row renderer special-cases.
   const bodyItems: ModelSupplyDemandRow[] =
-    rows.length > 0
-      ? rows
-      : [{ modelId: "__empty__" } as unknown as ModelSupplyDemandRow];
+    rows.length > 0 ? rows : [{ modelId: "__empty__" } as unknown as ModelSupplyDemandRow];
 
   return (
     <Page.Root variant="large" style={styles.root}>
@@ -335,9 +334,7 @@ export function ModelCapacityPage({
       {data ? (
         <div {...stylex.props(styles.statGrid)}>
           <Stat
-            value={
-              supplyKnown && demandKnown ? formatCount(data.totals.unservedModels) : null
-            }
+            value={supplyKnown && demandKnown ? formatCount(data.totals.unservedModels) : null}
             label="models needing capacity"
           />
           <Stat
@@ -492,13 +489,9 @@ function renderCell(columnId: ColumnId, row: ModelSupplyDemandRow, ctx: CellCont
         <TableCell>
           <span {...stylex.props(styles.stack)}>
             <span {...stylex.props(styles.numStrong)}>
-              {supplyKnown
-                ? `${formatCount(row.healthy)} / ${formatCount(row.advertising)}`
-                : DASH}
+              {supplyKnown ? `${formatCount(row.healthy)} / ${formatCount(row.advertising)}` : DASH}
             </span>
-            {supplyKnown && blockers ? (
-              <span {...stylex.props(styles.sub)}>{blockers}</span>
-            ) : null}
+            {supplyKnown && blockers ? <span {...stylex.props(styles.sub)}>{blockers}</span> : null}
           </span>
         </TableCell>
       );

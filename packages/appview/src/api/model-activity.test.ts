@@ -112,7 +112,11 @@ describe("aggregateModelActivity grouping", () => {
   });
 
   test("models are sorted by id, so the response is stable across calls", () => {
-    const rows = [receipt({ model: "zeta" }), receipt({ model: "alpha" }), receipt({ model: "mu" })];
+    const rows = [
+      receipt({ model: "zeta" }),
+      receipt({ model: "alpha" }),
+      receipt({ model: "mu" }),
+    ];
     assert.deepEqual(
       aggregateModelActivity(rows, NOW).models.map((m) => m.modelId),
       ["alpha", "mu", "zeta"],
