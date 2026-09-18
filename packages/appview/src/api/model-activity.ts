@@ -15,17 +15,17 @@
 // `oldestScannedAt` and callers surface it.
 
 /** The four windows every `activityWindows` roll-up carries. */
-export const ACTIVITY_WINDOWS = ["hour", "day", "week", "month"] as const;
-export type ActivityWindow = (typeof ACTIVITY_WINDOWS)[number];
+const ACTIVITY_WINDOWS = ["hour", "day", "week", "month"] as const;
+type ActivityWindow = (typeof ACTIVITY_WINDOWS)[number];
 
-export interface ActivityCounts {
+interface ActivityCounts {
   requests: number;
   tokens: number;
 }
 
-export type ActivityWindows = Record<ActivityWindow, ActivityCounts>;
+type ActivityWindows = Record<ActivityWindow, ActivityCounts>;
 
-export interface ModelActivityEntry {
+interface ModelActivityEntry {
   modelId: string;
   totals: ActivityWindows;
   byProvider: Array<{ did: string; stats: ActivityWindows }>;

@@ -19,10 +19,7 @@ import {
   DEFAULT_CAPACITY_WINDOW,
   modelCapacityQueryOptions,
 } from "@/components/models/model-capacity.functions.ts";
-import {
-  SUPPLY_DEMAND_WINDOWS,
-  type SupplyDemandWindow,
-} from "@/lib/model-supply-demand.ts";
+import { SUPPLY_DEMAND_WINDOWS, type SupplyDemandWindow } from "@/lib/model-supply-demand.ts";
 
 /** `window` stays OPTIONAL so every `<Link to="/models/capacity">` in the app
  *  can omit it — an all-optional search schema is what lets TanStack treat the

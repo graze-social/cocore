@@ -66,7 +66,7 @@ export const SUPPLY_BLOCKERS: readonly SupplyBlocker[] = [
   "coolingDown",
 ];
 
-export type BlockedCounts = Record<SupplyBlocker, number>;
+type BlockedCounts = Record<SupplyBlocker, number>;
 
 /** What a model's capacity/traffic balance reads as. Drives the UI badge and
  *  the "needs help" sort. */
@@ -316,7 +316,13 @@ export function buildSupplyDemand(input: SupplyDemandInput): SupplyDemandSnapsho
   const accFor = (modelId: string): Acc => {
     let acc = supplyByModel.get(modelId);
     if (!acc) {
-      acc = { advertising: 0, healthy: 0, blocked: emptyBlocked(), silent: 0, operators: new Set() };
+      acc = {
+        advertising: 0,
+        healthy: 0,
+        blocked: emptyBlocked(),
+        silent: 0,
+        operators: new Set(),
+      };
       supplyByModel.set(modelId, acc);
     }
     return acc;

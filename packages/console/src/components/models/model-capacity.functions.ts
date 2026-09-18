@@ -23,8 +23,9 @@ const capacitySchema = z.object({
 
 const loadModelCapacityServerFn = createServerFn({ method: "GET" })
   .inputValidator(capacitySchema)
-  .handler(({ data }): Promise<ModelSupplyDemandPayload> =>
-    buildModelSupplyDemand(data.window ?? DEFAULT_CAPACITY_WINDOW),
+  .handler(
+    ({ data }): Promise<ModelSupplyDemandPayload> =>
+      buildModelSupplyDemand(data.window ?? DEFAULT_CAPACITY_WINDOW),
   );
 
 export function modelCapacityQueryOptions(window: SupplyDemandWindow = DEFAULT_CAPACITY_WINDOW) {
