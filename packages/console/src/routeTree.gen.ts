@@ -20,6 +20,7 @@ import { Route as XrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport } from '.
 import { Route as XrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]listApiKeys'
 import { Route as XrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]deleteApiKey'
 import { Route as XrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport } from './routes/xrpc.dev[.]cocore[.]account[.]createApiKey'
+import { Route as V1SystemoneRouteImport } from './routes/v1.systemone'
 import { Route as V1RecommendedModelsRouteImport } from './routes/v1.recommended-models'
 import { Route as V1ModelsRouteImport } from './routes/v1.models'
 import { Route as LexiconsNsidRouteImport } from './routes/lexicons.$nsid'
@@ -60,6 +61,7 @@ import { Route as ApiXrpcDevDotcocoreDotaccountDotrevokeApiKeyRouteImport } from
 import { Route as ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]listApiKeys'
 import { Route as ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]deleteApiKey'
 import { Route as ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport } from './routes/api/xrpc/dev[.]cocore[.]account[.]createApiKey'
+import { Route as ApiV1SystemoneRouteImport } from './routes/api.v1.systemone'
 import { Route as ApiV1ModelsRouteImport } from './routes/api/v1/models'
 import { Route as ApiPdsPutRecordRouteImport } from './routes/api/pds/putRecord'
 import { Route as ApiPdsGetServiceAuthRouteImport } from './routes/api/pds/getServiceAuth'
@@ -161,6 +163,11 @@ const XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute =
     path: '/xrpc/dev.cocore.account.createApiKey',
     getParentRoute: () => rootRouteImport,
   } as any)
+const V1SystemoneRoute = V1SystemoneRouteImport.update({
+  id: '/v1/systemone',
+  path: '/v1/systemone',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const V1RecommendedModelsRoute = V1RecommendedModelsRouteImport.update({
   id: '/v1/recommended-models',
   path: '/v1/recommended-models',
@@ -375,6 +382,11 @@ const ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute =
     path: '/api/xrpc/dev.cocore.account.createApiKey',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiV1SystemoneRoute = ApiV1SystemoneRouteImport.update({
+  id: '/api/v1/systemone',
+  path: '/api/v1/systemone',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiV1ModelsRoute = ApiV1ModelsRouteImport.update({
   id: '/api/v1/models',
   path: '/api/v1/models',
@@ -645,6 +657,7 @@ export interface FileRoutesByFullPath {
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
   '/v1/recommended-models': typeof V1RecommendedModelsRoute
+  '/v1/systemone': typeof V1SystemoneRoute
   '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -672,6 +685,7 @@ export interface FileRoutesByFullPath {
   '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/v1/systemone': typeof ApiV1SystemoneRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -739,6 +753,7 @@ export interface FileRoutesByTo {
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
   '/v1/recommended-models': typeof V1RecommendedModelsRoute
+  '/v1/systemone': typeof V1SystemoneRoute
   '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -765,6 +780,7 @@ export interface FileRoutesByTo {
   '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/v1/systemone': typeof ApiV1SystemoneRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -834,6 +850,7 @@ export interface FileRoutesById {
   '/lexicons/$nsid': typeof LexiconsNsidRoute
   '/v1/models': typeof V1ModelsRoute
   '/v1/recommended-models': typeof V1RecommendedModelsRoute
+  '/v1/systemone': typeof V1SystemoneRoute
   '/xrpc/dev.cocore.account.createApiKey': typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/xrpc/dev.cocore.account.deleteApiKey': typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/xrpc/dev.cocore.account.listApiKeys': typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -862,6 +879,7 @@ export interface FileRoutesById {
   '/api/pds/getServiceAuth': typeof ApiPdsGetServiceAuthRoute
   '/api/pds/putRecord': typeof ApiPdsPutRecordRoute
   '/api/v1/models': typeof ApiV1ModelsRoute
+  '/api/v1/systemone': typeof ApiV1SystemoneRoute
   '/api/xrpc/dev.cocore.account.createApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   '/api/xrpc/dev.cocore.account.deleteApiKey': typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   '/api/xrpc/dev.cocore.account.listApiKeys': typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -931,6 +949,7 @@ export interface FileRouteTypes {
     | '/lexicons/$nsid'
     | '/v1/models'
     | '/v1/recommended-models'
+    | '/v1/systemone'
     | '/xrpc/dev.cocore.account.createApiKey'
     | '/xrpc/dev.cocore.account.deleteApiKey'
     | '/xrpc/dev.cocore.account.listApiKeys'
@@ -958,6 +977,7 @@ export interface FileRouteTypes {
     | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
+    | '/api/v1/systemone'
     | '/api/xrpc/dev.cocore.account.createApiKey'
     | '/api/xrpc/dev.cocore.account.deleteApiKey'
     | '/api/xrpc/dev.cocore.account.listApiKeys'
@@ -1025,6 +1045,7 @@ export interface FileRouteTypes {
     | '/lexicons/$nsid'
     | '/v1/models'
     | '/v1/recommended-models'
+    | '/v1/systemone'
     | '/xrpc/dev.cocore.account.createApiKey'
     | '/xrpc/dev.cocore.account.deleteApiKey'
     | '/xrpc/dev.cocore.account.listApiKeys'
@@ -1051,6 +1072,7 @@ export interface FileRouteTypes {
     | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
+    | '/api/v1/systemone'
     | '/api/xrpc/dev.cocore.account.createApiKey'
     | '/api/xrpc/dev.cocore.account.deleteApiKey'
     | '/api/xrpc/dev.cocore.account.listApiKeys'
@@ -1119,6 +1141,7 @@ export interface FileRouteTypes {
     | '/lexicons/$nsid'
     | '/v1/models'
     | '/v1/recommended-models'
+    | '/v1/systemone'
     | '/xrpc/dev.cocore.account.createApiKey'
     | '/xrpc/dev.cocore.account.deleteApiKey'
     | '/xrpc/dev.cocore.account.listApiKeys'
@@ -1147,6 +1170,7 @@ export interface FileRouteTypes {
     | '/api/pds/getServiceAuth'
     | '/api/pds/putRecord'
     | '/api/v1/models'
+    | '/api/v1/systemone'
     | '/api/xrpc/dev.cocore.account.createApiKey'
     | '/api/xrpc/dev.cocore.account.deleteApiKey'
     | '/api/xrpc/dev.cocore.account.listApiKeys'
@@ -1197,6 +1221,7 @@ export interface RootRouteChildren {
   LexiconsNsidRoute: typeof LexiconsNsidRoute
   V1ModelsRoute: typeof V1ModelsRoute
   V1RecommendedModelsRoute: typeof V1RecommendedModelsRoute
+  V1SystemoneRoute: typeof V1SystemoneRoute
   XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute: typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute: typeof XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   XrpcDevDotcocoreDotaccountDotlistApiKeysRoute: typeof XrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -1214,6 +1239,7 @@ export interface RootRouteChildren {
   ApiPdsGetServiceAuthRoute: typeof ApiPdsGetServiceAuthRoute
   ApiPdsPutRecordRoute: typeof ApiPdsPutRecordRoute
   ApiV1ModelsRoute: typeof ApiV1ModelsRoute
+  ApiV1SystemoneRoute: typeof ApiV1SystemoneRoute
   ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute
   ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute: typeof ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute
   ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute: typeof ApiXrpcDevDotcocoreDotaccountDotlistApiKeysRoute
@@ -1324,6 +1350,13 @@ declare module '@tanstack/react-router' {
       path: '/xrpc/dev.cocore.account.createApiKey'
       fullPath: '/xrpc/dev.cocore.account.createApiKey'
       preLoaderRoute: typeof XrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/v1/systemone': {
+      id: '/v1/systemone'
+      path: '/v1/systemone'
+      fullPath: '/v1/systemone'
+      preLoaderRoute: typeof V1SystemoneRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/v1/recommended-models': {
@@ -1604,6 +1637,13 @@ declare module '@tanstack/react-router' {
       path: '/api/xrpc/dev.cocore.account.createApiKey'
       fullPath: '/api/xrpc/dev.cocore.account.createApiKey'
       preLoaderRoute: typeof ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/v1/systemone': {
+      id: '/api/v1/systemone'
+      path: '/api/v1/systemone'
+      fullPath: '/api/v1/systemone'
+      preLoaderRoute: typeof ApiV1SystemoneRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/v1/models': {
@@ -2037,6 +2077,7 @@ const rootRouteChildren: RootRouteChildren = {
   LexiconsNsidRoute: LexiconsNsidRoute,
   V1ModelsRoute: V1ModelsRoute,
   V1RecommendedModelsRoute: V1RecommendedModelsRoute,
+  V1SystemoneRoute: V1SystemoneRoute,
   XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute:
     XrpcDevDotcocoreDotaccountDotcreateApiKeyRoute,
   XrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute:
@@ -2059,6 +2100,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiPdsGetServiceAuthRoute: ApiPdsGetServiceAuthRoute,
   ApiPdsPutRecordRoute: ApiPdsPutRecordRoute,
   ApiV1ModelsRoute: ApiV1ModelsRoute,
+  ApiV1SystemoneRoute: ApiV1SystemoneRoute,
   ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute:
     ApiXrpcDevDotcocoreDotaccountDotcreateApiKeyRoute,
   ApiXrpcDevDotcocoreDotaccountDotdeleteApiKeyRoute:
@@ -2106,3 +2148,12 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
+
+import type { getRouter } from './router.tsx'
+import type { createStart } from '@tanstack/react-start'
+declare module '@tanstack/react-start' {
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+  }
+}

@@ -7,6 +7,22 @@ export function resolveInferenceApiBody(
   if (entry.method !== "POST") return undefined;
   const base = entry.example.body ?? {};
   const model = values.model?.trim() || String((base.model as string | undefined) ?? "stub");
+
+  // A decision request has no `messages` and no `max_tokens` — the chat
+  // assembly below would rewrite it into something the endpoint rejects.
+  if (entry.id === "inference-api-systemone") {
+    const baseQuestions = (base.questions ?? {}) as Record<string, { instructions?: string }>;
+    const [firstId, firstQuestion] = Object.entries(baseQuestions)[0] ?? ["is_urgent", {}];
+    const state = values.state?.trim() || String((base.state as string | undefined) ?? "");
+    const statement = values.statement?.trim() || String(firstQuestion.instructions ?? "");
+    return {
+      ...base,
+      model,
+      state,
+      questions: { [firstId]: { type: "noul", instructions: statement } },
+    };
+  }
+
   const message =
     values.message?.trim() ||
     String(

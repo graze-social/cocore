@@ -36,12 +36,22 @@ import { resolveProBonoProviderKeys } from "@/lib/pro-bono.server.ts";
 import {
   buildJobInput,
   bufferedResponse,
+  cocoreMeta,
   jsonError,
   type OpenAiChatRequest,
   parseRequest,
   readBearer,
   streamingResponse,
 } from "@/lib/openai-chat-completions.server.ts";
+import {
+  canonicalDecisionPrompt,
+  dispatchErrorToSystemOneResponse,
+  parseDecisionCompletion,
+  parseSystemOneRequest,
+  resolveDecisionModel,
+  systemOneError,
+  systemOneResponse,
+} from "@/lib/systemone.server.ts";
 import { resolveBearerKey } from "@/lib/api-keys.server.ts";
 import { cocoreConfig } from "@/lib/cocore-config.ts";
 import { resolveBearerKeyViaAppview } from "@/lib/api-keys-appview.server.ts";
@@ -321,6 +331,101 @@ export async function handleChatCompletions(request: Request): Promise<Response>
     return streamingResponse(id, parsed.model, runDispatch(inputs));
   }
   return await bufferedResponse(id, parsed.model, runDispatch(inputs));
+}
+
+/**
+ * POST /v1/systemone — the System-One decision surface.
+ *
+ * Wire-identical to TypeSafe's Jev API and to what `ollaya serve` and Unsloth
+ * Desktop answer locally, so an existing Jev client reaches the cocore network
+ * by changing one base URL. `state` + typed `questions` in, calibrated
+ * probabilities out, receipted like any other job.
+ *
+ * It rides the ordinary dispatch path: the canonical `{model, state,
+ * questions}` bytes are the sealed prompt (so `inputCommitment` covers the
+ * decision request), and the provider's canonical answers envelope is the
+ * completion (so `outputCommitment` covers the decision). No lexicon change
+ * and no second pipeline — see `provider/src/engines/decision.rs`.
+ *
+ * Not streamed: a System-One model is non-autoregressive and answers every
+ * question in one encoder pass, so there is nothing to stream. A `stream`
+ * field in the body is ignored rather than rejected, since some Jev clients
+ * send one out of habit.
+ */
+export async function handleSystemOne(request: Request): Promise<Response> {
+  const auth = await authenticate(request);
+  if (auth instanceof Response) return auth;
+
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch {
+    return systemOneError({
+      status: 422,
+      message: "Body must be JSON.",
+      code: "validation_error",
+    });
+  }
+
+  const parsed = parseSystemOneRequest(raw);
+  if ("status" in parsed) return systemOneError(parsed);
+
+  // `jev-latest` and `laya` are aliases every client hardcodes, not repo ids.
+  // Resolve against what is actually online so the job — and therefore the
+  // receipt — names the model that really ran.
+  const directory = await buildModelDirectory();
+  const resolved = resolveDecisionModel(
+    parsed.requestedModel,
+    directory.models.map((m) => m.modelId),
+  );
+  if (typeof resolved !== "string") return systemOneError(resolved);
+
+  const inputs: DispatchInputs = {
+    did: auth.did,
+    oauthSession: auth.oauthSession,
+    model: resolved,
+    prompt: canonicalDecisionPrompt(parsed, resolved),
+    // A decision generates no tokens. The lexicon floor is 1, and the
+    // SDK's strict-verify gate is `receipt.tokens.out > job.maxTokensOut`,
+    // which an honest decision receipt (tokens.out = 0) passes.
+    maxTokensOut: 1,
+    priceCeiling: DEFAULT_PRICE_CEILING,
+  };
+
+  const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);
+  if (admission.refusal) return admission.refusal;
+
+  let text = "";
+  let receiptUri: string | null = null;
+  let providerCredit: Parameters<typeof cocoreMeta>[0];
+  let completed = false;
+  for await (const ev of runDispatch(inputs)) {
+    if (ev.kind === "chunk") {
+      // Reasoning and tool-call channels cannot occur on a decision engine;
+      // ignoring them keeps a chat provider that somehow answered from
+      // corrupting the decision bytes.
+      if (ev.channel !== "reasoning" && ev.channel !== "tool_call") text += ev.text;
+    } else if (ev.kind === "complete") {
+      receiptUri = ev.receiptUri;
+      providerCredit = ev.providerCredit;
+      completed = true;
+    } else if (ev.kind === "error") {
+      const mapped = dispatchErrorToSystemOneResponse(ev.code);
+      return systemOneError({ status: mapped.status, message: ev.reason, code: mapped.code });
+    }
+  }
+  if (!completed) {
+    return systemOneError({
+      status: 502,
+      message: "The decision ended before completion. Please retry.",
+      code: "advisor_transport",
+    });
+  }
+
+  const result = parseDecisionCompletion(text, parsed.questions, resolved);
+  if ("status" in result) return systemOneError(result);
+
+  return systemOneResponse(result, cocoreMeta(providerCredit, receiptUri));
 }
 
 /** POST /v1/private/chat/completions — friends-only routing. Identical

@@ -556,7 +556,7 @@ function chunkPayload(
  *  result, plus the on-chain receipt. OpenAI clients ignore unknown
  *  top-level fields, so this is invisible to vanilla SDKs but available
  *  to anyone who looks. */
-function cocoreMeta(
+export function cocoreMeta(
   credit: ProviderCredit | undefined,
   receiptUri: string | null,
 ): { x_cocore: Record<string, unknown> } | undefined {
