@@ -153,7 +153,7 @@ export interface ExchangePolicyRecord {
 export interface JobRecord {
   model: string;
   inputCommitment: string;
-  inputFormat?: "text" | "messages-v1";
+  inputFormat?: "text" | "messages-v1" | "decision-v1";
   inputCipherURL?: string;
   maxTokensOut: number;
   priceCeiling: Money;

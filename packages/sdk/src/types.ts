@@ -146,8 +146,10 @@ export interface JobRecord {
   inputCommitment: string;
   /** How to interpret the sealed input bytes inputCommitment covers.
    *  Absent/"text": raw prompt string. "messages-v1": UTF-8 of the
-   *  canonical multimodal envelope (see multimodal-envelope.ts). */
-  inputFormat?: "text" | "messages-v1";
+   *  canonical multimodal envelope (see multimodal-envelope.ts).
+   *  "decision-v1": UTF-8 of a canonical System-One decision request
+   *  (see decision.ts) — the one format whose output can be re-derived. */
+  inputFormat?: "text" | "messages-v1" | "decision-v1";
   inputCipherURL?: string;
   maxTokensOut: number;
   priceCeiling: Money;
@@ -194,6 +196,11 @@ export interface GenerationParams {
   /** SHA-256 hex of the canonical JSON of the tools array used. Present
    *  only when the job specified tools. */
   toolSchemaHash?: string;
+  /** SHA-256 hex identifying the exact model artifact that ran, disambiguating
+   *  the opaque `model` id. A provider CLAIM, not an attestation — its value
+   *  is that a deterministic model makes it falsifiable by replay (see
+   *  `verifyDecisionReceipt`). Absent when the provider named no artifact. */
+  modelDigest?: string;
 }
 
 export interface ReceiptRecord {

@@ -33,8 +33,8 @@
           },
           "inputFormat": {
             "type": "string",
-            "knownValues": ["text", "messages-v1"],
-            "description": "How to interpret the sealed input bytes that `inputCommitment` covers. Absent (legacy) or `text`: the bytes are the raw prompt string. `messages-v1`: the bytes are the UTF-8 of a canonical-JSON multimodal envelope { v: 1, messages: [ { role, content } ] }, where `content` is either a string or an array of parts — { type: \"text\", text } and { type: \"image\", mime, data } with `data` base64-encoded image bytes inline. A verifier reconstructs the same canonical bytes to recompute `inputCommitment`. Additive: providers that don't understand a format reject the job rather than mis-serving it."
+            "knownValues": ["text", "messages-v1", "decision-v1"],
+            "description": "How to interpret the sealed input bytes that `inputCommitment` covers. Absent (legacy) or `text`: the bytes are the raw prompt string. `messages-v1`: the bytes are the UTF-8 of a canonical-JSON multimodal envelope { v: 1, messages: [ { role, content } ] }, where `content` is either a string or an array of parts — { type: \"text\", text } and { type: \"image\", mime, data } with `data` base64-encoded image bytes inline. `decision-v1`: the bytes are the UTF-8 of a canonical-JSON System-One decision request { model, state, questions }, with object keys sorted recursively at every level (arrays keep their order \u2014 a score question's `criteria` levels are ordered, and reordering them would change the question); the provider answers it over `/v1/systemone`, and the receipt's `outputCommitment` covers the canonical answers envelope. A verifier reconstructs the same canonical bytes to recompute `inputCommitment`; for `decision-v1` it can go further and recompute `outputCommitment` too, by re-running the decision \u2014 the model is a single deterministic pass with no sampling, which an autoregressive completion can never offer. Additive: providers that don't understand a format reject the job rather than mis-serving it."
           },
           "inputCipherURL": {
             "type": "string",

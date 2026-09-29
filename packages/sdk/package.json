@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./canonical": "./src/canonical.ts",
+    "./decision": "./src/decision.ts",
     "./ecies": "./src/ecies.ts",
     "./firehose": "./src/firehose.ts",
     "./lex": "./src/lex-runtime.ts",

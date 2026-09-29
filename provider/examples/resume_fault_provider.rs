@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
         supports_tool_calls: Some(false),
         tool_call_models: None,
         structured_output_models: None,
+        decision_models: None,
         model_capacity: None,
         binary_version: Some(env!("CARGO_PKG_VERSION").into()),
         secure_enclave_available: Some(false),

@@ -180,6 +180,12 @@
           "minLength": 64,
           "maxLength": 64,
           "description": "SHA-256 hex over the canonical JSON of the tools the provider used for this job. Present only when the job specified tools. Covered by enclaveSignature, so a requester can prove the provider honored the tool definitions they asked for."
+        },
+        "modelDigest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "description": "SHA-256 hex identifying the exact model artifact the provider ran, disambiguating the opaque `model` id (a 4-bit and an f16 build of one repo are different artifacts that produce different outputs). This is a provider CLAIM, not an attestation: nothing here verifies it. Its value is that it is falsifiable — for a deterministic model the requester can re-run the named artifact over the same input and check `outputCommitment`, which makes a false digest self-defeating. Covered by enclaveSignature. Absent when the provider cannot identify the artifact it ran; absence is the honest default and is NOT a claim about the model."
         }
       }
     }

@@ -21,6 +21,11 @@ from .appattest import (
     verify_app_attest_b64,
 )
 from .canonical import CanonicalError, canonical_bytes, canonicalize
+from .decision import (
+    canonical_decision_answers,
+    canonical_decision_request,
+    verify_decision_receipt,
+)
 from .mda import MdaError, MdaResult, verify_chain, verify_chain_against
 from .p256 import (
     signature_is_high_s,
@@ -44,6 +49,9 @@ from .validate import (
 from .verify import VerifyResult, session_key_message, verify_provider_for_seal
 
 __all__ = [
+    "canonical_decision_answers",
+    "canonical_decision_request",
+    "verify_decision_receipt",
     "AppPairing",
     "AppPairingError",
     "AppPairingPoll",

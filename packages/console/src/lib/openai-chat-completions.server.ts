@@ -556,7 +556,7 @@ function chunkPayload(
  *  result, plus the on-chain receipt. OpenAI clients ignore unknown
  *  top-level fields, so this is invisible to vanilla SDKs but available
  *  to anyone who looks. */
-function cocoreMeta(
+export function cocoreMeta(
   credit: ProviderCredit | undefined,
   receiptUri: string | null,
 ): { x_cocore: Record<string, unknown> } | undefined {
@@ -632,6 +632,18 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
         status: 400,
         type: "invalid_request_error",
         code: "tool_calls_not_supported",
+      };
+    case "no-providers-for-decision":
+      // On the chat surface this means the model is served, but only by a
+      // decision engine (`/v1/systemone`), which cannot answer a chat prompt.
+      // 400 like the tool-calling mismatch: retrying won't help — the caller
+      // needs a chat model, or the /v1/systemone endpoint. The System-One
+      // surface maps the SAME code to 529, because from that direction it
+      // means "no decision machine online right now", which is retryable.
+      return {
+        status: 400,
+        type: "invalid_request_error",
+        code: "decision_model_mismatch",
       };
     case "no-friends-available":
       return {

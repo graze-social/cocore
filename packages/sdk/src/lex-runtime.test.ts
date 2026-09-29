@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "vitest";
 import assert from "node:assert/strict";
 
-import { ids, schemas } from "./lex-runtime.ts";
+import { ids, lexicons, schemas } from "./lex-runtime.ts";
 
 const LEX_DIR = fileURLToPath(new URL("../../../lexicons/dev/cocore/compute/", import.meta.url));
 
@@ -50,4 +50,44 @@ test("lex-runtime ids map covers every on-disk lexicon", () => {
   for (const nsid of inIds) {
     assert.ok(onDisk.has(nsid), `ids map has stale entry ${nsid}`);
   }
+});
+
+// Invariant 3 (CLAUDE.md): "Lexicons evolve additively. New behavior is a new
+// optional field or a new NSID." That only holds if a validator running an
+// OLDER lexicon tolerates a record carrying a field it has never heard of —
+// otherwise every additive change is a flag-day break, and a provider that
+// ships a new field is rejected by every consumer that hasn't redeployed.
+//
+// This pins the tolerance rather than trusting it. It is not a test of
+// `modelDigest` specifically; it is the guard for every field added after it.
+test("a record carrying unknown fields still validates (additive evolution)", () => {
+  const CID = "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a";
+  const receipt = {
+    $type: ids.DevCocoreComputeReceipt,
+    job: { uri: "at://did:plc:requester/dev.cocore.compute.job/1", cid: CID },
+    requester: "did:plc:requester",
+    model: "m",
+    inputCommitment: "a".repeat(64),
+    outputCommitment: "b".repeat(64),
+    tokens: { in: 1, out: 0 },
+    startedAt: "2026-09-29T00:00:00.000Z",
+    completedAt: "2026-09-29T00:00:00.000Z",
+    price: { amount: 1, currency: "CC" },
+    attestation: { uri: "at://did:plc:provider/dev.cocore.compute.attestation/1", cid: CID },
+    enclaveSignature: new Uint8Array([1, 2, 3]),
+  };
+
+  // Baseline: the record itself is valid, so a failure below is about the
+  // added field and not about the fixture.
+  lexicons.assertValidRecord(ids.DevCocoreComputeReceipt, receipt);
+
+  // What an old validator sees from a provider running a newer lexicon.
+  lexicons.assertValidRecord(ids.DevCocoreComputeReceipt, {
+    ...receipt,
+    aFieldFromTheFuture: "x",
+  });
+  lexicons.assertValidRecord(ids.DevCocoreComputeReceipt, {
+    ...receipt,
+    params: { maxTokens: 1, aParamFromTheFuture: "x" },
+  });
 });

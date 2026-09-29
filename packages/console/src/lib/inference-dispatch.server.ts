@@ -43,10 +43,12 @@ export interface DispatchInputs {
    *  canonical messages-v1 envelope). When present, these are sealed and
    *  hashed verbatim and `prompt` is ignored. */
   payloadBytes?: Uint8Array;
-  /** Set to "messages-v1" when `payloadBytes` is the multimodal envelope,
-   *  so the job record and the provider both interpret the bytes
-   *  correctly. */
-  inputFormat?: "messages-v1";
+  /** How the sealed bytes are to be read, recorded on the job so the provider
+   *  and any later verifier agree on what `inputCommitment` covers.
+   *  `messages-v1` when `payloadBytes` is the multimodal envelope;
+   *  `decision-v1` when `prompt` is a canonical System-One decision request.
+   *  Absent = a raw prompt string. */
+  inputFormat?: "messages-v1" | "decision-v1";
   maxTokensOut: number;
   priceCeiling: { amount: number; currency: string };
   targetProviderDid?: string;
@@ -215,6 +217,10 @@ export type DispatchErrorCode =
   | "no-providers-for-country"
   | "no-providers-for-version"
   | "no-providers-for-tool-calls"
+  /** The model is served, but not by an engine of the kind this request
+   *  needs — a decision asked of chat machines, or a chat request aimed at a
+   *  model only served as a decision. */
+  | "no-providers-for-decision"
   | "no-friends-available"
   | "no-friends-for-model"
   | "target-provider-not-connected"
@@ -353,6 +359,11 @@ export interface AdvisorProviderRow {
    *  When absent, callers fall back to legacy `supportsToolCalls`; when
    *  present, only these models should be considered tool-capable. */
   toolCallModels?: string[];
+  /** Model ids this machine serves through a DECISION engine
+   *  (`/v1/systemone`) rather than a chat engine. Absent = none, which is
+   *  also what a pre-field agent means. Used in BOTH directions: a decision
+   *  routes only here, and a chat job routes only elsewhere. */
+  decisionModels?: string[];
   /** Agent binary version (e.g. `0.9.32`) reported by the machine, from the
    *  advisor Register frame. Absent for a pre-version agent. Used for
    *  `minProviderVersion` routing (fail-closed: absent never satisfies a
@@ -486,6 +497,40 @@ export function filterByToolCalls<
   return candidates.filter((c) => machineSupportsToolCallsFor(c, model));
 }
 
+/** True iff this machine serves `model` through a decision engine. Mirrors
+ *  the advisor's `servesDecisionsFor` (registry.ts) — the console pre-filter
+ *  and the advisor's own filter must agree, or the console pins a machine the
+ *  advisor then refuses. Absent list = serves no decisions (fail-closed for
+ *  decisions, and no change at all for chat). */
+export function machineServesDecisionsFor<T extends { decisionModels?: string[] }>(
+  row: T,
+  model: string,
+): boolean {
+  return Array.isArray(row.decisionModels) && row.decisionModels.includes(model);
+}
+
+/** Pure filter for decision routing, in both directions: a decision request
+ *  keeps only machines serving `model` over `/v1/systemone`; an ordinary chat
+ *  request keeps only machines that do NOT, because a decision engine cannot
+ *  answer a chat prompt (it refuses with `decision-request-invalid`) and a
+ *  chat engine answers a decision with prose. */
+export function filterByDecision<T extends { decisionModels?: string[] }>(
+  candidates: T[],
+  model: string,
+  wantsDecision: boolean,
+): T[] {
+  return candidates.filter((c) => machineServesDecisionsFor(c, model) === wantsDecision);
+}
+
+export class NoProvidersForDecisionError extends Error {
+  readonly model: string;
+  constructor(model: string, detail: string) {
+    super(`no provider serving model '${model}' as a decision model: ${detail}`);
+    this.name = "NoProvidersForDecisionError";
+    this.model = model;
+  }
+}
+
 export class NoProvidersForVersionError extends Error {
   readonly minVersion: string;
   constructor(minVersion: string, detail: string) {
@@ -540,6 +585,10 @@ async function pickProvider(
    *  503 the pinned `/jobs`, so filter it out here and pin a machine the
    *  advisor will actually accept. Fail-closed via {@link filterByToolCalls}. */
   wantsToolCalls: boolean,
+  /** True when this is a System-One decision, so only a machine serving the
+   *  model over `/v1/systemone` may be pinned — and, when false, only a
+   *  machine that does not. */
+  wantsDecision: boolean,
   /** Providers already tried this dispatch (a prior attempt's `/jobs`
    *  failed because they'd flapped out between the snapshot and the
    *  dispatch). Excluded from re-selection so failover lands on a
@@ -583,6 +632,14 @@ async function pickProvider(
       throw new NoProvidersForToolCallsError(
         model,
         `pinned provider ${targetDid} has not passed the forced-tool canary for this model`,
+      );
+    }
+    if (filterByDecision([hit], model, wantsDecision).length === 0) {
+      throw new NoProvidersForDecisionError(
+        model,
+        wantsDecision
+          ? `pinned provider ${targetDid} does not serve this model over /v1/systemone`
+          : `pinned provider ${targetDid} serves this model as a decision model, which cannot answer a chat request`,
       );
     }
     return hit;
@@ -641,7 +698,16 @@ async function pickProvider(
         `${friendAtVersion.length} friend provider(s) serve model '${model}' but none passed the forced-tool canary`,
       );
     }
-    const eligible = filterByPayoutsEligibility(friendToolCapable, options);
+    const friendRightEngine = filterByDecision(friendToolCapable, model, wantsDecision);
+    if (friendRightEngine.length === 0) {
+      throw new NoProvidersForDecisionError(
+        model,
+        `${friendToolCapable.length} friend provider(s) serve model '${model}' but none with a ${
+          wantsDecision ? "decision (/v1/systemone)" : "chat"
+        } engine`,
+      );
+    }
+    const eligible = filterByPayoutsEligibility(friendRightEngine, options);
     if (eligible.length === 0) {
       // Surface a DID from the post-country-filter list so the diagnostic
       // points at a provider that's actually both model-fit and in-country,
@@ -672,7 +738,16 @@ async function pickProvider(
       `${atVersion.length} provider(s) serve model '${model}' but none passed the forced-tool canary`,
     );
   }
-  const eligible = filterByPayoutsEligibility(toolCapable, options);
+  const rightEngine = filterByDecision(toolCapable, model, wantsDecision);
+  if (rightEngine.length === 0) {
+    throw new NoProvidersForDecisionError(
+      model,
+      `${toolCapable.length} provider(s) serve model '${model}' but none with a ${
+        wantsDecision ? "decision (/v1/systemone)" : "chat"
+      } engine`,
+    );
+  }
+  const eligible = filterByPayoutsEligibility(rightEngine, options);
   if (eligible.length === 0) {
     // No payouts-eligible provider serves this model. Surface the
     // first model-fit, in-country provider's DID so the caller can
@@ -741,6 +816,7 @@ export function classifyDispatchError(e: unknown): DispatchErrorCode {
   if (e instanceof NoProvidersForCountryError) return "no-providers-for-country";
   if (e instanceof NoProvidersForVersionError) return "no-providers-for-version";
   if (e instanceof NoProvidersForToolCallsError) return "no-providers-for-tool-calls";
+  if (e instanceof NoProvidersForDecisionError) return "no-providers-for-decision";
   if (e instanceof NoFriendsAvailableError) return "no-friends-available";
   if (e instanceof NoFriendsForModelError) return "no-friends-for-model";
   if (e instanceof TargetProviderNotConnectedError) return "target-provider-not-connected";
@@ -886,6 +962,11 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         // Tools in the request → only pin a machine that passed the forced-tool
         // canary for this model, so the advisor doesn't 503 the dispatch.
         Array.isArray(input.tools) && input.tools.length > 0,
+        // Decision vs chat: the two engine kinds can't serve each other's
+        // requests, so this pins the right kind rather than expressing a
+        // preference. Derived from the input format the job record carries, so
+        // the console's pre-filter and the advisor's filter read one field.
+        input.inputFormat === "decision-v1",
         excludeDids,
       );
     } catch (e) {

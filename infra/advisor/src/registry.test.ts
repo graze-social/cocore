@@ -12,6 +12,7 @@ import {
   STRIKE_RESET_MS,
   supportsStructuredOutputFor,
   hasCapacityFor,
+  servesDecisionsFor,
 } from "./registry.ts";
 
 const noop = (): void => {};
@@ -1013,5 +1014,118 @@ describe("structured-output gating and admission capacity (attached engines)", (
     expect(withSchema.map((e) => e.did).sort()).toEqual(
       ["did:plc:legacy", "did:plc:verified"].sort(),
     );
+  });
+});
+
+describe("decision-model routing (System-One / /v1/systemone)", () => {
+  const noopLocal = () => {};
+  const noopSendLocal = () => {};
+  const noopPingLocal = () => Promise.resolve(true);
+
+  const LAYA = "convaiinnovations/laya";
+
+  /** A machine serving `laya` through a decision engine. */
+  function decisionReg(did: string) {
+    return {
+      ...baseReg,
+      provider_did: did,
+      supported_models: [LAYA],
+      decision_models: [LAYA],
+    };
+  }
+
+  /** A machine serving the same model id through an ordinary chat engine —
+   *  a misconfiguration we must route around, not into. */
+  function chatReg(did: string) {
+    return { ...baseReg, provider_did: did, supported_models: [LAYA] };
+  }
+
+  it("maps decision_models from the Register frame", () => {
+    const r = new ProviderRegistry();
+    r.upsert(decisionReg(DID), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    const e = r.get(DID, MID)!;
+    expect(e.decisionModels).toEqual([LAYA]);
+    expect(servesDecisionsFor(e, LAYA)).toBe(true);
+    expect(servesDecisionsFor(e, "mlx-community/Qwen3.6-35B-A3B-4bit")).toBe(false);
+  });
+
+  // The opposite default from structured output, on purpose: an agent that
+  // predates the field cannot have had a decision engine, so assuming
+  // capability would route decisions to machines that would refuse them.
+  it("a legacy Register serves NO decision models (absence is not capability)", () => {
+    const r = new ProviderRegistry();
+    r.upsert(baseReg, noopLocal, noopSendLocal, noopPingLocal, 1000);
+    const e = r.get(DID, MID)!;
+    expect(e.decisionModels).toBeUndefined();
+    expect(servesDecisionsFor(e, "llama-3.2")).toBe(false);
+    expect(servesDecisionsFor(e, undefined)).toBe(false);
+  });
+
+  it("routes a decision only to a machine serving that model as a decision", () => {
+    const r = new ProviderRegistry();
+    r.upsert(decisionReg("did:plc:decider"), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    r.upsert(chatReg("did:plc:chatter"), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    r.markAttested("did:plc:decider", MID, 1100);
+    r.markAttested("did:plc:chatter", MID, 1100);
+
+    const forDecision = r.pickCandidates(
+      LAYA,
+      true,
+      Number.POSITIVE_INFINITY,
+      2000,
+      null,
+      false,
+      false,
+      true,
+    );
+    expect(forDecision.map((e) => e.did)).toEqual(["did:plc:decider"]);
+  });
+
+  it("keeps a chat job away from a decision engine — it could not answer it", () => {
+    const r = new ProviderRegistry();
+    r.upsert(decisionReg("did:plc:decider"), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    r.upsert(chatReg("did:plc:chatter"), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    r.markAttested("did:plc:decider", MID, 1100);
+    r.markAttested("did:plc:chatter", MID, 1100);
+
+    const forChat = r.pickCandidates(LAYA);
+    expect(forChat.map((e) => e.did)).toEqual(["did:plc:chatter"]);
+  });
+
+  it("fails closed rather than falling back to the wrong engine kind", () => {
+    const r = new ProviderRegistry();
+    r.upsert(chatReg("did:plc:chatter"), noopLocal, noopSendLocal, noopPingLocal, 1000);
+    r.markAttested("did:plc:chatter", MID, 1100);
+    expect(
+      r.pickCandidates(LAYA, true, Number.POSITIVE_INFINITY, 2000, null, false, false, true),
+    ).toEqual([]);
+  });
+
+  // A machine can run a decision engine for one model and vllm-mlx for
+  // another; the chat gate must exclude it only for the decision model.
+  it("a mixed machine still takes chat jobs for its chat models", () => {
+    const r = new ProviderRegistry();
+    r.upsert(
+      {
+        ...baseReg,
+        supported_models: [LAYA, "llama-3.2"],
+        decision_models: [LAYA],
+      },
+      noopLocal,
+      noopSendLocal,
+      noopPingLocal,
+      1000,
+    );
+    r.markAttested(DID, MID, 1100);
+
+    expect(r.pickCandidates("llama-3.2").map((e) => e.did)).toEqual([DID]);
+    expect(r.pickCandidates(LAYA)).toEqual([]);
+    expect(
+      r
+        .pickCandidates(LAYA, true, Number.POSITIVE_INFINITY, 2000, null, false, false, true)
+        .map((e) => e.did),
+    ).toEqual([DID]);
+    // No model named (a bare health/capacity query) is not a decision filter.
+    expect(r.pickCandidates(undefined).map((e) => e.did)).toEqual([DID]);
   });
 });

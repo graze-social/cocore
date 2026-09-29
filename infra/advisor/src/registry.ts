@@ -205,6 +205,11 @@ export interface ProviderEntry {
    *  capability. Undefined = legacy agent, assume every advertised model;
    *  present = only the listed models honour a schema. */
   structuredOutputModels: string[] | undefined;
+  /** Models this machine serves through a decision engine (`/v1/systemone`).
+   *  Undefined or empty = none, which is also what a legacy agent means —
+   *  unlike `structuredOutputModels`, absence here is NOT "assume capable",
+   *  because a decision engine is newer than the field. */
+  decisionModels: string[] | undefined;
   /** Per-model in-flight ceiling the provider's admission gate enforces
    *  (running + queued). Null = legacy agent with no gate. */
   modelCapacity: number | null;
@@ -308,6 +313,25 @@ export function supportsStructuredOutputFor(e: ProviderEntry, model: string | un
   return model === undefined
     ? e.structuredOutputModels.length > 0
     : e.structuredOutputModels.includes(model);
+}
+
+/** Whether machine `e` serves `model` through a DECISION engine
+ *  (`/v1/systemone`) rather than a chat engine.
+ *
+ *  This gate runs in BOTH directions, which is what makes it different from
+ *  every other capability filter here. A decision job may only go to a
+ *  machine where this is true, and a chat job may only go to one where it is
+ *  false — because the two engines cannot serve each other's requests at all.
+ *  A chat job landing on a decision engine is refused mid-dispatch with
+ *  `decision-request-invalid`, and a decision landing on a chat engine gets
+ *  prose where the caller expects probabilities.
+ *
+ *  A machine that reports no list (legacy agent, or one with no decision
+ *  engine) serves no decision models — so decisions never route there, and
+ *  chat routing is completely unchanged from before the field existed. */
+export function servesDecisionsFor(e: ProviderEntry, model: string | undefined): boolean {
+  if (!Array.isArray(e.decisionModels) || e.decisionModels.length === 0) return false;
+  return model === undefined ? true : e.decisionModels.includes(model);
 }
 
 /** Whether machine `e` has room for one more job on `model`, given
@@ -529,6 +553,7 @@ export class ProviderRegistry {
       supportsToolCalls: reg.supports_tool_calls ?? false,
       toolCallModels: reg.tool_call_models,
       structuredOutputModels: reg.structured_output_models,
+      decisionModels: reg.decision_models,
       modelCapacity:
         typeof reg.model_capacity === "number" && reg.model_capacity > 0
           ? Math.floor(reg.model_capacity)
@@ -596,6 +621,7 @@ export class ProviderRegistry {
     minProviderVersion: string | null = null,
     requireToolCalls = false,
     requireStructuredOutput = false,
+    requireDecision = false,
   ): ProviderEntry[] {
     const candidates = [...this.byKey.values()].filter((e) => {
       // Owner stopped this machine from the console — route it nothing.
@@ -622,6 +648,17 @@ export class ProviderRegistry {
       // Job carries `outputSchema` → only a machine whose engine is verified
       // to constrain decoding for this model may take it.
       if (requireStructuredOutput && !supportsStructuredOutputFor(e, model)) return false;
+      // Decision routing, both ways: a decision job only to a machine whose
+      // engine for this model speaks /v1/systemone, and a chat job only to one
+      // whose engine does not. Neither engine can serve the other's request.
+      // A machine may serve both kinds, so the chat direction only excludes it
+      // for the SPECIFIC model it serves as a decision — never wholesale, and
+      // never when no model was named.
+      if (requireDecision) {
+        if (!servesDecisionsFor(e, model)) return false;
+      } else if (model !== undefined && servesDecisionsFor(e, model)) {
+        return false;
+      }
       // No model requested → any attested machine is fine.
       if (!model) return true;
       // M2: an explicit advertised model set is REQUIRED to be routed a model.

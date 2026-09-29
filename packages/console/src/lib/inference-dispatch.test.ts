@@ -13,7 +13,10 @@ import {
   filterByCountry,
   filterByMinVersion,
   filterByPayoutsEligibility,
+  filterByDecision,
   filterByToolCalls,
+  machineServesDecisionsFor,
+  NoProvidersForDecisionError,
   machineSupportsToolCallsFor,
   meetsMinVersion,
   NoFriendsAvailableError,
@@ -311,5 +314,48 @@ describe("filterByToolCalls — tool-calling routing", () => {
     assert.match(e.message, /Qwen3\.5-4B/);
     assert.match(e.message, /verified tool-calling/);
     assert.equal(classifyDispatchError(e), "no-providers-for-tool-calls");
+  });
+});
+
+describe("filterByDecision — decision vs chat routing", () => {
+  const LAYA = "convaiinnovations/laya";
+  const CHAT = "mlx-community/Qwen3.5-4B-MLX-4bit";
+  // Serves LAYA through a decision engine (/v1/systemone).
+  const DECIDER = { did: "did:plc:decider", decisionModels: [LAYA] };
+  // Serves the same model id through an ordinary chat engine — a
+  // misconfiguration, and the case the gate exists to route around.
+  const CHATTER = { did: "did:plc:chatter", decisionModels: [] as string[] };
+  // Predates the field entirely.
+  const LEGACY: { did: string; decisionModels?: string[] } = { did: "did:plc:legacy" };
+  // Runs a decision engine for LAYA and vllm-mlx for CHAT.
+  const MIXED = { did: "did:plc:mixed", decisionModels: [LAYA] };
+
+  test("a decision keeps only machines serving that model over /v1/systemone", () => {
+    assert.deepEqual(filterByDecision([DECIDER, CHATTER, LEGACY], LAYA, true), [DECIDER]);
+  });
+
+  test("a chat request keeps only machines that do NOT — a decision engine cannot answer it", () => {
+    assert.deepEqual(filterByDecision([DECIDER, CHATTER, LEGACY], LAYA, false), [CHATTER, LEGACY]);
+  });
+
+  // The opposite default from structured output, deliberately: a machine that
+  // predates the field cannot have had a decision engine, so assuming
+  // capability would route decisions somewhere that would refuse them.
+  test("absence is not capability — a legacy machine never takes a decision", () => {
+    assert.deepEqual(filterByDecision([LEGACY], LAYA, true), []);
+    assert.equal(machineServesDecisionsFor(LEGACY, LAYA), false);
+  });
+
+  test("the gate is per model, so a mixed machine still takes its chat work", () => {
+    assert.deepEqual(filterByDecision([MIXED], CHAT, false), [MIXED]);
+    assert.deepEqual(filterByDecision([MIXED], LAYA, false), []);
+    assert.deepEqual(filterByDecision([MIXED], LAYA, true), [MIXED]);
+  });
+
+  test("classifies the mismatch as its own dispatch code", () => {
+    assert.equal(
+      classifyDispatchError(new NoProvidersForDecisionError(LAYA, "nothing serves it")),
+      "no-providers-for-decision",
+    );
   });
 });

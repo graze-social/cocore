@@ -26,6 +26,19 @@ export type InferenceApiCatalogEntry = {
   };
 };
 
+/** A decision request, in the shape every Jev/System-One client already
+ *  sends. One state, one typed question; real callers ask several at once. */
+const SYSTEMONE_BODY = {
+  model: "jev-latest",
+  state: "Third time this year you've double-charged me. I need this fixed today.",
+  questions: {
+    is_urgent: {
+      type: "noul",
+      instructions: "The message conveys urgency or time-sensitivity.",
+    },
+  },
+};
+
 const CHAT_BODY = {
   model: "stub",
   messages: [{ role: "user", content: "Hello" }],
@@ -68,6 +81,36 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
       },
     ],
     example: { body: CHAT_BODY, canRun: false },
+  },
+  {
+    id: "inference-api-systemone",
+    navLabel: "systemone",
+    method: "POST",
+    path: "/systemone",
+    description:
+      "Typed decisions from a System-One model, wire-compatible with the Jev API and with local servers like ollaya — point an existing client at co/core by changing its base URL. Send a state plus a map of named questions, each a noul (yes/no), choice (pick one of criteria), or score (rate against 2–10 ordered levels); every question is answered in one pass with calibrated probabilities. The model jev-latest resolves to whichever System-One model is currently on the network, and the receipt named in x_cocore records the model that actually ran. Decisions are never streamed — the model is non-autoregressive, so there is nothing to stream, and usage reports 0 output tokens. A malformed request is 422; no capacity is 529 (the status Jev SDKs retry with backoff). Because a decision is deterministic, you can check the answer yourself — see Verifying a decision below.",
+    auth: "required",
+    params: [
+      { name: "model", type: "string", required: true },
+      { name: "state", type: "string | object | array", required: true },
+      { name: "questions", type: "object", required: true },
+    ],
+    controls: [
+      { kind: "text", param: "model", label: "model", placeholder: "jev-latest" },
+      {
+        kind: "text",
+        param: "state",
+        label: "state",
+        placeholder: "Third time this year you've double-charged me.",
+      },
+      {
+        kind: "text",
+        param: "statement",
+        label: "noul statement",
+        placeholder: "The message conveys urgency or time-sensitivity.",
+      },
+    ],
+    example: { body: SYSTEMONE_BODY, canRun: false },
   },
   {
     id: "inference-api-models",
@@ -207,6 +250,13 @@ export const INFERENCE_API_CATALOG: Array<InferenceApiCatalogEntry> = [
 ];
 
 export const INFERENCE_API_TOPIC_SECTIONS = [
+  {
+    id: "inference-api-verifying-a-decision",
+    navLabel: "verifying a decision",
+    title: "Verifying a decision",
+    description:
+      "A decision is one deterministic pass with no sampling, so unlike a chat completion you can re-run it and check the receipt yourself — offline, without the provider's cooperation. It does not make the decision confidential.",
+  },
   {
     id: "inference-api-image-input",
     navLabel: "image input",

@@ -84,6 +84,112 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
+  /v1/systemone:
+    post:
+      tags: [Inference]
+      operationId: createDecision
+      summary: Ask a decision model typed questions
+      description: >
+        Typed decisions from a System-One model, wire-compatible with the Jev
+        API and with local servers such as `ollaya serve` — point an existing
+        client at co/core by changing its base URL. Send a `state` plus a map of
+        named `questions`, each a `noul` (yes/no), `choice` (pick one of
+        `criteria`) or `score` (rate against 2–10 ordered levels); every
+        question is answered in one pass with calibrated probabilities.
+
+
+        The model `jev-latest` resolves to whichever System-One model is
+        currently on the network, and the receipt names the model that actually
+        ran. Never streamed: the model is non-autoregressive, so there is
+        nothing to stream, and `usage.output_tokens` is always 0.
+
+
+        A decision is deterministic, so unlike a chat completion its
+        `outputCommitment` can be checked by re-running it. See
+        `scripts/verify-decision.ts`, or `verifyDecisionReceipt` in
+        `@cocore/sdk/decision` / `cocore.verify_decision_receipt` in the Python
+        SDK. This does NOT make a decision confidential: it is served by an
+        out-of-process engine, so the machine operator can read the state.
+
+
+        Also available at the legacy path `/api/v1/systemone`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state, questions]
+              properties:
+                model:
+                  type: string
+                  default: jev-latest
+                  description: "A System-One model id, or the alias `jev-latest` / `laya`."
+                state:
+                  description: "The situation the questions are asked about. Text, or structured data."
+                  oneOf:
+                    - type: string
+                    - type: object
+                    - type: array
+                questions:
+                  type: object
+                  description: "Question id → question. Each has a `type` of `noul`, `choice` or `score`, `instructions`, and for choice/score a `criteria`."
+                  additionalProperties:
+                    type: object
+                    required: [type, instructions]
+                    properties:
+                      type: { type: string, enum: [noul, choice, score] }
+                      instructions:
+                        description: "The statement or prompt being assessed."
+                        oneOf:
+                          - type: string
+                          - type: object
+                          - type: array
+                      criteria:
+                        description: "Absent/optional for `noul`; option → description for `choice` (max 255); an ordered array of 2–10 level descriptions for `score`."
+      responses:
+        "200":
+          description: "The answers, one per question."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model: { type: string, description: "The model that actually ran, not the alias asked for." }
+                  answers:
+                    type: object
+                    description: "Question id → answer. `noul` carries `noul` (0–1); `choice` carries `choice`, `probabilities` and `confidence`; `score` carries `score`, `legend`, `probabilities` and `confidence`."
+                  usage:
+                    type: object
+                    properties:
+                      input_tokens: { type: integer }
+                      output_tokens: { type: integer, description: "Always 0 — a System-One model generates no tokens." }
+                  x_cocore:
+                    type: object
+                    description: "Who served it and where the signed receipt lives."
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404":
+          description: No connected provider serves a System-One decision model (`model_not_found`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "422":
+          description: The request is malformed (`validation_error`) — a missing `state`, an empty `questions`, an unknown question `type`, or `criteria` outside the documented limits.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "529":
+          description: No decision-serving provider is available right now. Retryable with backoff, which is what Jev SDKs do on this status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /v1/private/chat/completions:
     post:
       tags: [Inference]
