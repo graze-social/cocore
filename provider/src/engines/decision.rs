@@ -323,7 +323,11 @@ pub enum Answer {
     },
     Score {
         score: f64,
-        legend: BTreeMap<String, Value>,
+        /// Level descriptions, always as strings. A raw JSON value here would
+        /// be uncanonicalizable: JavaScript cannot tell `1` from `1.0`, so a
+        /// numeric legend entry would hash differently in the verifier than in
+        /// the provider. Non-string values are coerced to their JSON text.
+        legend: BTreeMap<String, String>,
         probabilities: BTreeMap<String, f64>,
         confidence: Option<f64>,
     },
@@ -369,7 +373,7 @@ impl Answer {
                 if !legend.is_empty() {
                     let mut l = Map::new();
                     for (k, v) in legend {
-                        l.insert(k.clone(), v.clone());
+                        l.insert(k.clone(), Value::String(v.clone()));
                     }
                     o.insert("legend".into(), Value::Object(l));
                 }
@@ -537,7 +541,17 @@ fn parse_answer(raw: &Value, question: &Question, id: &str) -> Result<Answer> {
             let legend = obj
                 .get("legend")
                 .and_then(|l| l.as_object())
-                .map(|l| l.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .map(|l| {
+                    l.iter()
+                        .map(|(k, v)| {
+                            let text = match v.as_str() {
+                                Some(s) => s.to_string(),
+                                None => v.to_string(),
+                            };
+                            (k.clone(), text)
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             Ok(Answer::Score {
                 score,

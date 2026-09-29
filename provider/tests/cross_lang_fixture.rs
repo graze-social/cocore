@@ -590,6 +590,7 @@ fn writes_decision_canonical_fixture() {
         "state": "Third time this year you've double-charged me. I need this fixed today.",
         "questions": {
             "urgent": { "type": "noul", "instructions": "The message conveys urgency." },
+            "certainly_not": { "type": "noul", "instructions": "The message is about gardening." },
             "action": {
                 "type": "choice",
                 "instructions": "What should happen next?",
@@ -606,12 +607,21 @@ fn writes_decision_canonical_fixture() {
 
     // An upstream reply whose keys are in an awkward order, as a real server's
     // JSON serializer might emit them — canonicalization must erase that.
+    // Deliberately adversarial about number formatting. A confident decision
+    // model answers with exact 1 and 0, and `2` is a legal score — and those
+    // are precisely the values where the three languages disagree if nobody
+    // pins them: serde_json and Python print an integral float as `1.0`,
+    // JavaScript prints `1`. An earlier version of this fixture used only
+    // non-integral values and would have shipped a canonical form where every
+    // confident answer failed verification as if it were fraud.
     let upstream = br#"{
         "usage": { "output_tokens": 0, "input_tokens": 37 },
         "answers": {
-            "severity": { "probabilities": { "severe": 0.5, "minor": 0.1, "moderate": 0.4 },
-                          "type": "score", "confidence": 0.62, "score": 2.4 },
-            "urgent": { "noul": 0.97, "type": "noul" },
+            "severity": { "probabilities": { "severe": 0.5, "minor": 0, "moderate": 0.5 },
+                          "type": "score", "confidence": 1, "score": 2,
+                          "legend": { "0": "minor", "1": "moderate", "2": "severe" } },
+            "urgent": { "noul": 1, "type": "noul" },
+            "certainly_not": { "noul": 0, "type": "noul" },
             "action": { "confidence": 0.71, "type": "choice", "choice": "refund",
                         "probabilities": { "escalate": 0.29, "refund": 0.71 } }
         },

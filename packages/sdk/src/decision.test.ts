@@ -53,6 +53,33 @@ describe("cross-language canonicalization", () => {
   });
 });
 
+describe("number formatting", () => {
+  // The trap. Rust's serde_json and Python's json print an integral f64 as
+  // `1.0`; JavaScript's JSON.stringify prints `1`. A confident decision model
+  // answers with exactly 1 and 0, so leaning on JSON.stringify here would make
+  // the verifier disagree with the provider on precisely those answers and
+  // fail honest receipts as if they were forged.
+  test("integral decision values print as floats, token counts do not", () => {
+    const canonical = canonicalDecisionAnswers({
+      model: "m",
+      answers: { q: { type: "noul", noul: 1 } },
+      usage: { input_tokens: 12, output_tokens: 0 },
+    });
+    assert.ok(canonical.includes('"noul":1.0'), canonical);
+    // Token counts are u64 on the provider — they must NOT gain a `.0`.
+    assert.ok(canonical.includes('"input_tokens":12,"output_tokens":0'), canonical);
+  });
+
+  test("a non-finite value is refused rather than silently mis-hashed", () => {
+    assert.throws(() =>
+      canonicalDecisionAnswers({
+        model: "m",
+        answers: { q: { type: "noul", noul: Number.NaN } },
+      }),
+    );
+  });
+});
+
 describe("canonicalDecisionRequest", () => {
   const request: DecisionRequest = {
     state: "x",

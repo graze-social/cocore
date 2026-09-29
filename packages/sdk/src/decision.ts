@@ -108,55 +108,102 @@ function sortKeys(value: unknown): unknown {
  * implementations disagree on the bytes.
  */
 export function canonicalDecisionAnswers(envelope: DecisionAnswersEnvelope): string {
-  const answers: Record<string, unknown> = {};
-  for (const id of Object.keys(envelope.answers).sort()) {
-    answers[id] = canonicalAnswer(envelope.answers[id]);
-  }
-  return JSON.stringify({
-    model: envelope.model,
-    answers,
-    usage: {
-      input_tokens: envelope.usage?.input_tokens ?? 0,
-      output_tokens: envelope.usage?.output_tokens ?? 0,
-    },
-  });
+  const answers = Object.keys(envelope.answers)
+    .sort()
+    .map((id) => `${JSON.stringify(id)}:${canonicalAnswer(envelope.answers[id])}`)
+    .join(",");
+  return (
+    `{"model":${JSON.stringify(envelope.model)},` +
+    `"answers":{${answers}},` +
+    `"usage":{"input_tokens":${int(envelope.usage?.input_tokens ?? 0)},` +
+    `"output_tokens":${int(envelope.usage?.output_tokens ?? 0)}}}`
+  );
 }
 
-function canonicalAnswer(raw: unknown): unknown {
+/**
+ * Format a decision number the way the provider does.
+ *
+ * This is the subtle one. Every probability, score and confidence is an f64 on
+ * the provider, and both Rust's serde_json and Python's json print an integral
+ * f64 with a trailing `.0` — `1.0`, not `1`. JavaScript has no such
+ * distinction and `JSON.stringify(1)` gives `1`, so leaning on it here would
+ * make the verifier disagree with the provider on exactly the answers a
+ * confident model produces (`noul: 1`, `noul: 0`, `score: 2`) and fail honest
+ * receipts as if they were forged.
+ *
+ * Exponent notation is refused rather than guessed at: Rust prints `1e21`
+ * where JavaScript prints `1e+21`, and no probability or score should ever be
+ * out there. A value that formats that way is not a decision number.
+ */
+function f64(n: unknown): string {
+  if (typeof n !== "number" || !Number.isFinite(n)) {
+    throw new Error(`decision value is not a finite number: ${JSON.stringify(n)}`);
+  }
+  const s = String(n);
+  if (s.includes("e") || s.includes("E")) {
+    throw new Error(`decision value ${s} is outside the canonical range (exponent notation)`);
+  }
+  return Number.isInteger(n) ? `${s}.0` : s;
+}
+
+/** Token counts are integers on the provider (u64), so no `.0`. */
+function int(n: unknown): string {
+  if (typeof n !== "number" || !Number.isInteger(n)) return "0";
+  return String(n);
+}
+
+function canonicalAnswer(raw: unknown): string {
   const a = (raw ?? {}) as Record<string, unknown>;
   const type = a["type"];
-  const out: Record<string, unknown> = { type };
   if (type === "noul") {
-    out["noul"] = a["noul"];
-    return out;
+    return `{"type":"noul","noul":${f64(a["noul"])}}`;
   }
   if (type === "choice") {
-    out["choice"] = a["choice"];
-    out["probabilities"] = sortedNumberMap(a["probabilities"]);
-    if (a["confidence"] !== undefined && a["confidence"] !== null) {
-      out["confidence"] = a["confidence"];
-    }
-    return out;
+    return (
+      `{"type":"choice","choice":${JSON.stringify(a["choice"])},` +
+      `"probabilities":${probabilities(a["probabilities"])}` +
+      `${confidence(a["confidence"])}}`
+    );
   }
-  // score
-  out["score"] = a["score"];
-  const legend = a["legend"];
-  if (typeof legend === "object" && legend !== null && Object.keys(legend).length > 0) {
-    out["legend"] = legend;
-  }
-  out["probabilities"] = sortedNumberMap(a["probabilities"]);
-  if (a["confidence"] !== undefined && a["confidence"] !== null) {
-    out["confidence"] = a["confidence"];
-  }
-  return out;
+  const legend = legendOf(a["legend"]);
+  return (
+    `{"type":"score","score":${f64(a["score"])}` +
+    `${legend}` +
+    `,"probabilities":${probabilities(a["probabilities"])}` +
+    `${confidence(a["confidence"])}}`
+  );
 }
 
-function sortedNumberMap(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) return {};
+function probabilities(value: unknown): string {
+  if (typeof value !== "object" || value === null) return "{}";
   const src = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const k of Object.keys(src).sort()) out[k] = src[k];
-  return out;
+  const body = Object.keys(src)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${f64(src[k])}`)
+    .join(",");
+  return `{${body}}`;
+}
+
+function confidence(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  return `,"confidence":${f64(value)}`;
+}
+
+/** Level descriptions, always strings — see the Rust `Answer::Score` doc: a
+ *  numeric legend entry could not be canonicalized identically here. Omitted
+ *  entirely when empty, as the provider omits it. */
+function legendOf(value: unknown): string {
+  if (typeof value !== "object" || value === null) return "";
+  const src = value as Record<string, unknown>;
+  const keys = Object.keys(src).sort();
+  if (keys.length === 0) return "";
+  const body = keys
+    .map((k) => {
+      const v = src[k];
+      return `${JSON.stringify(k)}:${JSON.stringify(typeof v === "string" ? v : JSON.stringify(v))}`;
+    })
+    .join(",");
+  return `,"legend":{${body}}`;
 }
 
 /** Runs a decision request against a model and returns the raw envelope.
