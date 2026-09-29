@@ -75,6 +75,7 @@ import { Route as ApiAgentStatusRouteImport } from './routes/api/agent.status'
 import { Route as ApiAgentHealthRouteImport } from './routes/api/agent.health'
 import { Route as ApiAgentBugReportRouteImport } from './routes/api/agent.bug-report'
 import { Route as HeaderLayoutUIdentifierRouteImport } from './routes/_header-layout.u.$identifier'
+import { Route as HeaderLayoutModelsCapacityRouteImport } from './routes/_header-layout.models_.capacity'
 import { Route as HeaderLayoutMachinesRkeyRouteImport } from './routes/_header-layout.machines.$rkey'
 import { Route as HeaderLayoutDevicesNewRouteImport } from './routes/_header-layout.devices.new'
 import { Route as HeaderLayoutBlogSlugRouteImport } from './routes/_header-layout.blog.$slug'
@@ -454,6 +455,12 @@ const HeaderLayoutUIdentifierRoute = HeaderLayoutUIdentifierRouteImport.update({
   path: '/u/$identifier',
   getParentRoute: () => HeaderLayoutRoute,
 } as any)
+const HeaderLayoutModelsCapacityRoute =
+  HeaderLayoutModelsCapacityRouteImport.update({
+    id: '/models_/capacity',
+    path: '/models/capacity',
+    getParentRoute: () => HeaderLayoutRoute,
+  } as any)
 const HeaderLayoutMachinesRkeyRoute =
   HeaderLayoutMachinesRkeyRouteImport.update({
     id: '/machines/$rkey',
@@ -672,6 +679,7 @@ export interface FileRoutesByFullPath {
   '/blog/$slug': typeof HeaderLayoutBlogSlugRoute
   '/devices/new': typeof HeaderLayoutDevicesNewRoute
   '/machines/$rkey': typeof HeaderLayoutMachinesRkeyRoute
+  '/models/capacity': typeof HeaderLayoutModelsCapacityRoute
   '/u/$identifier': typeof HeaderLayoutUIdentifierRoute
   '/api/agent/bug-report': typeof ApiAgentBugReportRoute
   '/api/agent/health': typeof ApiAgentHealthRoute
@@ -767,6 +775,7 @@ export interface FileRoutesByTo {
   '/blog/$slug': typeof HeaderLayoutBlogSlugRoute
   '/devices/new': typeof HeaderLayoutDevicesNewRoute
   '/machines/$rkey': typeof HeaderLayoutMachinesRkeyRoute
+  '/models/capacity': typeof HeaderLayoutModelsCapacityRoute
   '/u/$identifier': typeof HeaderLayoutUIdentifierRoute
   '/api/agent/bug-report': typeof ApiAgentBugReportRoute
   '/api/agent/health': typeof ApiAgentHealthRoute
@@ -866,6 +875,7 @@ export interface FileRoutesById {
   '/_header-layout/blog/$slug': typeof HeaderLayoutBlogSlugRoute
   '/_header-layout/devices/new': typeof HeaderLayoutDevicesNewRoute
   '/_header-layout/machines/$rkey': typeof HeaderLayoutMachinesRkeyRoute
+  '/_header-layout/models_/capacity': typeof HeaderLayoutModelsCapacityRoute
   '/_header-layout/u/$identifier': typeof HeaderLayoutUIdentifierRoute
   '/api/agent/bug-report': typeof ApiAgentBugReportRoute
   '/api/agent/health': typeof ApiAgentHealthRoute
@@ -964,6 +974,7 @@ export interface FileRouteTypes {
     | '/blog/$slug'
     | '/devices/new'
     | '/machines/$rkey'
+    | '/models/capacity'
     | '/u/$identifier'
     | '/api/agent/bug-report'
     | '/api/agent/health'
@@ -1059,6 +1070,7 @@ export interface FileRouteTypes {
     | '/blog/$slug'
     | '/devices/new'
     | '/machines/$rkey'
+    | '/models/capacity'
     | '/u/$identifier'
     | '/api/agent/bug-report'
     | '/api/agent/health'
@@ -1157,6 +1169,7 @@ export interface FileRouteTypes {
     | '/_header-layout/blog/$slug'
     | '/_header-layout/devices/new'
     | '/_header-layout/machines/$rkey'
+    | '/_header-layout/models_/capacity'
     | '/_header-layout/u/$identifier'
     | '/api/agent/bug-report'
     | '/api/agent/health'
@@ -1737,6 +1750,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof HeaderLayoutUIdentifierRouteImport
       parentRoute: typeof HeaderLayoutRoute
     }
+    '/_header-layout/models_/capacity': {
+      id: '/_header-layout/models_/capacity'
+      path: '/models/capacity'
+      fullPath: '/models/capacity'
+      preLoaderRoute: typeof HeaderLayoutModelsCapacityRouteImport
+      parentRoute: typeof HeaderLayoutRoute
+    }
     '/_header-layout/machines/$rkey': {
       id: '/_header-layout/machines/$rkey'
       path: '/machines/$rkey'
@@ -2012,6 +2032,7 @@ interface HeaderLayoutRouteChildren {
   HeaderLayoutBlogSlugRoute: typeof HeaderLayoutBlogSlugRoute
   HeaderLayoutDevicesNewRoute: typeof HeaderLayoutDevicesNewRoute
   HeaderLayoutMachinesRkeyRoute: typeof HeaderLayoutMachinesRkeyRoute
+  HeaderLayoutModelsCapacityRoute: typeof HeaderLayoutModelsCapacityRoute
   HeaderLayoutUIdentifierRoute: typeof HeaderLayoutUIdentifierRoute
   HeaderLayoutBlogIndexRoute: typeof HeaderLayoutBlogIndexRoute
   HeaderLayoutMachinesIndexRoute: typeof HeaderLayoutMachinesIndexRoute
@@ -2035,6 +2056,7 @@ const HeaderLayoutRouteChildren: HeaderLayoutRouteChildren = {
   HeaderLayoutBlogSlugRoute: HeaderLayoutBlogSlugRoute,
   HeaderLayoutDevicesNewRoute: HeaderLayoutDevicesNewRoute,
   HeaderLayoutMachinesRkeyRoute: HeaderLayoutMachinesRkeyRoute,
+  HeaderLayoutModelsCapacityRoute: HeaderLayoutModelsCapacityRoute,
   HeaderLayoutUIdentifierRoute: HeaderLayoutUIdentifierRoute,
   HeaderLayoutBlogIndexRoute: HeaderLayoutBlogIndexRoute,
   HeaderLayoutMachinesIndexRoute: HeaderLayoutMachinesIndexRoute,

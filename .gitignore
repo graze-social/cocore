@@ -7,7 +7,7 @@ packages/appview/schemas/
 sdk/py/src/cocore/lex/
 
 # Node
-node_modules/
+node_modules
 dist/
 .next/
 *.tsbuildinfo
