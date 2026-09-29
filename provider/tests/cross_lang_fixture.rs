@@ -570,3 +570,73 @@ fn workspace_target_dir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).ok();
     dir
 }
+
+/// Pin the decision engine's canonical answer bytes so the TypeScript
+/// verifier reproduces them exactly.
+///
+/// This is the contract replay verification rests on. A requester re-runs a
+/// decision, canonicalizes the answers in TS, hashes, and compares with the
+/// `outputCommitment` a Rust provider signed. If the two canonicalizations
+/// disagree by so much as a key order, every honest receipt fails to verify
+/// and the whole property is worthless — so the bytes are pinned here rather
+/// than described in prose in two places.
+#[test]
+fn writes_decision_canonical_fixture() {
+    use cocore_provider::engines::decision::{parse_decision_response, DecisionRequest};
+
+    // One of each question type, with ids deliberately NOT in sorted order.
+    let request = serde_json::json!({
+        "model": "convaiinnovations/laya",
+        "state": "Third time this year you've double-charged me. I need this fixed today.",
+        "questions": {
+            "urgent": { "type": "noul", "instructions": "The message conveys urgency." },
+            "action": {
+                "type": "choice",
+                "instructions": "What should happen next?",
+                "criteria": { "refund": "issue a refund", "escalate": "send to a human" }
+            },
+            "severity": {
+                "type": "score",
+                "instructions": "How severe is this?",
+                "criteria": ["minor", "moderate", "severe"]
+            }
+        }
+    });
+    let parsed = DecisionRequest::parse(&request.to_string()).unwrap();
+
+    // An upstream reply whose keys are in an awkward order, as a real server's
+    // JSON serializer might emit them — canonicalization must erase that.
+    let upstream = br#"{
+        "usage": { "output_tokens": 0, "input_tokens": 37 },
+        "answers": {
+            "severity": { "probabilities": { "severe": 0.5, "minor": 0.1, "moderate": 0.4 },
+                          "type": "score", "confidence": 0.62, "score": 2.4 },
+            "urgent": { "noul": 0.97, "type": "noul" },
+            "action": { "confidence": 0.71, "type": "choice", "choice": "refund",
+                        "probabilities": { "escalate": 0.29, "refund": 0.71 } }
+        },
+        "model": "convaiinnovations/laya"
+    }"#;
+
+    let result =
+        parse_decision_response(upstream, &parsed.questions, "convaiinnovations/laya").unwrap();
+    let canonical = result.to_canonical_json();
+    let output_commitment = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(canonical.as_bytes());
+        hex::encode(h.finalize())
+    };
+
+    let fixture = serde_json::json!({
+        "request": request,
+        "upstreamReply": serde_json::from_slice::<serde_json::Value>(upstream).unwrap(),
+        "canonicalAnswers": canonical,
+        "outputCommitment": output_commitment,
+    });
+
+    let path = workspace_target_dir().join("decision-cross-lang-fixture.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&fixture).unwrap())
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    eprintln!("wrote {}", path.display());
+}

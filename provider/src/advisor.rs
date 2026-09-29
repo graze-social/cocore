@@ -2292,6 +2292,11 @@ async fn handle_inference_request_inner(
         topPMilli: None,
         outputSchemaHash: output_schema_hash,
         toolSchemaHash: tool_schema_hash,
+        // Which artifact actually ran, when the engine can name one. A claim,
+        // not an attestation (see `Engine::model_digest`) — its worth is that
+        // a deterministic model can be re-run against it, so a false digest
+        // fails the requester's own check.
+        modelDigest: engine.model_digest(),
     };
 
     // Pro bono decision: if the owner has elected to serve this requester

@@ -822,6 +822,19 @@ pub trait Engine: Send + Sync {
     /// backend can stream token deltas natively.
     fn generate_once(&self, request: &GenerateRequest) -> Result<GenerateResponse>;
 
+    /// SHA-256 hex identifying the exact model artifact this engine runs, when
+    /// it knows one. Stamped onto the receipt as `params.modelDigest` so the
+    /// opaque `model` id is disambiguated — a 4-bit and an f16 build of one
+    /// repo are different artifacts that produce different outputs.
+    ///
+    /// This is a CLAIM the provider publishes, not something the agent
+    /// verifies. `None` is the honest default and the only correct answer when
+    /// the engine cannot identify what it loaded (an attached server owns its
+    /// own weights, so the agent knows only what the operator declared).
+    fn model_digest(&self) -> Option<String> {
+        None
+    }
+
     /// True iff this engine processes the plaintext prompt ENTIRELY inside the
     /// measured provider binary — no owner-controlled subprocess, interpreter,
     /// or IPC the attestation doesn't cover. This is the load-bearing

@@ -190,6 +190,10 @@ impl Engine for Gated {
     fn in_process(&self) -> bool {
         self.inner.in_process()
     }
+
+    fn model_digest(&self) -> Option<String> {
+        self.inner.model_digest()
+    }
     fn metallib_hash(&self) -> Option<String> {
         self.inner.metallib_hash()
     }

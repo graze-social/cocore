@@ -84,6 +84,9 @@ const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DECISION_ENGINE_MAP_ENV: &str = "COCORE_DECISION_ENGINE_MAP";
 pub const DECISION_ENGINE_MAP_FILE: &str = ".cocore/decision-engine-map";
 
+pub const MODEL_DIGESTS_ENV: &str = "COCORE_MODEL_DIGESTS";
+pub const MODEL_DIGESTS_FILE: &str = ".cocore/model-digests";
+
 /// Upper bound on `choice` options, from the System-One API reference.
 const MAX_CHOICE_OPTIONS: usize = 255;
 /// Ordered `score` levels, from the System-One API reference.
@@ -95,6 +98,64 @@ const MAX_SCORE_LEVELS: usize = 10;
 /// model by an operator editing one file.
 pub fn decision_engine_map() -> Result<EngineMap> {
     EngineMap::from_sources(DECISION_ENGINE_MAP_ENV, DECISION_ENGINE_MAP_FILE)
+}
+
+/// Operator-declared model artifact digests, `model = <64 hex>` per line in
+/// `COCORE_MODEL_DIGESTS` or `~/.cocore/model-digests`.
+///
+/// The operator is the one who pulled the weights, so they are the only party
+/// on this machine that can compute `sha256sum` over them — an attached server
+/// owns its own files and the agent never sees them. So this is a declaration
+/// the agent relays, clearly, as a claim.
+///
+/// It is worth relaying despite being unverified because it is *falsifiable*:
+/// a decision model is deterministic, so a requester who re-runs the named
+/// artifact over the same input and gets different probabilities holds a
+/// signed receipt that contradicts itself. A wrong digest is strictly worse
+/// for the provider than no digest, which is why an honest one is the
+/// equilibrium and why absence is allowed rather than defaulted.
+///
+/// Malformed entries are dropped with a warning rather than failing the serve:
+/// a typo'd digest must not take a working machine offline, and the receipt
+/// simply carries no claim.
+pub fn model_digests() -> BTreeMap<String, String> {
+    let raw = match std::env::var(MODEL_DIGESTS_ENV) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => match dirs::home_dir().map(|h| h.join(MODEL_DIGESTS_FILE)) {
+            Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
+            None => String::new(),
+        },
+    };
+    let mut out = BTreeMap::new();
+    for entry in raw.split([',', ';', '\n']) {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let Some((model, digest)) = entry.split_once('=') else {
+            tracing::warn!(entry = %entry, "model-digest entry is not `model=<sha256>`; ignoring");
+            continue;
+        };
+        let model = model.trim();
+        // Accept a `sha256:` prefix since that is how most tooling prints one.
+        let digest = digest
+            .trim()
+            .trim_start_matches("sha256:")
+            .to_ascii_lowercase();
+        if model.is_empty() || !is_sha256_hex(&digest) {
+            tracing::warn!(
+                model = %model,
+                "model-digest entry is not 64 lowercase hex characters; ignoring (the receipt will carry no digest claim for this model)"
+            );
+            continue;
+        }
+        out.insert(model.to_string(), digest);
+    }
+    out
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +642,7 @@ pub fn decision_canary_passed(bytes: &[u8]) -> bool {
 
 pub struct AttachedDecisionEngine {
     model_id: String,
+    model_digest: Option<String>,
     target: AttachedTarget,
     verified_decisions: Mutex<bool>,
     ready_cache: Mutex<Option<(Instant, bool)>>,
@@ -601,11 +663,19 @@ impl AttachedDecisionEngine {
         }
         Self {
             model_id,
+            model_digest: None,
             target,
             verified_decisions: Mutex::new(false),
             ready_cache: Mutex::new(None),
             ready_timeout: None,
         }
+    }
+
+    /// Declare which artifact this engine runs (see [`model_digests`]). The
+    /// agent relays it as a claim on the receipt; it never verifies it.
+    pub fn with_model_digest(mut self, digest: Option<String>) -> Self {
+        self.model_digest = digest;
+        self
     }
 
     /// Bound how long [`start`](Self::start) waits for the server, instead of
@@ -740,6 +810,10 @@ impl AttachedDecisionEngine {
 impl Engine for AttachedDecisionEngine {
     fn name(&self) -> &'static str {
         "attached-decision"
+    }
+
+    fn model_digest(&self) -> Option<String> {
+        self.model_digest.clone()
     }
 
     fn ready(&self) -> bool {

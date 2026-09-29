@@ -3077,7 +3077,9 @@ impl BuiltEngines {
 fn build_engines(ram_gb: u32) -> BuiltEngines {
     use cocore_provider::engines::admission::Gated;
     use cocore_provider::engines::attached::{AttachedEngine, EngineMap};
-    use cocore_provider::engines::decision::{decision_engine_map, AttachedDecisionEngine};
+    use cocore_provider::engines::decision::{
+        decision_engine_map, model_digests, AttachedDecisionEngine,
+    };
     use cocore_provider::engines::stub::StubEngine;
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
@@ -3476,11 +3478,15 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
     // passed its canary. A model that failed either is not served at all, so
     // listing it would route decisions to a machine that can't answer them.
     let mut served_decision_models: Vec<String> = vec![];
+    // Operator-declared artifact digests, relayed onto receipts as a claim.
+    // Empty when the operator declared none — the honest default.
+    let declared_digests = model_digests();
     for model in &decision_models {
         let Some(target) = decision_map.get(model) else {
             continue;
         };
-        let engine = AttachedDecisionEngine::new(model.clone(), target.clone());
+        let engine = AttachedDecisionEngine::new(model.clone(), target.clone())
+            .with_model_digest(declared_digests.get(model).cloned());
         match engine.start() {
             Ok(()) => {
                 tracing::info!(model = %model, target = %target, "attached decision engine ready");

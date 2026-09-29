@@ -97,6 +97,17 @@ pub struct GenerationParams {
     /// Covered by enclaveSignature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolSchemaHash: Option<String>,
+    /// SHA-256 hex identifying the exact model artifact that ran, so the
+    /// opaque `model` id is disambiguated (a 4-bit and an f16 build of one
+    /// repo are different artifacts producing different outputs).
+    ///
+    /// A CLAIM, not an attestation — nothing in the agent verifies it, and a
+    /// dishonest provider can write anything. It is worth committing to
+    /// anyway because it is falsifiable: for a deterministic model the
+    /// requester re-runs the named artifact and checks `outputCommitment`, so
+    /// a false digest is self-defeating. Covered by enclaveSignature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modelDigest: Option<String>,
 }
 
 #[allow(non_snake_case)]
@@ -419,6 +430,7 @@ mod tests {
             topPMilli: None,
             outputSchemaHash: Some("d".repeat(64)),
             toolSchemaHash: Some("e".repeat(64)),
+            modelDigest: Some("f".repeat(64)),
         });
         let (rec, _) = build(inputs, &*signer).unwrap();
 
@@ -432,6 +444,9 @@ mod tests {
         assert!(signed["params"].get("topPMilli").is_none());
         assert_eq!(signed["params"]["outputSchemaHash"], json!("d".repeat(64)));
         assert_eq!(signed["params"]["toolSchemaHash"], json!("e".repeat(64)));
+        // The artifact claim is inside the signed bytes: a provider cannot
+        // publish a receipt and later disown which model it named.
+        assert_eq!(signed["params"]["modelDigest"], json!("f".repeat(64)));
         let message = to_canonical_bytes(&signed).unwrap();
 
         let sig_der = B64.decode(rec.enclaveSignature.as_bytes()).unwrap();

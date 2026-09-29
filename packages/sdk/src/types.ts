@@ -194,6 +194,11 @@ export interface GenerationParams {
   /** SHA-256 hex of the canonical JSON of the tools array used. Present
    *  only when the job specified tools. */
   toolSchemaHash?: string;
+  /** SHA-256 hex identifying the exact model artifact that ran, disambiguating
+   *  the opaque `model` id. A provider CLAIM, not an attestation — its value
+   *  is that a deterministic model makes it falsifiable by replay (see
+   *  `verifyDecisionReceipt`). Absent when the provider named no artifact. */
+  modelDigest?: string;
 }
 
 export interface ReceiptRecord {

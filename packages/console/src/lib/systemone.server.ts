@@ -25,6 +25,8 @@
 // signed receipt for a malformed decision. Neither can stand in for the
 // other — they defend against different parties.
 
+import { canonicalDecisionRequest } from "@cocore/sdk/decision";
+
 import type { DispatchErrorCode } from "@/lib/inference-dispatch.server.ts";
 import { dispatchErrorToHttpResponse } from "@/lib/openai-chat-completions.server.ts";
 
@@ -243,30 +245,22 @@ export function resolveDecisionModel(
  * same commitment no matter how the caller's JSON serializer ordered its
  * object keys. Arrays keep their order: a score question's `criteria` levels
  * are ordered, and reordering them would change the question.
+ *
+ * Thin wrapper over the SDK's `canonicalDecisionRequest` — the requester's
+ * replay verifier recomputes `inputCommitment` with the same function, so
+ * there is exactly one definition of these bytes.
  */
 export function canonicalDecisionPrompt(
   parsed: ParsedSystemOneRequest,
   resolvedModel: string,
 ): string {
-  return canonicalJson({
-    model: resolvedModel,
-    state: parsed.state,
-    questions: parsed.rawQuestions,
-  });
-}
-
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(sortKeys(value));
-}
-
-function sortKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortKeys);
-  if (typeof value !== "object" || value === null) return value;
-  const out: Record<string, unknown> = {};
-  for (const k of Object.keys(value as Record<string, unknown>).sort()) {
-    out[k] = sortKeys((value as Record<string, unknown>)[k]);
-  }
-  return out;
+  // The SDK owns this, because the requester's verifier has to reproduce the
+  // exact same bytes to check `inputCommitment` — two implementations of a
+  // canonical form is two chances to disagree. See `@cocore/sdk/decision`.
+  return canonicalDecisionRequest(
+    { state: parsed.state, questions: parsed.rawQuestions },
+    resolvedModel,
+  );
 }
 
 export interface DecisionAnswers {
