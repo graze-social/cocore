@@ -3066,6 +3066,7 @@ impl BuiltEngines {
 fn build_engines(ram_gb: u32) -> BuiltEngines {
     use cocore_provider::engines::admission::Gated;
     use cocore_provider::engines::attached::{AttachedEngine, EngineMap};
+    use cocore_provider::engines::decision::{decision_engine_map, AttachedDecisionEngine};
     use cocore_provider::engines::stub::StubEngine;
     let mut registry = cocore_provider::engines::EngineRegistry::new();
     registry.register("stub", std::sync::Arc::new(StubEngine));
@@ -3174,6 +3175,32 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         }
     };
 
+    // Attached DECISION engines: System-One models (Laya and friends) served
+    // over `/v1/systemone` by ollaya / `laya serve` / Unsloth Desktop. They are
+    // not chat models — non-autoregressive, no sampler, no
+    // `/v1/chat/completions` — so they get their own map rather than sharing
+    // one an operator would have to reason about per entry.
+    let decision_map = match decision_engine_map() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "decision engine map is invalid; ignoring attached decision engines");
+            if engine_map_fault.is_none() {
+                engine_map_fault = Some(EngineFault {
+                    code: "decision-engine-map-invalid".to_string(),
+                    message: format!(
+                        "The decision-engine map (COCORE_DECISION_ENGINE_MAP or \
+                         ~/.cocore/decision-engine-map) could not be parsed: {e}. Entries look like \
+                         `convaiinnovations/laya=http://127.0.0.1:11435`, one per line or \
+                         comma-separated. No decision model is being served until it is fixed."
+                    ),
+                    models: vec![],
+                    at: chrono::Utc::now(),
+                });
+            }
+            EngineMap::default()
+        }
+    };
+
     let raw = std::env::var("COCORE_INFERENCE_MODELS")
         .or_else(|_| std::env::var("COCORE_INFERENCE_MODEL"))
         .unwrap_or_default();
@@ -3191,12 +3218,17 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         // ALSO by a vllm-mlx child — even if the operator listed it in both
         // places (the tray writes COCORE_INFERENCE_MODELS from its picker).
         .filter(|s| !engine_map.contains(s))
+        // Same rule for decision models: a System-One model has no MLX
+        // checkpoint to download, so a `snapshot_download` on it would 404
+        // and burn the recovery retries.
+        .filter(|s| !decision_map.contains(s))
         .collect();
     let mut attached: Vec<String> = engine_map.models();
+    let mut decision_models: Vec<String> = decision_map.models();
 
-    if configured.is_empty() && attached.is_empty() {
+    if configured.is_empty() && attached.is_empty() && decision_models.is_empty() {
         tracing::info!(
-            "no inference models configured (set COCORE_INFERENCE_MODELS or COCORE_ENGINE_MAP to enable real inference; this agent will serve `stub` only)"
+            "no inference models configured (set COCORE_INFERENCE_MODELS, COCORE_ENGINE_MAP, or COCORE_DECISION_ENGINE_MAP to enable real inference; this agent will serve `stub` only)"
         );
         // On a confidential machine the subprocess set is intentionally empty
         // (inference runs in-process), so a native failure is the fault to
@@ -3244,6 +3276,7 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         let active = schedules.active_now(&configured);
         tracing::info!(active = ?active, "per-model schedule: loading the models whose window is open now");
         attached = schedules.active_now(&attached);
+        decision_models = schedules.active_now(&decision_models);
         active
     };
 
@@ -3421,13 +3454,47 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         }
     }
 
+    // Attached decision engines: same contract as above, different wire
+    // format. `start()` here is stricter than the chat engine's — a decision
+    // server that answers `/v1/models` but fails the `/v1/systemone` canary is
+    // NOT registered at all, because unlike tool calling or structured output
+    // there is no reduced mode it could still serve.
+    let mut decision_failed: Vec<String> = vec![];
+    let mut decision_last_err: Option<String> = None;
+    for model in &decision_models {
+        let Some(target) = decision_map.get(model) else {
+            continue;
+        };
+        let engine = AttachedDecisionEngine::new(model.clone(), target.clone());
+        match engine.start() {
+            Ok(()) => {
+                tracing::info!(model = %model, target = %target, "attached decision engine ready");
+                registry.register(
+                    model.clone(),
+                    std::sync::Arc::new(Gated::single_flight(std::sync::Arc::new(engine))),
+                );
+            }
+            Err(e) => {
+                // Keep the "inference engine load failed" phrase stable —
+                // `models_cli::match_log_line` and the tray match on it.
+                tracing::warn!(model = %model, target = %target, error = %e, reason = "decision-engine-unavailable", "inference engine load failed");
+                decision_last_err = Some(e.to_string());
+                decision_failed.push(model.clone());
+            }
+        }
+    }
+
     let model_capacity = if registry.loaded_models().len() > 1 {
         Some(gate_capacity)
     } else {
         None
     };
 
-    if failed.is_empty() && too_large.is_empty() && attached_failed.is_empty() {
+    if failed.is_empty()
+        && too_large.is_empty()
+        && attached_failed.is_empty()
+        && decision_failed.is_empty()
+    {
         return BuiltEngines {
             registry,
             fault: engine_map_fault,
@@ -3444,6 +3511,7 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
     let mut all_unserved = failed.clone();
     all_unserved.extend(too_large.iter().cloned());
     all_unserved.extend(attached_failed.iter().cloned());
+    all_unserved.extend(decision_failed.iter().cloned());
 
     // Build a curated, content-safe fault for the console. Detailed
     // tracebacks already went to `tracing` inside the recovery loop;
@@ -3672,6 +3740,27 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
                  failing, DM @cocore.dev on Bluesky with your machine label and we'll help.",
                 failed.join(", "),
                 ENGINE_START_MAX_ATTEMPTS,
+            ),
+            models: all_unserved,
+            at: chrono::Utc::now(),
+        }
+    } else if !decision_failed.is_empty() {
+        tracing::warn!(
+            models = ?decision_failed,
+            last_error = %decision_last_err.as_deref().unwrap_or("(none captured)"),
+            "attached decision engine(s) unavailable; not advertising them"
+        );
+        EngineFault {
+            code: "decision-engine-unavailable".to_string(),
+            message: format!(
+                "The decision server for [{}] is not serving: {}. Decision models (Laya and \
+                 friends) are answered over `/v1/systemone` by a server you run — for example \
+                 `ollaya serve`, which listens on 11435. The agent does not start or manage it. \
+                 Check it answers `curl http://127.0.0.1:<port>/v1/models`, confirm it has the \
+                 model named in your decision-engine map pulled, then start serving again. Other \
+                 configured models are unaffected.",
+                decision_failed.join(", "),
+                decision_last_err.as_deref().unwrap_or("no response"),
             ),
             models: all_unserved,
             at: chrono::Utc::now(),

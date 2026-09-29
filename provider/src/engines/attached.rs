@@ -140,7 +140,7 @@ impl AttachedTarget {
         }
         if path.eq_ignore_ascii_case("/v1") {
             bail!(
-                "attached engine URL {raw:?} ends in /v1; give the server root instead (the agent appends /v1/chat/completions itself)"
+                "attached engine URL {raw:?} ends in /v1; give the server root instead (the agent appends /v1/... itself)"
             );
         }
         Ok(Self {
@@ -166,8 +166,50 @@ impl AttachedTarget {
             .unwrap_or(false)
     }
 
-    fn path(&self, route: &str) -> String {
+    pub fn path(&self, route: &str) -> String {
         format!("{}{}", self.path_prefix, route)
+    }
+
+    /// Dial the server, honoring [`CONNECT_TIMEOUT`]. Every attached engine
+    /// — chat or decision — goes through here so there is one place that
+    /// knows how we reach an operator-run server.
+    pub fn connect(&self) -> Result<TcpStream> {
+        let addrs: Vec<_> = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving attached engine host {self}"))?
+            .collect();
+        let mut last = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    return Ok(s);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(anyhow!(
+            "connecting to attached engine {}: {}",
+            self,
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "no addresses".to_string())
+        ))
+    }
+
+    /// `GET /v1/models` answering 2xx — the readiness signal for any
+    /// attached server. A decision server (ollaya, `laya serve`) answers it
+    /// too, which is why it is the probe for both engine kinds.
+    pub fn probe_ready(&self) -> bool {
+        let Ok(mut stream) = self.connect() else {
+            return false;
+        };
+        probe_models_ready(&mut stream, &self.host_header())
+    }
+
+    /// POST a JSON body to `route` (mounted under any path prefix).
+    pub fn post_json(&self, route: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let mut stream = self.connect()?;
+        http_post(&mut stream, &self.host_header(), &self.path(route), body)
     }
 }
 
@@ -214,12 +256,20 @@ impl EngineMap {
     /// A malformed source is an error — a typo must not silently fall back
     /// to spawning vllm-mlx for a model the operator meant to attach.
     pub fn from_env_or_file() -> Result<Self> {
-        if let Ok(raw) = std::env::var(ENGINE_MAP_ENV) {
+        Self::from_sources(ENGINE_MAP_ENV, ENGINE_MAP_FILE)
+    }
+
+    /// Same rule, for any (env var, home-relative file) pair. The decision
+    /// engine map (`COCORE_DECISION_ENGINE_MAP` / `~/.cocore/decision-engine-map`)
+    /// is a second map with identical syntax and precedence — one parser, so
+    /// the two can never drift in how they read `model=url`.
+    pub fn from_sources(env_var: &str, file_rel: &str) -> Result<Self> {
+        if let Ok(raw) = std::env::var(env_var) {
             if !raw.trim().is_empty() {
-                return Self::parse(&raw).context(ENGINE_MAP_ENV);
+                return Self::parse(&raw).context(env_var.to_string());
             }
         }
-        let Some(path) = Self::file_path() else {
+        let Some(path) = Self::file_path_rel(file_rel) else {
             return Ok(Self::default());
         };
         match std::fs::read_to_string(&path) {
@@ -230,7 +280,11 @@ impl EngineMap {
     }
 
     pub fn file_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(ENGINE_MAP_FILE))
+        Self::file_path_rel(ENGINE_MAP_FILE)
+    }
+
+    pub fn file_path_rel(file_rel: &str) -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(file_rel))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -290,43 +344,15 @@ impl AttachedEngine {
     }
 
     fn connect(&self) -> Result<TcpStream> {
-        let addrs: Vec<_> = (self.target.host.as_str(), self.target.port)
-            .to_socket_addrs()
-            .with_context(|| format!("resolving attached engine host {}", self.target))?
-            .collect();
-        let mut last = None;
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    return Ok(s);
-                }
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(anyhow!(
-            "connecting to attached engine {}: {}",
-            self.target,
-            last.map(|e| e.to_string())
-                .unwrap_or_else(|| "no addresses".to_string())
-        ))
+        self.target.connect()
     }
 
     fn probe(&self) -> bool {
-        let Ok(mut stream) = self.connect() else {
-            return false;
-        };
-        probe_models_ready(&mut stream, &self.target.host_header())
+        self.target.probe_ready()
     }
 
     fn post(&self, route: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = self.connect()?;
-        http_post(
-            &mut stream,
-            &self.target.host_header(),
-            &self.target.path(route),
-            body,
-        )
+        self.target.post_json(route, body)
     }
 
     fn ready_timeout() -> Duration {

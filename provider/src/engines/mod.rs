@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 pub mod admission;
 pub mod attached;
+pub mod decision;
 #[cfg(feature = "native_mlx")]
 pub mod native_mlx;
 pub mod openai_http;
@@ -66,6 +67,12 @@ pub enum EngineRejection {
     /// failed (or never ran) the structured-output canary, so it would serve
     /// unconstrained prose as if it were schema-valid JSON.
     StructuredOutputUnsupported { model: String },
+    /// The model is served by an attached DECISION engine (`/v1/systemone`),
+    /// and this request is not a decision it can answer — most often an
+    /// ordinary chat job routed to a decision model id, since no advertised
+    /// capability separates the two yet. Refusing keeps the contract of a
+    /// rejection: the model never ran, so no receipt and no bill.
+    DecisionRequestInvalid { model: String, reason: String },
 }
 
 impl std::fmt::Display for EngineRejection {
@@ -83,6 +90,10 @@ impl std::fmt::Display for EngineRejection {
                 f,
                 "model '{model}' on this provider does not support structured output (response_format json_schema); route to a provider that advertises it"
             ),
+            EngineRejection::DecisionRequestInvalid { model, reason } => write!(
+                f,
+                "model '{model}' is a decision model served over /v1/systemone and cannot answer this request: {reason}"
+            ),
         }
     }
 }
@@ -96,6 +107,7 @@ impl EngineRejection {
         match self {
             EngineRejection::Busy { .. } => "engine-busy",
             EngineRejection::StructuredOutputUnsupported { .. } => "structured-output-unsupported",
+            EngineRejection::DecisionRequestInvalid { .. } => "decision-request-invalid",
         }
     }
 }
