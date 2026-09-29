@@ -38,7 +38,7 @@ const MAX_SCORE_LEVELS = 10;
 /** Model ids every Jev client hardcodes, resolved to whichever System-One
  *  model is actually on the network. `jev-latest` is the SDK default and
  *  `laya` is what the local servers call it; neither is a repo id. */
-export const DECISION_MODEL_ALIASES = ["jev-latest", "jev", "laya", "laya:multilingual"];
+const DECISION_MODEL_ALIASES = ["jev-latest", "jev", "laya", "laya:multilingual"];
 
 /** The System-One models published as open weights today, in the order we
  *  prefer them when a caller asks for an alias. Multilingual leads because it
@@ -55,7 +55,7 @@ const BUILTIN_DECISION_MODELS = [
   "convaiinnovations/laya-typed-decisions",
 ];
 
-export function knownDecisionModels(): string[] {
+function knownDecisionModels(): string[] {
   const extra = (process.env["COCORE_DECISION_MODELS"] ?? "")
     .split(",")
     .map((s) => s.trim())
@@ -63,7 +63,7 @@ export function knownDecisionModels(): string[] {
   return [...new Set([...extra, ...BUILTIN_DECISION_MODELS])];
 }
 
-export type QuestionType = "noul" | "choice" | "score";
+type QuestionType = "noul" | "choice" | "score";
 
 export interface ParsedQuestion {
   type: QuestionType;

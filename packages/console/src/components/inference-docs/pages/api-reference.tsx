@@ -168,10 +168,10 @@ export function InferenceApiReferencePage({ baseUrl }: { baseUrl: string }) {
                   <p {...stylex.props(docsStyles.prose)}>
                     A 4-bit and an f16 build of one repo produce different probabilities, so a
                     receipt may name the exact artifact in{" "}
-                    <code {...stylex.props(docsStyles.codeInline)}>params.modelDigest</code>. That is
-                    a provider claim, not an attestation — nothing verifies it when the receipt is
-                    published. What makes it useful is that it is falsifiable: run the artifact it
-                    names and either the commitment matches or you hold a signed receipt that
+                    <code {...stylex.props(docsStyles.codeInline)}>params.modelDigest</code>. That
+                    is a provider claim, not an attestation — nothing verifies it when the receipt
+                    is published. What makes it useful is that it is falsifiable: run the artifact
+                    it names and either the commitment matches or you hold a signed receipt that
                     contradicts its own computation.
                   </p>
                   <h3 {...stylex.props(docsStyles.h2)}>What this does not prove</h3>
