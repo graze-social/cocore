@@ -461,6 +461,39 @@ mod tests {
             .expect("signature must verify with cipher commitment + params present");
     }
 
+    /// Backwards compatibility: a receipt from an engine that names no
+    /// artifact must serialize EXACTLY as it did before `modelDigest` existed.
+    ///
+    /// Every chat engine returns `None` from `Engine::model_digest`, so this
+    /// is the shape all existing traffic keeps producing. If the key were
+    /// emitted as `null` instead of omitted, the canonical signing bytes would
+    /// shift for every receipt on the network and every previously-published
+    /// receipt would stop verifying against a rebuilt canonical form.
+    #[test]
+    fn a_receipt_naming_no_artifact_omits_the_key_entirely() {
+        let signer = load_or_create_identity().unwrap();
+        let mut inputs = fixture(chrono::Utc::now());
+        inputs.params = Some(GenerationParams {
+            maxTokens: Some(256),
+            seed: None,
+            temperatureMilli: None,
+            topPMilli: None,
+            outputSchemaHash: None,
+            toolSchemaHash: None,
+            modelDigest: None,
+        });
+        let (rec, _) = build(inputs, &*signer).unwrap();
+        let published = serde_json::to_value(&rec).unwrap();
+        let params = published["params"].as_object().unwrap();
+        assert!(
+            !params.contains_key("modelDigest"),
+            "an absent digest must be absent, not null: {params:?}"
+        );
+        // And the whole params object is exactly what it was before the field
+        // was added — one key, the one that was set.
+        assert_eq!(params.len(), 1, "unexpected params keys: {params:?}");
+    }
+
     #[test]
     fn pro_bono_field_present_and_signed_when_set() {
         let signer = load_or_create_identity().unwrap();
