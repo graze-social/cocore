@@ -135,6 +135,54 @@ export function InferenceApiReferencePage({ baseUrl }: { baseUrl: string }) {
                   </p>
                 </>
               )}
+              {section.id === "inference-api-verifying-a-decision" && (
+                <>
+                  <p {...stylex.props(docsStyles.prose)}>
+                    A chat completion's{" "}
+                    <code {...stylex.props(docsStyles.codeInline)}>outputCommitment</code> cannot be
+                    checked by anyone: the provider sampled tokens with a random seed, so re-running
+                    the job never reproduces the same bytes. A decision is one deterministic encoder
+                    pass with no sampler, so the same model over the same state gives the same
+                    probabilities — and you already hold the state and questions you sent. That is
+                    enough to check the receipt yourself.
+                  </p>
+                  <HighlightedBlock
+                    lang="bash"
+                    code={`node --experimental-strip-types scripts/verify-decision.ts \\
+  at://did:plc:.../dev.cocore.compute.receipt/abc \\
+  --request ./what-i-sent.json \\
+  --server http://127.0.0.1:11435`}
+                  />
+                  <p {...stylex.props(docsStyles.prose)}>
+                    It recomputes the input commitment from your request, re-runs the decision
+                    against a model server <em>you</em> control, and compares the output commitment
+                    the provider signed. Point it at your own server — re-running against the
+                    provider that issued the receipt proves nothing. The same check is available as
+                    a library:{" "}
+                    <code {...stylex.props(docsStyles.codeInline)}>verifyDecisionReceipt</code> in{" "}
+                    <code {...stylex.props(docsStyles.codeInline)}>@cocore/sdk/decision</code>, and{" "}
+                    <code {...stylex.props(docsStyles.codeInline)}>verify_decision_receipt</code> in
+                    the Python SDK.
+                  </p>
+                  <h3 {...stylex.props(docsStyles.h2)}>Which model ran</h3>
+                  <p {...stylex.props(docsStyles.prose)}>
+                    A 4-bit and an f16 build of one repo produce different probabilities, so a
+                    receipt may name the exact artifact in{" "}
+                    <code {...stylex.props(docsStyles.codeInline)}>params.modelDigest</code>. That is
+                    a provider claim, not an attestation — nothing verifies it when the receipt is
+                    published. What makes it useful is that it is falsifiable: run the artifact it
+                    names and either the commitment matches or you hold a signed receipt that
+                    contradicts its own computation.
+                  </p>
+                  <h3 {...stylex.props(docsStyles.h2)}>What this does not prove</h3>
+                  <p {...stylex.props(docsStyles.prose)}>
+                    Not confidentiality. A decision is served by an engine running outside the
+                    provider's measured binary, so the machine operator can read the state you sent.
+                    Verification tells you the answer is real; it does not tell you nobody saw the
+                    question. Decision models aim to be checkable, not private.
+                  </p>
+                </>
+              )}
               {section.id === "inference-api-tool-calling" && (
                 <>
                   <p {...stylex.props(docsStyles.prose)}>
