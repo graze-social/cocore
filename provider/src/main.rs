@@ -2571,7 +2571,7 @@ struct EngineAttestationFacts {
 impl EngineAttestationFacts {
     fn from_registry(engines: &cocore_provider::engines::EngineRegistry) -> Self {
         Self {
-            in_process_backend: engines.entries().iter().any(|(_, e)| e.in_process()),
+            in_process_backend: cocore_provider::engines::machine_is_in_process(engines),
             metallib_hash: engines
                 .entries()
                 .iter()
@@ -3165,26 +3165,47 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         }
     }
 
+    // Confidential = native-only, and that has to hold for EVERY way a model
+    // can be loaded, not just the subprocess set. The serve path already
+    // clears `COCORE_INFERENCE_MODELS` for this reason; clearing the env var
+    // is not enough for attached engines, whose maps are also read from
+    // `~/.cocore/engine-map` and `~/.cocore/decision-engine-map` — an operator
+    // who once configured one, then turned on Secure Mode, would otherwise
+    // register an out-of-process engine and (correctly, per
+    // `machine_is_in_process`) lose the confidential tier without being told
+    // why. Ignoring the maps keeps the scarcer property.
+    let native_only = std::env::var_os("COCORE_NATIVE_MLX_MODEL").is_some();
+    if native_only {
+        tracing::info!(
+            "confidential tier — ignoring any attached-engine and decision-engine map: inference \
+             must stay inside the measured binary"
+        );
+    }
+
     // Attached engines (issue #204): models the operator serves through an
     // OpenAI-compatible server they already run (mei, mlx_lm.server,
     // llama-server, ...). `COCORE_ENGINE_MAP` or `~/.cocore/engine-map`. A
     // malformed map is a fault, not a silent fallback to vllm-mlx.
     let mut engine_map_fault: Option<EngineFault> = None;
-    let engine_map = match EngineMap::from_env_or_file() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "engine map is invalid; ignoring attached engines");
-            engine_map_fault = Some(EngineFault {
-                code: "engine-map-invalid".to_string(),
-                message: format!(
+    let engine_map = if native_only {
+        EngineMap::default()
+    } else {
+        match EngineMap::from_env_or_file() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "engine map is invalid; ignoring attached engines");
+                engine_map_fault = Some(EngineFault {
+                    code: "engine-map-invalid".to_string(),
+                    message: format!(
                     "The attached-engine map (COCORE_ENGINE_MAP or ~/.cocore/engine-map) could not \
                      be parsed: {e}. Entries look like `model-id=http://127.0.0.1:8024`, one per \
                      line or comma-separated. No attached model is being served until it is fixed."
                 ),
-                models: vec![],
-                at: chrono::Utc::now(),
-            });
-            EngineMap::default()
+                    models: vec![],
+                    at: chrono::Utc::now(),
+                });
+                EngineMap::default()
+            }
         }
     };
 
@@ -3193,12 +3214,15 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
     // not chat models — non-autoregressive, no sampler, no
     // `/v1/chat/completions` — so they get their own map rather than sharing
     // one an operator would have to reason about per entry.
-    let decision_map = match decision_engine_map() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "decision engine map is invalid; ignoring attached decision engines");
-            if engine_map_fault.is_none() {
-                engine_map_fault = Some(EngineFault {
+    let decision_map = if native_only {
+        EngineMap::default()
+    } else {
+        match decision_engine_map() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "decision engine map is invalid; ignoring attached decision engines");
+                if engine_map_fault.is_none() {
+                    engine_map_fault = Some(EngineFault {
                     code: "decision-engine-map-invalid".to_string(),
                     message: format!(
                         "The decision-engine map (COCORE_DECISION_ENGINE_MAP or \
@@ -3209,8 +3233,9 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
                     models: vec![],
                     at: chrono::Utc::now(),
                 });
+                }
+                EngineMap::default()
             }
-            EngineMap::default()
         }
     };
 

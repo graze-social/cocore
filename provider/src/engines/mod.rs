@@ -119,6 +119,63 @@ pub fn rejection_of(err: &anyhow::Error) -> Option<&EngineRejection> {
         .find_map(|e| e.downcast_ref::<EngineRejection>())
 }
 
+/// The model id the built-in echo engine is always registered under. It is
+/// reserved: [`attached::EngineMap`] refuses to remap it, so this really is
+/// the one id that never names a real model.
+pub const STUB_MODEL_ID: &str = "stub";
+
+/// Whether a prompt sealed to THIS MACHINE is handled entirely inside the
+/// measured binary — the `inProcessBackend` claim on the attestation, and the
+/// load-bearing gate for the confidential tier (`verify-provider.ts` blocks on
+/// it with "without this, nothing else about the binary's posture matters").
+///
+/// The claim is machine-level, so it is only honest when EVERY engine that can
+/// serve real work here is in-process. This used to be `any()`, which asserted
+/// the property whenever a single in-process engine was loaded — so a machine
+/// running the native MLX engine alongside an owner-controlled subprocess
+/// (vllm-mlx, an attached chat server, or an attached decision server)
+/// attested in-process while a prompt routed to that other engine
+/// demonstrably left the binary. A requester reading the attestation cannot
+/// see the routing, so the machine-level answer has to be the conservative
+/// one.
+///
+/// Routing is per-model, so the precise answer is per-model too. Saying that
+/// on the wire means a per-model attestation field, which is a lexicon change;
+/// until then this is the claim that cannot overstate what the machine does.
+///
+/// `stub` is excluded. It is registered on every machine and never serves real
+/// work, so counting it would make the property unreachable for everyone.
+/// A machine with nothing BUT `stub` is not in-process either — there is no
+/// real engine to make the claim about.
+pub fn machine_is_in_process(registry: &EngineRegistry) -> bool {
+    let real: Vec<(String, Arc<dyn Engine>)> = registry
+        .entries()
+        .into_iter()
+        .filter(|(id, _)| id != STUB_MODEL_ID)
+        .collect();
+    if real.is_empty() {
+        return false;
+    }
+    let outside: Vec<&str> = real
+        .iter()
+        .filter(|(_, e)| !e.in_process())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !outside.is_empty() {
+        // The operator needs this: it is the whole answer to "why did my
+        // confidential machine drop to best-effort?" and nothing else says it.
+        tracing::warn!(
+            out_of_process_models = ?outside,
+            "this machine is NOT attesting an in-process backend: the listed model(s) are served \
+             by an engine outside the measured binary (a Python subprocess, or an attached server \
+             you run). The confidential tier requires every engine on the machine to be \
+             in-process — unload those models to serve confidentially."
+        );
+        return false;
+    }
+    true
+}
+
 /// A directory of engines keyed by the NSID the requester names in
 /// `chat.completions { model: ... }`.
 ///
@@ -1164,6 +1221,58 @@ mod tests {
         ] {
             assert!(!is_vision_model(id), "{id} should NOT be vision");
         }
+    }
+
+    /// Minimal engine that just declares where it runs, for the
+    /// `inProcessBackend` claim.
+    struct PlacedEngine(bool);
+    impl Engine for PlacedEngine {
+        fn name(&self) -> &'static str {
+            "placed"
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn generate_once(&self, _r: &GenerateRequest) -> Result<GenerateResponse> {
+            unimplemented!("not exercised")
+        }
+        fn in_process(&self) -> bool {
+            self.0
+        }
+    }
+
+    fn registry_with(models: &[(&str, bool)]) -> EngineRegistry {
+        let mut r = EngineRegistry::new();
+        r.register(STUB_MODEL_ID, Arc::new(crate::engines::stub::StubEngine));
+        for (id, in_process) in models {
+            r.register(*id, Arc::new(PlacedEngine(*in_process)));
+        }
+        r
+    }
+
+    #[test]
+    fn in_process_claim_needs_every_real_engine_inside_the_binary() {
+        // The confidential shape: one native engine, nothing else.
+        assert!(machine_is_in_process(&registry_with(&[("native", true)])));
+
+        // The bug this replaced: `any()` claimed the property here, while a
+        // prompt routed to `laya` demonstrably left the measured binary.
+        assert!(!machine_is_in_process(&registry_with(&[
+            ("native", true),
+            ("laya", false),
+        ])));
+
+        // An ordinary best-effort machine.
+        assert!(!machine_is_in_process(&registry_with(&[("qwen", false)])));
+    }
+
+    #[test]
+    fn a_machine_with_only_stub_makes_no_in_process_claim() {
+        // `stub` is excluded from the check because it is registered
+        // everywhere — but excluding it must not let a machine with no real
+        // engine at all inherit the claim by vacuous truth.
+        assert!(!machine_is_in_process(&registry_with(&[])));
+        assert!(!machine_is_in_process(&EngineRegistry::new()));
     }
 
     /// Engine whose readiness is flippable, standing in for a subprocess
