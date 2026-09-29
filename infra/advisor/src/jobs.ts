@@ -32,7 +32,12 @@ import { err } from "@cocore/o11y/http";
 import type { BrokerageAuthority } from "./brokerage.ts";
 import { dispatchOutcome } from "./metrics.ts";
 import type { AdvisorMessage, InferenceRequest } from "./protocol.ts";
-import { hasCapacityFor, supportsStructuredOutputFor, supportsToolCallsFor } from "./registry.ts";
+import {
+  hasCapacityFor,
+  servesDecisionsFor,
+  supportsStructuredOutputFor,
+  supportsToolCallsFor,
+} from "./registry.ts";
 import type { ProviderEntry, ProviderRegistry } from "./registry.ts";
 import type { SseResponse } from "./sessions.ts";
 import type { SessionManager } from "./sessions.ts";
@@ -76,6 +81,17 @@ interface JobBody {
    *  Backstops the open-pool path; the console also pre-filters before it
    *  seals + pins to a single machine. */
   minProviderVersion?: string;
+  /** Optional: this job's sealed bytes are a System-One decision request, to
+   *  be answered over `/v1/systemone`. Routing-only — the advisor never reads
+   *  the plaintext; it only needs to know which KIND of engine can serve it,
+   *  since a decision engine and a chat engine cannot serve each other's
+   *  requests. Absent/false = an ordinary chat job.
+   *
+   *  The durable form of this signal is an `inputFormat` of `decision-v1` on
+   *  the job record itself, so a verifier reading the record knows how to
+   *  interpret `inputCommitment`. That needs a lexicon change and belongs in
+   *  its own PR; until then this flag carries it at dispatch time only. */
+  decision?: boolean;
 }
 
 interface ParsedJob {
@@ -91,6 +107,7 @@ interface ParsedJob {
       | "tools"
       | "toolChoice"
       | "minProviderVersion"
+      | "decision"
     >
   > & {
     jobCid?: string;
@@ -101,6 +118,7 @@ interface ParsedJob {
     tools?: unknown;
     toolChoice?: unknown;
     minProviderVersion?: string;
+    decision?: boolean;
   };
 }
 
@@ -172,6 +190,9 @@ function parseJobBody(input: unknown, generateId: () => string): ParsedJob | Par
   }
   if (b["tools"] !== undefined && !Array.isArray(b["tools"])) {
     return { ok: false, status: 400, error: "tools must be an array when provided" };
+  }
+  if (b["decision"] !== undefined && typeof b["decision"] !== "boolean") {
+    return { ok: false, status: 400, error: "decision must be a boolean when provided" };
   }
   if (b["toolChoice"] !== undefined && typeof b["toolChoice"] !== "string") {
     return { ok: false, status: 400, error: "toolChoice must be a string when provided" };
@@ -303,6 +324,10 @@ async function selectProvider(
   // whose vLLM then rejects the request mid-stream.
   const wantsToolCalls = Array.isArray(job.tools) && job.tools.length > 0;
   const wantsStructuredOutput = job.outputSchema !== undefined && job.outputSchema !== null;
+  // A System-One decision. Unlike the two above this is not a capability the
+  // job optionally wants — it is which KIND of engine can serve it at all, so
+  // the filter runs in both directions (see `servesDecisionsFor`).
+  const wantsDecision = job.decision === true;
 
   // Build the candidate list. A pinned `targetProviderDid` restricts
   // dispatch to that owner's machines (optionally a single machine via
@@ -353,6 +378,12 @@ async function selectProvider(
       if (wantsStructuredOutput && !supportsStructuredOutputFor(m, job.model || undefined)) {
         return false;
       }
+      // Decision vs chat. Pinning a provider doesn't buy a pass: the wrong
+      // engine kind can't answer the request at all, so fail fast with a
+      // reason rather than dispatching into a typed refusal.
+      if (servesDecisionsFor(m, job.model || undefined) !== wantsDecision) {
+        return false;
+      }
       return true;
     });
     if (eligible.length === 0) {
@@ -365,15 +396,17 @@ async function selectProvider(
       return {
         kind: "error",
         status: 503,
-        error: wantsToolCalls
-          ? `provider ${job.targetProviderDid} has no machine with verified tool-calling for this model available`
-          : wantsStructuredOutput
-            ? `provider ${job.targetProviderDid} has no machine with verified structured output (response_format) for this model available`
-            : job.minProviderVersion
-              ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
-              : allCooling
-                ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
-                : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
+        error: wantsDecision
+          ? `provider ${job.targetProviderDid} has no machine serving this model as a decision model (/v1/systemone) available`
+          : wantsToolCalls
+            ? `provider ${job.targetProviderDid} has no machine with verified tool-calling for this model available`
+            : wantsStructuredOutput
+              ? `provider ${job.targetProviderDid} has no machine with verified structured output (response_format) for this model available`
+              : job.minProviderVersion
+                ? `provider ${job.targetProviderDid} has no machine at version >= ${job.minProviderVersion} available`
+                : allCooling
+                  ? `provider ${job.targetProviderDid} is temporarily cooling down after repeated failures; try again shortly`
+                  : `provider ${job.targetProviderDid} has no attested, healthy machine available`,
       };
     }
     eligible.sort((a, b) => b.lastSeen - a.lastSeen);
@@ -387,18 +420,21 @@ async function selectProvider(
       job.minProviderVersion ?? null,
       wantsToolCalls,
       wantsStructuredOutput,
+      wantsDecision,
     );
     if (candidates.length === 0) {
       return {
         kind: "error",
         status: 503,
-        error: wantsToolCalls
-          ? "no attested providers with verified tool-calling for this model available"
-          : wantsStructuredOutput
-            ? "no attested providers with verified structured output (response_format) for this model available"
-            : job.minProviderVersion
-              ? `no attested providers at version >= ${job.minProviderVersion} available`
-              : "no attested providers available",
+        error: wantsDecision
+          ? "no attested providers serving this model as a decision model (/v1/systemone) available"
+          : wantsToolCalls
+            ? "no attested providers with verified tool-calling for this model available"
+            : wantsStructuredOutput
+              ? "no attested providers with verified structured output (response_format) for this model available"
+              : job.minProviderVersion
+                ? `no attested providers at version >= ${job.minProviderVersion} available`
+                : "no attested providers available",
       };
     }
   }

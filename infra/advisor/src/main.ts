@@ -530,6 +530,10 @@ async function main(): Promise<void> {
             // as capability for every model on the machine.
             supportsToolCalls: p.supportsToolCalls,
             toolCallModels: p.toolCallModels,
+            // Models this machine serves over /v1/systemone. The console reads
+            // it to resolve `jev-latest` to a decision model that is actually
+            // online, instead of guessing from a built-in list.
+            decisionModels: p.decisionModels,
           })),
         ),
       ).pipe(Effect.withSpan("advisor.providers")),

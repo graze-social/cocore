@@ -118,17 +118,19 @@ describe("parseSystemOneRequest", () => {
 });
 
 describe("resolveDecisionModel", () => {
-  const online = [
-    "mlx-community/Qwen3.6-35B-A3B-4bit",
-    "convaiinnovations/laya",
-    "convaiinnovations/laya-multilingual",
-  ];
+  // The input is what machines ADVERTISE as decision models (decisionModels on
+  // the Register frame), not every model online. A machine listing a model
+  // there has proven its engine answers /v1/systemone for it.
+  const advertised = ["convaiinnovations/laya", "convaiinnovations/laya-multilingual"];
 
   test("resolves the aliases every Jev client hardcodes", () => {
     // Multilingual is preferred: it is the local servers' default and has the
     // longer context.
-    assert.equal(resolveDecisionModel("jev-latest", online), "convaiinnovations/laya-multilingual");
-    assert.equal(resolveDecisionModel("laya", online), "convaiinnovations/laya-multilingual");
+    assert.equal(
+      resolveDecisionModel("jev-latest", advertised),
+      "convaiinnovations/laya-multilingual",
+    );
+    assert.equal(resolveDecisionModel("laya", advertised), "convaiinnovations/laya-multilingual");
   });
 
   test("falls through to the next known model when the preferred one is offline", () => {
@@ -138,14 +140,21 @@ describe("resolveDecisionModel", () => {
     );
   });
 
-  test("a concrete model id is honored verbatim", () => {
-    // Even one we've never heard of: the caller may be running something new,
-    // and dispatch reports "no provider serves it" better than we could.
-    assert.equal(resolveDecisionModel("some-org/new-decider", online), "some-org/new-decider");
+  test("takes an advertised decision model we've never heard of", () => {
+    // A provider advertising it has proven its engine serves it — a stronger
+    // signal than our built-in list, which only orders preferences.
+    assert.equal(
+      resolveDecisionModel("jev-latest", ["some-org/new-decider"]),
+      "some-org/new-decider",
+    );
   });
 
-  test("404s with the known set when no decision model is online", () => {
-    const r = resolveDecisionModel("jev-latest", ["mlx-community/Qwen3.6-35B-A3B-4bit"]);
+  test("a concrete model id is honored verbatim", () => {
+    assert.equal(resolveDecisionModel("some-org/new-decider", advertised), "some-org/new-decider");
+  });
+
+  test("404s with the known set when nothing advertises a decision model", () => {
+    const r = resolveDecisionModel("jev-latest", []);
     assert.ok(typeof r !== "string");
     assert.equal(r.status, 404);
     assert.equal(r.code, "model_not_found");

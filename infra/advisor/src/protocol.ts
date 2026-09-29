@@ -74,6 +74,14 @@ export interface Register {
    *  behaviour. When present (even empty), a job carrying `outputSchema`
    *  must find its model listed. Additive. */
   structured_output_models?: string[];
+  /** Model ids served through an attached DECISION engine — a System-One
+   *  model answered over `/v1/systemone` rather than `/v1/chat/completions`.
+   *  Listed only after that engine's startup decision canary passed.
+   *
+   *  Note the default is the OPPOSITE of `structured_output_models`: absent
+   *  means "no decision models", because an agent that predates the field
+   *  cannot have had a decision engine. */
+  decision_models?: string[];
   /** Per-model in-flight ceiling (running + queued) the provider's admission
    *  gate accepts before refusing a job with `engine-busy`. The advisor skips
    *  a machine whose in-flight count for the requested model has reached it,

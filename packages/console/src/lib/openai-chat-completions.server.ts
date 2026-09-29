@@ -633,6 +633,18 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
         type: "invalid_request_error",
         code: "tool_calls_not_supported",
       };
+    case "no-providers-for-decision":
+      // On the chat surface this means the model is served, but only by a
+      // decision engine (`/v1/systemone`), which cannot answer a chat prompt.
+      // 400 like the tool-calling mismatch: retrying won't help — the caller
+      // needs a chat model, or the /v1/systemone endpoint. The System-One
+      // surface maps the SAME code to 529, because from that direction it
+      // means "no decision machine online right now", which is retryable.
+      return {
+        status: 400,
+        type: "invalid_request_error",
+        code: "decision_model_mismatch",
+      };
     case "no-friends-available":
       return {
         status: 503,

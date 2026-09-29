@@ -43,9 +43,10 @@ export const DECISION_MODEL_ALIASES = ["jev-latest", "jev", "laya", "laya:multil
  *  is the default in the local servers and has the longer context (1024 vs
  *  512). Extend without a release via `COCORE_DECISION_MODELS`.
  *
- *  This list exists only because nothing in the provider Register frame
- *  distinguishes a decision model from a chat model yet — once it does, the
- *  advisor knows, and this becomes a fallback rather than the source. */
+ *  Providers now advertise their decision models on the Register frame, so
+ *  this is the FALLBACK ordering, not the source of truth: {@link
+ *  resolveDecisionModel} prefers what machines actually advertise and only
+ *  consults this list to break ties and to name the known set in an error. */
 const BUILTIN_DECISION_MODELS = [
   "convaiinnovations/laya-multilingual",
   "convaiinnovations/laya",
@@ -201,29 +202,35 @@ function parseQuestion(id: string, q: unknown): ParsedQuestion | SystemOneError 
  * Resolve the model a caller named to one that is actually on the network.
  *
  * A Jev client sends `jev-latest` and a local-server user sends `laya` —
- * neither is a repo id, so both are resolved against the known System-One
- * set, preferring the order in {@link knownDecisionModels}. A caller who
- * names a concrete repo id gets it verbatim (they may be running something
- * we don't know about, and refusing would be worse than routing and letting
- * the dispatch layer report "no provider serves it").
+ * neither is a repo id, so both resolve against the decision models machines
+ * currently advertise on their Register frame, preferring the order in
+ * {@link knownDecisionModels} and otherwise taking any advertised one. A
+ * caller who names a concrete repo id gets it verbatim (they may be running
+ * something we don't know about, and refusing would be worse than routing and
+ * letting the dispatch layer report "no provider serves it").
  */
 export function resolveDecisionModel(
   requested: string,
-  onlineModels: readonly string[],
+  advertisedDecisionModels: readonly string[],
 ): string | SystemOneError {
   if (!DECISION_MODEL_ALIASES.includes(requested)) return requested;
 
-  const known = knownDecisionModels();
-  const online = new Set(onlineModels);
-  const match = known.find((m) => online.has(m));
-  if (match) return match;
+  const advertised = [...new Set(advertisedDecisionModels)];
+  if (advertised.length > 0) {
+    // Prefer our known ordering among what's online; otherwise take whatever
+    // a provider is advertising, since a machine reporting a model on
+    // `decisionModels` has proven its engine answers /v1/systemone for it —
+    // a stronger signal than our built-in list.
+    const preferred = knownDecisionModels().find((m) => advertised.includes(m));
+    return preferred ?? advertised.sort()[0]!;
+  }
 
   return {
     status: 404,
     code: "model_not_found",
     message:
       `No provider is currently serving a System-One decision model, so \`${requested}\` ` +
-      `cannot be resolved. Known decision models: ${known.join(", ")}. ` +
+      `cannot be resolved. Known decision models: ${knownDecisionModels().join(", ")}. ` +
       `Name a concrete model id to route to one directly.`,
   };
 }
@@ -352,6 +359,9 @@ export function dispatchErrorToSystemOneResponse(code: DispatchErrorCode): {
     case "no-friends-available":
     case "target-provider-not-connected":
     case "no-capacity":
+    // From this direction the code means "no machine is serving a decision
+    // engine for this model right now" — capacity, not a client mistake.
+    case "no-providers-for-decision":
       return { status: 529, code: mapped.code };
     default:
       return { status: mapped.status, code: mapped.code };

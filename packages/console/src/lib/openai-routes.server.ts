@@ -333,6 +333,29 @@ export async function handleChatCompletions(request: Request): Promise<Response>
   return await bufferedResponse(id, parsed.model, runDispatch(inputs));
 }
 
+/** Every model the connected fleet advertises as a decision model
+ *  (`decisionModels` on the advisor's `/providers` rows). An unreachable
+ *  advisor yields an empty list, which resolves an alias to a 404 naming the
+ *  known set — better than resolving to a model nothing can serve and
+ *  failing later with a routing error. */
+async function advertisedDecisionModels(): Promise<string[]> {
+  const config = cocoreConfig();
+  try {
+    const r = await fetch(`${config.advisorUrl}/providers`);
+    if (!r.ok) return [];
+    const list = (await r.json()) as AdvisorProviderRow[];
+    return [
+      ...new Set(
+        list
+          .filter((p) => p.attestedAt && p.active !== false)
+          .flatMap((p) => p.decisionModels ?? []),
+      ),
+    ];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * POST /v1/systemone — the System-One decision surface.
  *
@@ -371,13 +394,9 @@ export async function handleSystemOne(request: Request): Promise<Response> {
   if ("status" in parsed) return systemOneError(parsed);
 
   // `jev-latest` and `laya` are aliases every client hardcodes, not repo ids.
-  // Resolve against what is actually online so the job — and therefore the
-  // receipt — names the model that really ran.
-  const directory = await buildModelDirectory();
-  const resolved = resolveDecisionModel(
-    parsed.requestedModel,
-    directory.models.map((m) => m.modelId),
-  );
+  // Resolve against the decision models machines actually advertise, so the
+  // job — and therefore the receipt — names the model that really ran.
+  const resolved = resolveDecisionModel(parsed.requestedModel, await advertisedDecisionModels());
   if (typeof resolved !== "string") return systemOneError(resolved);
 
   const inputs: DispatchInputs = {
@@ -390,6 +409,8 @@ export async function handleSystemOne(request: Request): Promise<Response> {
     // which an honest decision receipt (tokens.out = 0) passes.
     maxTokensOut: 1,
     priceCeiling: DEFAULT_PRICE_CEILING,
+    // Route to a decision engine, and only a decision engine.
+    decision: true,
   };
 
   const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);

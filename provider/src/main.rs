@@ -1933,6 +1933,7 @@ async fn cmd_serve(
         fault: engine_fault,
         tool_call_models,
         structured_output_models,
+        decision_models,
         model_capacity,
     } = build_engines(profile.ram_gb);
 
@@ -2255,6 +2256,11 @@ async fn cmd_serve(
         // response_format canary passed. Always sent (possibly empty) so the
         // advisor can tell "verified none" from "legacy agent".
         structured_output_models: Some(structured_output_models.clone()),
+        // Decision models (System-One, `/v1/systemone`). Always sent, possibly
+        // empty, so the advisor can tell "this agent has no decision engine"
+        // from "this agent is too old to know about them" — the two route
+        // identically today, but only the first is a stable claim.
+        decision_models: Some(decision_models.clone()),
         // Admission ceiling per model (running + queued) — absent when only
         // `stub` is loaded, since the stub engine is not gated.
         model_capacity,
@@ -3043,6 +3049,10 @@ struct BuiltEngines {
     /// (every vllm-mlx subprocess model; attached models only after their
     /// canary). Advertised so the advisor can steer schema jobs correctly.
     structured_output_models: Vec<String>,
+    /// Models served by an attached decision engine (`/v1/systemone`), listed
+    /// only after that engine's decision canary passed. Advertised so the
+    /// advisor can route decisions here and keep chat away.
+    decision_models: Vec<String>,
     /// Per-model running+queued ceiling of the admission gate every real
     /// engine is wrapped in; `None` when only `stub` is registered.
     model_capacity: Option<u32>,
@@ -3058,6 +3068,7 @@ impl BuiltEngines {
             fault,
             tool_call_models: vec![],
             structured_output_models: vec![],
+            decision_models: vec![],
             model_capacity: None,
         }
     }
@@ -3461,6 +3472,10 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
     // there is no reduced mode it could still serve.
     let mut decision_failed: Vec<String> = vec![];
     let mut decision_last_err: Option<String> = None;
+    // Advertised to the advisor: only models whose decision engine started AND
+    // passed its canary. A model that failed either is not served at all, so
+    // listing it would route decisions to a machine that can't answer them.
+    let mut served_decision_models: Vec<String> = vec![];
     for model in &decision_models {
         let Some(target) = decision_map.get(model) else {
             continue;
@@ -3469,6 +3484,7 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         match engine.start() {
             Ok(()) => {
                 tracing::info!(model = %model, target = %target, "attached decision engine ready");
+                served_decision_models.push(model.clone());
                 registry.register(
                     model.clone(),
                     std::sync::Arc::new(Gated::single_flight(std::sync::Arc::new(engine))),
@@ -3500,6 +3516,7 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
             fault: engine_map_fault,
             tool_call_models,
             structured_output_models,
+            decision_models: served_decision_models,
             model_capacity,
         };
     }
@@ -3814,6 +3831,7 @@ fn build_engines(ram_gb: u32) -> BuiltEngines {
         fault: Some(fault),
         tool_call_models,
         structured_output_models,
+        decision_models: served_decision_models,
         model_capacity,
     }
 }

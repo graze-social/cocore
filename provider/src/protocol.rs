@@ -232,6 +232,22 @@ pub struct Register {
     /// model", preserving the old routing. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_models: Option<Vec<String>>,
+    /// Model ids this machine serves through an attached DECISION engine —
+    /// a System-One model answered over `/v1/systemone`, not
+    /// `/v1/chat/completions` (see `engines/decision.rs`). Listed only after
+    /// the engine's startup decision canary passed.
+    ///
+    /// The routing default is the OPPOSITE of `structured_output_models`, and
+    /// deliberately so: an absent list means "this agent serves no decision
+    /// models", because an agent that predates the field cannot have had a
+    /// decision engine. Assuming capability (the structured-output default)
+    /// would route decisions to chat machines that would refuse them.
+    ///
+    /// The advisor uses this in BOTH directions — a decision job may only go
+    /// to a machine that lists the model here, and a chat job may only go to
+    /// one that does not. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_models: Option<Vec<String>>,
     /// Per-model in-flight ceiling this machine accepts before its admission
     /// gate refuses a job with `engine-busy` (running + queued slots; 2 for
     /// every single-flight backend we ship). The advisor uses it to skip a
