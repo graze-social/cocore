@@ -130,8 +130,9 @@ export interface PublishJobInputs {
   inputCommitment: string;
   /** How to interpret the sealed input bytes inputCommitment covers.
    *  Omit (or "text") for the raw-prompt path; "messages-v1" for the
-   *  canonical multimodal envelope. */
-  inputFormat?: "text" | "messages-v1";
+   *  canonical multimodal envelope; "decision-v1" for a canonical System-One
+   *  decision request. */
+  inputFormat?: "text" | "messages-v1" | "decision-v1";
   inputCipherURL?: string;
   maxTokensOut: number;
   priceCeiling: Money;
@@ -241,9 +242,11 @@ export interface SubmitJobInputs {
    *  the same SHA-256 over the bytes it opens, so the commitment is
    *  self-consistent without either side parsing the payload. */
   inputBytes: Uint8Array;
-  /** Set to "messages-v1" when `inputBytes` is the multimodal envelope so
-   *  the published job is self-describing. Omitted for the text path. */
-  inputFormat?: "messages-v1";
+  /** Set when `inputBytes` is not a raw prompt, so the published job is
+   *  self-describing: "messages-v1" for the multimodal envelope,
+   *  "decision-v1" for a canonical System-One decision request. Omitted for
+   *  the text path. */
+  inputFormat?: "messages-v1" | "decision-v1";
   maxTokensOut: number;
   priceCeiling: Money;
   exchangeDid: string;

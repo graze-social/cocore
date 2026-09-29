@@ -133,7 +133,7 @@ async function fixtures(overrides?: {
     overrides?.outputCommitment ??
     (await sha256Hex(new TextEncoder().encode(canonicalDecisionAnswers(ANSWERS))));
   return {
-    job: { model, inputCommitment } as JobRecord,
+    job: { model, inputCommitment, inputFormat: "decision-v1" } as JobRecord,
     receipt: {
       job: { uri: "at://did:plc:r/dev.cocore.compute.job/1", cid: "bafyjob" },
       requester: "did:plc:r",
@@ -199,6 +199,23 @@ describe("verifyDecisionReceipt", () => {
     const report = await verifyDecisionReceipt({ receipt, job, request: REQUEST });
     assert.equal(report.ok, true);
     assert.equal(report.replayed, false);
+  });
+
+  // The point of the lexicon's `decision-v1`: the record describes its own
+  // bytes, so a later reader knows to re-canonicalize them as a decision
+  // rather than taking the caller's word for it.
+  test("a job that doesn't declare decision-v1 still verifies, but says so", async () => {
+    const { job, receipt } = await fixtures();
+    const report = await verifyDecisionReceipt({
+      receipt,
+      job: { ...job, inputFormat: undefined },
+      request: REQUEST,
+      runner: async () => ANSWERS,
+    });
+    assert.equal(report.ok, true, "a legacy job is not invalid");
+    const warn = report.findings.find((f) => f.code === "decision-job-format-missing");
+    assert.ok(warn);
+    assert.equal(warn.severity, "warn");
   });
 
   test("replaying a different artifact than the receipt named is an error", async () => {

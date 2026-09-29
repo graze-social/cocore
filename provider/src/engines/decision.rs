@@ -830,6 +830,10 @@ impl Engine for AttachedDecisionEngine {
         self.model_digest.clone()
     }
 
+    fn serves_decisions(&self) -> bool {
+        true
+    }
+
     fn ready(&self) -> bool {
         if let Ok(c) = self.ready_cache.lock() {
             if let Some((at, ready)) = *c {

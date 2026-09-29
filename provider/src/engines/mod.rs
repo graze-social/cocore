@@ -879,6 +879,18 @@ pub trait Engine: Send + Sync {
     /// backend can stream token deltas natively.
     fn generate_once(&self, request: &GenerateRequest) -> Result<GenerateResponse>;
 
+    /// True iff this engine answers System-One DECISION requests
+    /// (`/v1/systemone`) rather than chat completions.
+    ///
+    /// The two cannot serve each other's work, and the job record says which
+    /// it is via `inputFormat: "decision-v1"`. The lexicon's contract for that
+    /// field is that "providers that don't understand a format reject the job
+    /// rather than mis-serving it" — this is what lets the provider honour it
+    /// instead of handing a decision request to a chat model as a prompt.
+    fn serves_decisions(&self) -> bool {
+        false
+    }
+
     /// SHA-256 hex identifying the exact model artifact this engine runs, when
     /// it knows one. Stamped onto the receipt as `params.modelDigest` so the
     /// opaque `model` id is disambiguated — a 4-bit and an f16 build of one

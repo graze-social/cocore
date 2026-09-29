@@ -146,8 +146,10 @@ export interface JobRecord {
   inputCommitment: string;
   /** How to interpret the sealed input bytes inputCommitment covers.
    *  Absent/"text": raw prompt string. "messages-v1": UTF-8 of the
-   *  canonical multimodal envelope (see multimodal-envelope.ts). */
-  inputFormat?: "text" | "messages-v1";
+   *  canonical multimodal envelope (see multimodal-envelope.ts).
+   *  "decision-v1": UTF-8 of a canonical System-One decision request
+   *  (see decision.ts) — the one format whose output can be re-derived. */
+  inputFormat?: "text" | "messages-v1" | "decision-v1";
   inputCipherURL?: string;
   maxTokensOut: number;
   priceCeiling: Money;

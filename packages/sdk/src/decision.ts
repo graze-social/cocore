@@ -309,6 +309,23 @@ export async function verifyDecisionReceipt(
     });
   }
 
+  // 0. Does the record say these bytes are a decision at all? A job without
+  // `inputFormat: "decision-v1"` can still be verified — the commitments are
+  // what they are — but nothing except the caller's say-so identifies the
+  // sealed bytes as a decision request, so a later reader of the record alone
+  // could not know to re-canonicalize them this way. A warning, not an error:
+  // jobs published before the format existed are legitimate.
+  if (job.inputFormat !== "decision-v1") {
+    findings.push({
+      severity: "warn",
+      code: "decision-job-format-missing",
+      message:
+        `the job declares inputFormat ${JSON.stringify(job.inputFormat ?? null)} rather than ` +
+        `"decision-v1", so the record does not describe its own bytes as a decision — this ` +
+        `verification rests on you knowing what you sent`,
+    });
+  }
+
   // 1. Did the job commit to the request we actually sent?
   const canonicalRequest = canonicalDecisionRequest(request, receipt.model);
   const inputCommitment = await sha256Hex(new TextEncoder().encode(canonicalRequest));

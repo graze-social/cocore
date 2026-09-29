@@ -43,10 +43,12 @@ export interface DispatchInputs {
    *  canonical messages-v1 envelope). When present, these are sealed and
    *  hashed verbatim and `prompt` is ignored. */
   payloadBytes?: Uint8Array;
-  /** Set to "messages-v1" when `payloadBytes` is the multimodal envelope,
-   *  so the job record and the provider both interpret the bytes
-   *  correctly. */
-  inputFormat?: "messages-v1";
+  /** How the sealed bytes are to be read, recorded on the job so the provider
+   *  and any later verifier agree on what `inputCommitment` covers.
+   *  `messages-v1` when `payloadBytes` is the multimodal envelope;
+   *  `decision-v1` when `prompt` is a canonical System-One decision request.
+   *  Absent = a raw prompt string. */
+  inputFormat?: "messages-v1" | "decision-v1";
   maxTokensOut: number;
   priceCeiling: { amount: number; currency: string };
   targetProviderDid?: string;
@@ -105,11 +107,6 @@ export interface DispatchInputs {
   toolChoice?: "auto" | "none" | "required";
   /** When toolChoice is "required", optionally force a specific function. */
   toolChoiceFunction?: string;
-  /** True when the sealed bytes are a System-One decision request rather
-   *  than a prompt. Routes to (and only to) a machine serving this model over
-   *  `/v1/systemone`; forwarded to the advisor as `decision` so its own filter
-   *  agrees with the machine we pinned. */
-  decision?: boolean;
   /** Optional minimum provider binaryVersion (e.g. `0.9.32`). When set,
    *  pickProvider keeps only machines reporting a version >= this — used to
    *  steer feature-bearing requests (image input needs a messages-v1 release)
@@ -967,8 +964,9 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         Array.isArray(input.tools) && input.tools.length > 0,
         // Decision vs chat: the two engine kinds can't serve each other's
         // requests, so this pins the right kind rather than expressing a
-        // preference.
-        input.decision === true,
+        // preference. Derived from the input format the job record carries, so
+        // the console's pre-filter and the advisor's filter read one field.
+        input.inputFormat === "decision-v1",
         excludeDids,
       );
     } catch (e) {
@@ -1029,7 +1027,6 @@ export async function* runDispatch(input: DispatchInputs): AsyncGenerator<Dispat
         ...(input.toolChoice ? { toolChoice: input.toolChoice } : {}),
         ...(input.toolChoiceFunction ? { toolChoiceFunction: input.toolChoiceFunction } : {}),
         ...(input.minProviderVersion ? { minProviderVersion: input.minProviderVersion } : {}),
-        ...(input.decision ? { decision: true } : {}),
         sessionId,
         targetProviderDid: candidate.did,
         // Pin the exact machine we sealed the prompt to, the only one that can unseal.

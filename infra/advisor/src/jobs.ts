@@ -81,17 +81,6 @@ interface JobBody {
    *  Backstops the open-pool path; the console also pre-filters before it
    *  seals + pins to a single machine. */
   minProviderVersion?: string;
-  /** Optional: this job's sealed bytes are a System-One decision request, to
-   *  be answered over `/v1/systemone`. Routing-only — the advisor never reads
-   *  the plaintext; it only needs to know which KIND of engine can serve it,
-   *  since a decision engine and a chat engine cannot serve each other's
-   *  requests. Absent/false = an ordinary chat job.
-   *
-   *  The durable form of this signal is an `inputFormat` of `decision-v1` on
-   *  the job record itself, so a verifier reading the record knows how to
-   *  interpret `inputCommitment`. That needs a lexicon change and belongs in
-   *  its own PR; until then this flag carries it at dispatch time only. */
-  decision?: boolean;
 }
 
 interface ParsedJob {
@@ -107,7 +96,6 @@ interface ParsedJob {
       | "tools"
       | "toolChoice"
       | "minProviderVersion"
-      | "decision"
     >
   > & {
     jobCid?: string;
@@ -118,7 +106,6 @@ interface ParsedJob {
     tools?: unknown;
     toolChoice?: unknown;
     minProviderVersion?: string;
-    decision?: boolean;
   };
 }
 
@@ -190,9 +177,6 @@ function parseJobBody(input: unknown, generateId: () => string): ParsedJob | Par
   }
   if (b["tools"] !== undefined && !Array.isArray(b["tools"])) {
     return { ok: false, status: 400, error: "tools must be an array when provided" };
-  }
-  if (b["decision"] !== undefined && typeof b["decision"] !== "boolean") {
-    return { ok: false, status: 400, error: "decision must be a boolean when provided" };
   }
   if (b["toolChoice"] !== undefined && typeof b["toolChoice"] !== "string") {
     return { ok: false, status: 400, error: "toolChoice must be a string when provided" };
@@ -327,7 +311,12 @@ async function selectProvider(
   // A System-One decision. Unlike the two above this is not a capability the
   // job optionally wants — it is which KIND of engine can serve it at all, so
   // the filter runs in both directions (see `servesDecisionsFor`).
-  const wantsDecision = job.decision === true;
+  //
+  // Read from `inputFormat`, which the job RECORD carries, rather than a
+  // separate dispatch-only flag: the record is the source of truth for what
+  // the sealed bytes are, so routing and a verifier reading the record later
+  // cannot disagree about whether this was a decision.
+  const wantsDecision = job.inputFormat === "decision-v1";
 
   // Build the candidate list. A pinned `targetProviderDid` restricts
   // dispatch to that owner's machines (optionally a single machine via

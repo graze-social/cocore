@@ -216,6 +216,22 @@ def verify_decision_receipt(
             f'receipt.model "{receipt.get("model")}" is not the job\'s model "{job.get("model")}"',
         )
 
+    # 0. Does the record say these bytes are a decision at all? A job without
+    # inputFormat "decision-v1" can still be verified — the commitments are
+    # what they are — but nothing except the caller's say-so identifies the
+    # sealed bytes as a decision request. A warning, not an error: jobs
+    # published before the format existed are legitimate.
+    if job.get("inputFormat") != "decision-v1":
+        findings.append(
+            Finding(
+                "warn",
+                "decision-job-format-missing",
+                f'the job declares inputFormat {job.get("inputFormat")!r} rather than '
+                '"decision-v1", so the record does not describe its own bytes as a decision — '
+                "this verification rests on you knowing what you sent",
+            )
+        )
+
     # 1. Did the job commit to the request we actually sent?
     canonical_request = canonical_decision_request(request, receipt.get("model") or "")
     input_commitment = _sha256_hex(canonical_request.encode("utf-8"))

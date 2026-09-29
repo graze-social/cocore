@@ -169,11 +169,11 @@ describe("POST /jobs", () => {
   });
 
   // Both directions of the rolling deploy. An OLD console sends no
-  // `decision` field and must keep working; a NEWER one may send fields this
+  // `inputFormat` and must keep working; a NEWER one may send fields this
   // advisor has never heard of, and those must be ignored rather than 400'd —
   // the body check is a positive list of what the handlers dereference, and
   // this pins that it stays one.
-  it("tolerates a body with unknown fields, and one with no `decision`", async () => {
+  it("tolerates a body with unknown fields, and one with no `inputFormat`", async () => {
     const legacyBody = {
       jobUri: "at://x",
       requesterDid: "did:plc:requester",
@@ -192,23 +192,6 @@ describe("POST /jobs", () => {
       // routing; a 400 would mean the body was rejected.
       expect(resp.status).toBe(503);
     }
-  });
-
-  it("400s on a non-boolean `decision`", async () => {
-    const resp = await fetch(`${h.url}/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jobUri: "at://x",
-        requesterDid: "did:plc:requester",
-        requesterPubKey: "abcd",
-        model: "stub",
-        maxTokensOut: 10,
-        ciphertext: "QQ==",
-        decision: "yes",
-      }),
-    });
-    expect(resp.status).toBe(400);
   });
 
   it("503s when no providers are connected", async () => {

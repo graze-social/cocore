@@ -194,6 +194,10 @@ impl Engine for Gated {
     fn model_digest(&self) -> Option<String> {
         self.inner.model_digest()
     }
+
+    fn serves_decisions(&self) -> bool {
+        self.inner.serves_decisions()
+    }
     fn metallib_hash(&self) -> Option<String> {
         self.inner.metallib_hash()
     }

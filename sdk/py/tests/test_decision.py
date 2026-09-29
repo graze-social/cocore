@@ -111,7 +111,8 @@ def _fixtures(model_digest=None):
     }
     if model_digest:
         receipt["params"] = {"modelDigest": model_digest}
-    return {"model": model, "inputCommitment": input_commitment}, receipt
+    job = {"model": model, "inputCommitment": input_commitment, "inputFormat": "decision-v1"}
+    return job, receipt
 
 
 def test_an_honest_receipt_verifies_by_replay():
@@ -168,3 +169,14 @@ def test_an_unreachable_server_leaves_the_output_unverified():
 
     report = verify_decision_receipt(receipt, job, REQUEST, runner=boom)
     assert "decision-replay-failed" in report.codes()
+
+
+def test_a_job_that_does_not_declare_decision_v1_still_verifies_but_says_so():
+    # The point of the lexicon's decision-v1: the record describes its own
+    # bytes, so a later reader knows to re-canonicalize them as a decision
+    # rather than taking the caller's word for it.
+    job, receipt = _fixtures()
+    legacy = {k: v for k, v in job.items() if k != "inputFormat"}
+    report = verify_decision_receipt(receipt, legacy, REQUEST, runner=lambda _req: ANSWERS)
+    assert report.ok, "a legacy job is not invalid"
+    assert "decision-job-format-missing" in report.codes()

@@ -404,13 +404,15 @@ export async function handleSystemOne(request: Request): Promise<Response> {
     oauthSession: auth.oauthSession,
     model: resolved,
     prompt: canonicalDecisionPrompt(parsed, resolved),
+    // The job record says what its own sealed bytes are, so a verifier reading
+    // it later knows to re-canonicalize a decision request — and the advisor
+    // routes on the same field rather than a parallel dispatch-only flag.
+    inputFormat: "decision-v1",
     // A decision generates no tokens. The lexicon floor is 1, and the
     // SDK's strict-verify gate is `receipt.tokens.out > job.maxTokensOut`,
     // which an honest decision receipt (tokens.out = 0) passes.
     maxTokensOut: 1,
     priceCeiling: DEFAULT_PRICE_CEILING,
-    // Route to a decision engine, and only a decision engine.
-    decision: true,
   };
 
   const admission = await admit(auth.did, DEFAULT_PRICE_CEILING.amount);

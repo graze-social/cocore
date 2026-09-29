@@ -2006,8 +2006,40 @@ async fn handle_inference_request_inner(
     // belt-and-suspenders check here surfaces the failure as a
     // clear sealed error chunk instead of letting the stub engine
     // silently masquerade as the requested model's reply.
+    // Two ways this can fail before a single token is generated: no engine for
+    // the model, or an engine of the wrong KIND for the job's input format.
+    // Both end the same way — a sealed error chunk and a completion with no
+    // receipt — so they resolve to one message and share the block below.
+    let wants_decision = req.input_format.as_deref() == Some("decision-v1");
     let engine = match ctx.engines.for_model(&req.model) {
-        Some(e) => e,
+        // The lexicon's contract for `inputFormat` is that a provider which
+        // doesn't understand a format rejects the job rather than mis-serving
+        // it. Without this, a chat engine handed `decision-v1` bytes would
+        // treat the decision request as a prompt and answer it in prose — a
+        // plausible-looking 200 that is not a decision at all. The advisor's
+        // routing should already have prevented it; this is the provider
+        // honouring the record's own description of its bytes.
+        Some(e) if wants_decision != e.serves_decisions() => {
+            tracing::warn!(
+                model = %req.model,
+                wants_decision,
+                session_id = %session_id,
+                "input format and engine kind disagree; refusing rather than mis-serving",
+            );
+            let err = if wants_decision {
+                format!(
+                    "[cocore provider] model '{}' on this provider is not served by a decision engine, so it cannot answer a decision-v1 job.",
+                    req.model,
+                )
+            } else {
+                format!(
+                    "[cocore provider] model '{}' on this provider is a System-One decision model and answers only decision-v1 jobs, not chat.",
+                    req.model,
+                )
+            };
+            Err(err)
+        }
+        Some(e) => Ok(e),
         None => {
             tracing::warn!(
                 model = %req.model,
@@ -2015,11 +2047,16 @@ async fn handle_inference_request_inner(
                 session_id = %session_id,
                 "provider does not have an engine loaded for the requested model",
             );
-            let err = format!(
+            Err(format!(
                 "[cocore provider] this provider has no engine loaded for model '{}'. Loaded models: {}.",
                 req.model,
                 ctx.engines.loaded_models().join(", "),
-            );
+            ))
+        }
+    };
+    let engine = match engine {
+        Ok(e) => e,
+        Err(err) => {
             let err_ct = match ctx
                 .encryption
                 .seal_to(&req.requester_pub_key, err.as_bytes())
@@ -3730,6 +3767,70 @@ mod tests {
             Err(_) => Ok(Vec::new()),
         };
         assert!(recovered.unwrap().is_empty());
+    }
+
+    /// The lexicon says a provider that doesn't understand an `inputFormat`
+    /// must reject the job rather than mis-serve it. Without this the stub (or
+    /// any chat engine) would take `decision-v1` bytes as a prompt and answer
+    /// the decision request in prose — a plausible-looking 200 that is not a
+    /// decision, and that a requester would then fail to verify.
+    #[tokio::test]
+    async fn a_decision_v1_job_is_refused_by_a_chat_engine() {
+        let signer = load_or_create_identity().unwrap();
+        let provider_kp = fresh_keypair();
+        let requester_kp = fresh_keypair();
+        let pds = fake_pds();
+        let engines = stub_registry();
+        let cx = ctx(&*signer, &provider_kp, &pds, None, &engines);
+        let plaintext =
+            br#"{"model":"stub","state":"x","questions":{"q":{"type":"noul","instructions":"y"}}}"#;
+        let ct = requester_kp
+            .seal_to(&provider_kp.public_key_b64(), plaintext)
+            .unwrap();
+        let req = InferenceRequest {
+            job_uri: "at://did:plc:requester/dev.cocore.compute.job/abc".into(),
+            job_cid: None,
+            requester_did: "did:plc:requester".into(),
+            requester_pub_key: requester_kp.public_key_b64(),
+            model: "stub".into(),
+            max_tokens_out: 16,
+            ciphertext: ct,
+            input_format: Some("decision-v1".into()),
+            session_id: "session-decision".into(),
+            resume_token: None,
+            nonce: None,
+            attestation_cid: None,
+            output_schema: None,
+            tools: None,
+            tool_choice: None,
+            tool_choice_function: None,
+            brokerage_countersignature: None,
+        };
+
+        let replies = handle_inference_request(req, &cx).await;
+        let mut opened = String::new();
+        for m in &replies {
+            if let AdvisorMessage::InferenceChunk(c) = m {
+                let piece = requester_kp
+                    .open_from(&provider_kp.public_key_b64(), &c.ciphertext)
+                    .expect("requester opens chunk");
+                opened.push_str(&String::from_utf8(piece).unwrap());
+            }
+        }
+        assert!(
+            opened.contains("not served by a decision engine"),
+            "expected a typed refusal, got: {opened}"
+        );
+        // Refused, not served: the stub's echo must never appear.
+        assert!(!opened.contains("cocore stub provider"), "{opened}");
+        match replies.last() {
+            Some(AdvisorMessage::InferenceComplete(c)) => {
+                assert!(c.receipt_uri.is_empty(), "a refused job must not be billed");
+                assert_eq!(c.tokens_in, 0);
+                assert_eq!(c.tokens_out, 0);
+            }
+            other => panic!("expected InferenceComplete, got {other:?}"),
+        }
     }
 
     #[tokio::test]
