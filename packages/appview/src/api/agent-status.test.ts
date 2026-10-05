@@ -115,6 +115,66 @@ test("GET /api/agent/status: resolves an AppView-minted key and reports provider
   );
 });
 
+test("earned24h counts today's receipts even when the DID has more events than the fetch limit", async () => {
+  // Regression: the ledger's listEvents is oldest-first by default, so a DID
+  // with >500 events got back only stale rows and the menu read "Earnings
+  // (24h): 0" forever. The stub mirrors the real ledger's ordering semantics.
+  const { store, accountStore } = setup();
+  const did = "did:plc:busyprovider";
+  const { secret } = accountStore.createKey({ did, name: "busy machine" });
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const events = [
+    ...Array.from({ length: 600 }, () => ({
+      did,
+      kind: "receipt-in",
+      tokensDelta: 10,
+      balanceAfter: 0,
+      reference: null,
+      createdAt: old,
+    })),
+    {
+      did,
+      kind: "receipt-in",
+      tokensDelta: 2112,
+      balanceAfter: 0,
+      reference: "at://x/dev.cocore.compute.receipt/new",
+      createdAt: new Date().toISOString(),
+    },
+  ];
+  const bridge = createServer((req, res) => {
+    const u = new URL(req.url ?? "/", "http://bridge");
+    res.writeHead(200, { "content-type": "application/json" });
+    if (u.pathname === "/xrpc/dev.cocore.exchange.listEvents") {
+      const limit = Math.min(Number(u.searchParams.get("limit") ?? 100), 500);
+      const ordered = u.searchParams.get("order") === "desc" ? [...events].reverse() : events;
+      res.end(JSON.stringify({ events: ordered.slice(0, limit) }));
+    } else {
+      res.end(JSON.stringify({ balance: 1 }));
+    }
+  });
+  await new Promise<void>((resolve) => bridge.listen(0, "127.0.0.1", resolve));
+  const { port } = bridge.address() as AddressInfo;
+  try {
+    await withAppviewServer(
+      buildAppviewApp(store, {
+        accountStore,
+        appviewDid: APPVIEW_DID,
+        bridgeUrl: `http://127.0.0.1:${port}`,
+      }),
+      async (base) => {
+        const res = await fetch(`${base}/api/agent/status`, {
+          headers: { authorization: `Bearer ${secret}` },
+        });
+        assert.equal(res.status, 200);
+        const body = (await res.json()) as StatusBody;
+        assert.equal(body.earned24h, 2112);
+      },
+    );
+  } finally {
+    await new Promise<void>((resolve) => bridge.close(() => resolve()));
+  }
+});
+
 test("confidential-desired machine registered unauthenticated ⇒ 'sign in again', not 'not connected'", async () => {
   const { store, accountStore } = setup();
   const did = "did:plc:reauth";
