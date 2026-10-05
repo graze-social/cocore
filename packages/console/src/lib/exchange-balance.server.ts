@@ -99,9 +99,13 @@ export interface LedgerEvent {
   createdAt: string;
 }
 
+/** Newest-first, so a windowed sum (e.g. earnings in the last 24h) sees the
+ *  most recent events rather than the account's oldest `limit` rows. */
 export async function listEvents(did: string, limit = 50): Promise<{ events: LedgerEvent[] }> {
   const r = await fetch(
-    bridgeUrl(`/xrpc/dev.cocore.exchange.listEvents?did=${encodeURIComponent(did)}&limit=${limit}`),
+    bridgeUrl(
+      `/xrpc/dev.cocore.exchange.listEvents?did=${encodeURIComponent(did)}&limit=${limit}&order=desc`,
+    ),
   );
   if (!r.ok) {
     throw new Error(`listEvents(${did}) returned ${r.status}: ${await r.text().catch(() => "")}`);

@@ -1069,7 +1069,11 @@ async function main() {
         const did = sp.get("did") || "";
         if (!did.startsWith("did:")) return err(400, { error: "invalid did" });
         const limit = Math.min(Number(sp.get("limit") ?? 100), 500);
-        return ok({ events: ledger.listEvents(did, limit) });
+        // `order=desc` → newest-first. Default stays oldest-first for existing
+        // callers; anything summing a recent window MUST pass desc, or once a
+        // DID has more than `limit` events the window holds only stale rows.
+        const order = sp.get("order") === "desc" ? "desc" : "asc";
+        return ok({ events: ledger.listEvents(did, limit, order) });
       }).pipe(Effect.withSpan("services.exchange.listEvents")),
     ),
     // Account-page activity bundle: lifetime per-kind aggregates (credited /

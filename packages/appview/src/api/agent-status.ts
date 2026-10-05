@@ -151,7 +151,7 @@ async function buildStatus(ctx: AgentStatusContext, did: string) {
     bridge
       ? bridgeJson<{ events?: LedgerEvent[] }>(
           bridge,
-          `/xrpc/dev.cocore.exchange.listEvents?did=${q}&limit=${EVENT_LIMIT}`,
+          `/xrpc/dev.cocore.exchange.listEvents?did=${q}&limit=${EVENT_LIMIT}&order=desc`,
         )
       : Promise.resolve(null),
   ]);
