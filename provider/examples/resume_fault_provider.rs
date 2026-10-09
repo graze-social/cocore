@@ -15,7 +15,7 @@ use cocore_provider::{
         stub::StubEngine, DeltaChannel, Engine, EngineRegistry, GenerateRequest, GenerateResponse,
     },
     oauth::Session,
-    pds::{PdsClient, ProBonoPolicy},
+    pds::{LiveProBono, PdsClient},
     protocol::Register,
     receipt::StrongRef,
     schedule::ModelSchedules,
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
     };
     let schedules = ModelSchedules::default();
     let configured_models = vec!["stub".to_string()];
-    let pro_bono = ProBonoPolicy::default();
+    let pro_bono = LiveProBono::default();
     let client = AdvisorClient::new(advisor_url);
 
     loop {
