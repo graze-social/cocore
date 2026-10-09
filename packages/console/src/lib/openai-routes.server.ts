@@ -28,6 +28,7 @@ import { isAppviewForwardConfigured } from "@/lib/appview-pds-forward.server.ts"
 import {
   type AdvisorProviderRow,
   type DispatchInputs,
+  filterByAllowedDids,
   meetsMinVersion,
   runDispatch,
 } from "@/lib/inference-dispatch.server.ts";
@@ -234,10 +235,13 @@ async function checkToolCallSupport(
   // Filter to attested, active providers (friends-only: also the allowed
   // DID set), keeping the model-unfiltered pool around so a rejection can
   // tell the caller which models WOULD accept their tool request.
-  let live = list.filter((p) => p.attestedAt && p.active !== false);
-  if (allowedDids !== undefined) {
-    live = live.filter((p) => allowedDids.has(p.did));
-  }
+  // `filterByAllowedDids` matches bare DIDs (friends) AND machine-scoped
+  // `did:machineId` keys (pro bono), so a pro-bono allow-set gates on the
+  // elected machines only.
+  const live = filterByAllowedDids(
+    list.filter((p) => p.attestedAt && p.active !== false),
+    allowedDids,
+  );
   const pool = live.filter(
     (p) => p.supportedModels.length === 0 || p.supportedModels.includes(model),
   );
@@ -682,6 +686,10 @@ export async function handleProBonoChatCompletions(request: Request): Promise<Re
     );
   }
 
+  // Tool calling gate, scoped to the pro-bono machines (same as friends).
+  const toolError = await checkToolCallSupport(parsed.model, parsed.tools, allowedProviderDids);
+  if (toolError) return jsonError(400, toolError, "tool_calls_not_supported");
+
   const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, "")}`;
   let payload: Awaited<ReturnType<typeof buildJobInput>>;
   try {
@@ -706,6 +714,14 @@ export async function handleProBonoChatCompletions(request: Request): Promise<Re
     // gate as the friends/verified paths, just a different allow-set.
     allowedProviderDids,
     country: parsed.country,
+    // Same wire contract as /v1/chat/completions: a `response_format`
+    // json_schema and tool definitions MUST reach the provider, or the model
+    // generates unconstrained output (renamed keys; reasoning models never
+    // emit the JSON at all).
+    ...(parsed.outputSchema ? { outputSchema: parsed.outputSchema } : {}),
+    ...(parsed.tools ? { tools: parsed.tools } : {}),
+    ...(parsed.toolChoice ? { toolChoice: parsed.toolChoice } : {}),
+    ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
   };
 
   if (parsed.stream) {

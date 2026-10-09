@@ -11,11 +11,15 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import type { DispatchEvent } from "./inference-dispatch.server.ts";
+import type { DispatchEvent, DispatchInputs } from "./inference-dispatch.server.ts";
 
 // Mutable knobs the hoisted mocks read.
 const state = vi.hoisted(() => ({
   events: [] as DispatchEvent[],
+  // The DispatchInputs each handler handed to runDispatch, in call order.
+  dispatched: [] as DispatchInputs[],
+  // Machine-scoped keys resolveProBonoProviderKeys returns.
+  proBonoKeys: new Set<string>(["did:plc:provider:machine1"]),
   sessionPresent: true,
   // Resolved by the AppView-store fallback for a cocore- key the local
   // store rejects (null = the AppView declines it too).
@@ -56,13 +60,22 @@ vi.mock("@/lib/inference-dispatch.server.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./inference-dispatch.server.ts")>();
   return {
     ...actual,
-    runDispatch: async function* (): AsyncGenerator<DispatchEvent> {
+    runDispatch: async function* (inputs: DispatchInputs): AsyncGenerator<DispatchEvent> {
+      state.dispatched.push(inputs);
       for (const ev of state.events) yield ev;
     },
   };
 });
 
-import { handleChatCompletions } from "./openai-routes.server.ts";
+vi.mock("@/lib/pro-bono.server.ts", () => ({
+  resolveProBonoProviderKeys: async (_did: string) => state.proBonoKeys,
+}));
+
+vi.mock("@/lib/admission.server.ts", () => ({
+  admit: async () => ({ refusal: null, result: null, note: null }),
+}));
+
+import { handleChatCompletions, handleProBonoChatCompletions } from "./openai-routes.server.ts";
 
 function streamRequest(body: Record<string, unknown>): Request {
   return new Request("https://console.test/v1/chat/completions", {
@@ -256,5 +269,125 @@ describe("handleChatCompletions wire contract", () => {
     const res = await handleChatCompletions(req);
     expect(res.status).toBe(401);
     expect(res.headers.get("content-type") ?? "").toMatch(/application\/json/);
+  });
+});
+
+describe("handleProBonoChatCompletions forwards the same wire contract", () => {
+  const responseFormat = {
+    type: "json_schema",
+    json_schema: {
+      name: "digest",
+      strict: true,
+      schema: {
+        type: "object",
+        properties: { summary: { type: "string" } },
+        required: ["summary"],
+      },
+    },
+  };
+
+  beforeEach(() => {
+    state.sessionPresent = true;
+    state.appviewKey = null;
+    state.dispatched = [];
+    state.proBonoKeys = new Set(["did:plc:provider:machine1"]);
+    state.events = [
+      { kind: "chunk", seq: 0, channel: "content", text: '{"summary":"ok"}' },
+      { kind: "complete", tokensIn: 1, tokensOut: 1, receiptUri: "at://x" },
+    ];
+  });
+
+  test("response_format json_schema reaches dispatch as outputSchema, same as the paid route", async () => {
+    // Regression: the pro-bono route dropped outputSchema, so a schema-bound
+    // caller got unconstrained output (renamed keys; a reasoning model never
+    // emitted the JSON at all).
+    const body = { ...baseBody, stream: false, response_format: responseFormat };
+    expect((await handleProBonoChatCompletions(streamRequest(body))).status).toBe(200);
+    expect((await handleChatCompletions(streamRequest(body))).status).toBe(200);
+    const [proBono, paid] = state.dispatched;
+    const expected = {
+      name: "digest",
+      strict: true,
+      schema: responseFormat.json_schema.schema,
+    };
+    expect(proBono!.outputSchema).toEqual(expected);
+    expect(paid!.outputSchema).toEqual(expected);
+    // Pro-bono routing stays pinned to the elected machines.
+    expect(proBono!.allowedProviderDids).toEqual(new Set(["did:plc:provider:machine1"]));
+  });
+
+  test("tools and tool_choice are forwarded when a pro-bono machine has verified tool calling", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                did: "did:plc:provider",
+                machineId: "machine1",
+                supportedModels: ["stub"],
+                attestedAt: new Date().toISOString(),
+                active: true,
+                toolCallModels: ["stub"],
+              },
+            ]),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    const res = await handleProBonoChatCompletions(
+      streamRequest({
+        ...baseBody,
+        stream: false,
+        tools: weatherTools,
+        tool_choice: { type: "function", function: { name: "get_weather" } },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const [inputs] = state.dispatched;
+    expect(inputs!.tools?.[0]?.function.name).toBe("get_weather");
+    expect(inputs!.toolChoice).toBe("required");
+    expect(inputs!.toolChoiceFunction).toBe("get_weather");
+  });
+
+  test("tool requests are gated on the pro-bono machines, not the whole network", async () => {
+    // A billed sibling machine of the same owner (machine2) supports tools,
+    // but the elected pro-bono machine does not — must 400, not route.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify([
+              {
+                did: "did:plc:provider",
+                machineId: "machine1",
+                supportedModels: ["stub"],
+                attestedAt: new Date().toISOString(),
+                active: true,
+                toolCallModels: [],
+              },
+              {
+                did: "did:plc:provider",
+                machineId: "machine2",
+                supportedModels: ["stub"],
+                attestedAt: new Date().toISOString(),
+                active: true,
+                toolCallModels: ["stub"],
+              },
+            ]),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    const res = await handleProBonoChatCompletions(
+      streamRequest({ ...baseBody, stream: false, tools: weatherTools }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe(
+      "tool_calls_not_supported",
+    );
+    expect(state.dispatched).toHaveLength(0);
   });
 });
