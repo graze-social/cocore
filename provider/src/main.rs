@@ -1312,7 +1312,7 @@ async fn wait_until_active(pds: &cocore_provider::pds::PdsClient, rkey: Option<&
         let read = pds
             .get_provider_control(rk)
             .await
-            .map(|(active, _, _, _, _)| active);
+            .map(|(active, _, _, _, _, _)| active);
         if active_gate_decision(read, &mut confirmed_paused) == ActiveGate::Serve {
             clear_serving_paused();
             return;
@@ -1833,6 +1833,11 @@ async fn cmd_serve(
                 effective_tool_calls(tool_calls_env_override, None),
             ),
         };
+
+    // The live pro-bono cell. Owned here (not per connection) so a reconnect
+    // keeps whatever the owner-controls poll last read instead of reverting
+    // to the startup value; the serve loop swaps it in place on an edit.
+    let pro_bono = cocore_provider::pds::LiveProBono::new(pro_bono_at_start);
 
     // Feed the effective default into the existing engine knob only when the
     // operator did not set it. Exact model eligibility and the startup canary
@@ -2389,7 +2394,7 @@ async fn cmd_serve(
                             &model_schedules,
                             &configured_models,
                             push_rx.as_mut(),
-                            &pro_bono_at_start,
+                            &pro_bono,
                             tool_calls_at_start,
                             tool_calls_env_override,
                             &invocations,
@@ -2467,7 +2472,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start, tool_calls_at_start, tool_calls_env_override, &invocations) => {
+                            res = client.run(register.clone(), &signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono, tool_calls_at_start, tool_calls_env_override, &invocations) => {
                                 match &res {
                                     Ok(()) => advisor_fault.reset(),
                                     Err(e) => {

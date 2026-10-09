@@ -24,7 +24,7 @@ use crate::crypto::{EncryptionKey, ProviderKeypair};
 use crate::engines::{rejection_of, DeltaChannel, Engine, EngineRegistry};
 use crate::error::{ProviderError, Result};
 use crate::hypervisor;
-use crate::pds::{effective_tool_calls, PdsClient, ProBonoPolicy};
+use crate::pds::{effective_tool_calls, LiveProBono, PdsClient, ProBonoPolicy};
 use crate::pricing;
 use crate::protocol::{
     AdvisorMessage, AttestationChallenge, AttestationRefreshed, AttestationResponse, ChunkChannel,
@@ -101,7 +101,7 @@ struct OwnedServeContext {
     pds: PdsClient,
     attestation: Arc<RwLock<Option<StrongRef>>>,
     engines: EngineRegistry,
-    pro_bono: ProBonoPolicy,
+    pro_bono: LiveProBono,
 }
 
 impl OwnedServeContext {
@@ -580,11 +580,13 @@ struct ServeContext<'a> {
     /// echo masquerade as a real model's reply).
     engines: &'a EngineRegistry,
     /// The owner's pro-bono election, read from this machine's provider
-    /// record at serve start. A request from a requester this policy
-    /// matches is served free: the receipt carries `proBono: true` with a
-    /// zero price and zero token counts, and the exchange takes no cut.
-    /// An off / non-matching policy serves the job as a normal paid job.
-    pro_bono: &'a ProBonoPolicy,
+    /// record at serve start and kept current by the owner-controls poll
+    /// (swapped in place — no restart). A request from a requester the
+    /// policy in effect when the job is priced matches is served free: the
+    /// receipt carries `proBono: true` with a zero price and zero token
+    /// counts, and the exchange takes no cut. An off / non-matching policy
+    /// serves the job as a normal paid job.
+    pro_bono: &'a LiveProBono,
 }
 
 impl AdvisorClient {
@@ -632,10 +634,12 @@ impl AdvisorClient {
         // that never registered for push — the corresponding `select!` arm is
         // then inert and the loop behaves exactly as before.
         mut push_rx: Option<&mut mpsc::UnboundedReceiver<String>>,
-        // The owner's pro-bono election, read from this machine's provider
-        // record at serve start. Threaded into `ServeContext` so each job
-        // can decide, per requester, whether to serve free + unmetered.
-        pro_bono: &ProBonoPolicy,
+        // The owner's pro-bono election. Seeded from this machine's provider
+        // record at serve start, owned by `cmd_serve` so it survives
+        // reconnects, and updated in place by the owner-controls poll below.
+        // Threaded into `ServeContext` so each job can decide, per
+        // requester, whether to serve free + unmetered.
+        pro_bono: &LiveProBono,
         // The effective tool policy this serve loaded against. Live control
         // reads use the same captured operator override, so owner edits only
         // restart engines when they actually change effective behavior.
@@ -985,7 +989,7 @@ impl AdvisorClient {
                     // what made a transient blip look like the owner opting out
                     // of confidential / clearing their models and trip a spurious
                     // restart loop. Wait for the next poll / nudge instead.
-                    let Some((next_active, desired, desired_tier, tool_calls)) = maybe_control else {
+                    let Some((next_active, desired, desired_tier, tool_calls, next_pro_bono)) = maybe_control else {
                         tracing::debug!("provider-control read unresolved this cycle; skipping reconciliation");
                         continue;
                     };
@@ -995,6 +999,12 @@ impl AdvisorClient {
                         tracing::info!("owner stopped this machine from the console; disconnecting");
                         return Ok(());
                     }
+                    // Pro bono only changes how a job's receipt is priced —
+                    // the advisor and engines never see it — so swap it in
+                    // place rather than restarting. The router reads the
+                    // live record, so a stale policy here would bill jobs it
+                    // already sent us as pro bono.
+                    apply_pro_bono_change(pro_bono, next_pro_bono);
                     if tier_changed(desired_tier.as_deref(), desired_tier_at_start) {
                         // Owner changed this machine's trust tier on the console
                         // (opted in to / out of attested-confidential). The
@@ -1334,17 +1344,34 @@ async fn read_provider_control(
     pds: &PdsClient,
     rkey: &str,
     tool_calls_env_override: Option<bool>,
-) -> Option<(bool, Vec<String>, Option<String>, bool)> {
-    pds.get_provider_control(rkey)
-        .await
-        .map(|(active, desired, tier, _legacy, disabled)| {
+) -> Option<(bool, Vec<String>, Option<String>, bool, ProBonoPolicy)> {
+    pds.get_provider_control(rkey).await.map(
+        |(active, desired, tier, _legacy, disabled, pro_bono)| {
             (
                 active,
                 desired,
                 tier,
                 effective_tool_calls(tool_calls_env_override, disabled),
+                pro_bono,
             )
-        })
+        },
+    )
+}
+
+/// Install a freshly-read pro-bono policy into the live cell, logging when
+/// the owner actually changed it. Returns whether it changed.
+fn apply_pro_bono_change(live: &LiveProBono, next: ProBonoPolicy) -> bool {
+    let to = format!("{next:?}");
+    match live.replace(next) {
+        Some(from) => {
+            tracing::info!(
+                from = ?from, to = %to,
+                "owner changed this machine's pro bono election from the console; applying to the next job (no restart)"
+            );
+            true
+        }
+        None => false,
+    }
 }
 
 /// Whether two `desiredTier` values differ, normalising `None` to the
@@ -2341,14 +2368,17 @@ async fn handle_inference_request_inner(
     // (the provider's PDS stays the source of truth for work done) but with
     // zero tokens and a zero price, and flag it so the exchange takes no cut.
     // A non-matching / off policy falls through to normal metering below.
-    let pro_bono = ctx.pro_bono.applies_to(&req.requester_did);
+    // Read the live policy ONCE so the decision and everything priced off it
+    // agree even if the owner flips it while this job is finishing.
+    let pro_bono_policy = ctx.pro_bono.current();
+    let pro_bono = pro_bono_policy.applies_to(&req.requester_did);
 
     let rate = pricing::rate_for(&req.model);
     let (tokens_in, tokens_out, price_minor) = if pro_bono {
         tracing::info!(
             session_id = %session_id,
             requester = %req.requester_did,
-            mode = %ctx.pro_bono.mode,
+            mode = %pro_bono_policy.mode,
             "serving job pro bono — unmetered, zero price, no exchange cut",
         );
         (0u64, 0u64, 0u64)
@@ -3028,9 +3058,9 @@ mod tests {
     /// requester is served pro bono, so these tests exercise the normal
     /// metered path. Returned as `'static` so `ctx` can hand `ServeContext`
     /// a reference without each call site owning a binding.
-    fn off_pro_bono() -> &'static ProBonoPolicy {
-        static P: std::sync::OnceLock<ProBonoPolicy> = std::sync::OnceLock::new();
-        P.get_or_init(ProBonoPolicy::default)
+    fn off_pro_bono() -> &'static LiveProBono {
+        static P: std::sync::OnceLock<LiveProBono> = std::sync::OnceLock::new();
+        P.get_or_init(LiveProBono::default)
     }
 
     fn ctx<'a>(
@@ -3092,7 +3122,7 @@ mod tests {
             pds: fake_pds(),
             attestation: Arc::new(RwLock::new(None)),
             engines,
-            pro_bono: ProBonoPolicy::default(),
+            pro_bono: LiveProBono::default(),
         };
         let manager = InvocationManager::new();
         let mut changed = manager.subscribe();
@@ -3322,7 +3352,7 @@ mod tests {
             pds: fake_pds(),
             attestation: Arc::new(RwLock::new(None)),
             engines: stub_registry(),
-            pro_bono: ProBonoPolicy::default(),
+            pro_bono: LiveProBono::default(),
         };
         let manager = InvocationManager::new();
         {
@@ -4117,5 +4147,172 @@ mod tests {
                 "a refused job must not publish a receipt"
             );
         }
+    }
+
+    #[test]
+    fn apply_pro_bono_change_swaps_in_place_and_ignores_noops() {
+        let any = ProBonoPolicy {
+            mode: "any".into(),
+            dids: vec![],
+        };
+        let direct = ProBonoPolicy {
+            mode: "direct".into(),
+            dids: vec!["did:plc:friend".into()],
+        };
+        let live = LiveProBono::default();
+        // Unchanged (still off) → no swap.
+        assert!(!apply_pro_bono_change(&live, ProBonoPolicy::default()));
+        assert!(!live.current().applies_to("did:plc:anyone"));
+        // Owner turns it on mid-serve → takes effect with no restart.
+        assert!(apply_pro_bono_change(&live, any.clone()));
+        assert!(live.current().applies_to("did:plc:anyone"));
+        // Re-reading the same policy (30s poll) is a no-op.
+        assert!(!apply_pro_bono_change(&live, any));
+        // Narrowing to a direct list, then switching back off.
+        assert!(apply_pro_bono_change(&live, direct));
+        assert!(live.current().applies_to("did:plc:friend"));
+        assert!(!live.current().applies_to("did:plc:stranger"));
+        assert!(apply_pro_bono_change(&live, ProBonoPolicy::default()));
+        assert!(!live.current().applies_to("did:plc:friend"));
+        // Clones share the cell — the per-connection `OwnedServeContext`
+        // clone and `cmd_serve`'s copy see the same swap.
+        let clone = live.clone();
+        apply_pro_bono_change(
+            &live,
+            ProBonoPolicy {
+                mode: "any".into(),
+                dids: vec![],
+            },
+        );
+        assert!(clone.current().applies_to("did:plc:anyone"));
+    }
+
+    /// A PDS stand-in that records every request body it receives (answering
+    /// 500), so a test can inspect the receipt record the provider tried to
+    /// publish.
+    fn capturing_pds() -> (
+        PdsClient,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = bodies.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).is_ok() {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        sink.lock().unwrap().push(v);
+                    }
+                }
+                let _ = conn.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let pds = PdsClient::new(Session {
+            did: "did:plc:test".into(),
+            handle: "test.example".into(),
+            api_key: "cocore-fake".into(),
+            api_base: format!("http://127.0.0.1:{port}"),
+        });
+        (pds, bodies)
+    }
+
+    /// The 2026-10-08 regression: the owner turned pro bono on while the tray
+    /// was serving, the router (which reads the live record) sent this
+    /// machine a pro bono job, and the tray billed it at full price because
+    /// it only read the election at startup. A job priced AFTER the owner
+    /// controls swap the policy must get a pro bono receipt — `proBono: true`
+    /// with zero price and zero tokens, the shape verifiers require.
+    #[tokio::test]
+    async fn a_job_served_after_pro_bono_flips_on_gets_a_pro_bono_receipt() {
+        let signer = load_or_create_identity().unwrap();
+        let provider_kp = fresh_keypair();
+        let requester_kp = fresh_keypair();
+        let attestation = StrongRef {
+            uri: "at://did:plc:test/dev.cocore.compute.attestation/aaa".into(),
+            cid: "bafyatt".into(),
+        };
+        let (pds, bodies) = capturing_pds();
+        let engines = stub_registry();
+        let live = LiveProBono::default();
+        let cx = ServeContext {
+            signer: &*signer,
+            encryption: &provider_kp,
+            pds: &pds,
+            attestation: Arc::new(RwLock::new(Some(attestation))),
+            engines: &engines,
+            pro_bono: &live,
+        };
+        let published_receipt = |i: usize| -> serde_json::Value {
+            let all = bodies.lock().unwrap();
+            let body = all
+                .get(i)
+                .unwrap_or_else(|| panic!("no publish #{i}: {all:?}"));
+            assert_eq!(body["collection"], "dev.cocore.compute.receipt");
+            body["record"].clone()
+        };
+        let complete = |replies: &[AdvisorMessage]| match replies.last() {
+            Some(AdvisorMessage::InferenceComplete(c)) => (c.tokens_in, c.tokens_out),
+            other => panic!("expected InferenceComplete, got {other:?}"),
+        };
+
+        // Before the flip: a normal metered, billable receipt.
+        let replies =
+            handle_inference_request(schema_request(&requester_kp, &provider_kp, "stub"), &cx)
+                .await;
+        let (tin, tout) = complete(&replies);
+        assert!(tin > 0 && tout > 0, "paid job is metered");
+        let paid = published_receipt(0);
+        assert!(paid.get("proBono").is_none(), "{paid}");
+        assert!(paid["price"]["amount"].as_u64().unwrap() > 0, "{paid}");
+
+        // Owner turns pro bono on from the console; the control poll swaps
+        // it in place. No restart, same ServeContext.
+        assert!(apply_pro_bono_change(
+            &live,
+            ProBonoPolicy {
+                mode: "any".into(),
+                dids: vec![],
+            },
+        ));
+
+        let replies =
+            handle_inference_request(schema_request(&requester_kp, &provider_kp, "stub"), &cx)
+                .await;
+        assert_eq!(complete(&replies), (0, 0), "pro bono job is unmetered");
+        let free = published_receipt(1);
+        assert_eq!(free["proBono"], serde_json::json!(true), "{free}");
+        assert_eq!(free["price"]["amount"], serde_json::json!(0), "{free}");
+        assert_eq!(free["tokens"]["in"], serde_json::json!(0), "{free}");
+        assert_eq!(free["tokens"]["out"], serde_json::json!(0), "{free}");
+
+        // And back off: the next job bills again.
+        assert!(apply_pro_bono_change(&live, ProBonoPolicy::default()));
+        let _ = handle_inference_request(schema_request(&requester_kp, &provider_kp, "stub"), &cx)
+            .await;
+        let paid_again = published_receipt(2);
+        assert!(paid_again.get("proBono").is_none(), "{paid_again}");
+        assert!(
+            paid_again["price"]["amount"].as_u64().unwrap() > 0,
+            "{paid_again}"
+        );
     }
 }

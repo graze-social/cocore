@@ -11,11 +11,16 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import type { DispatchEvent } from "./inference-dispatch.server.ts";
+import type { DispatchEvent, DispatchInputs } from "./inference-dispatch.server.ts";
 
 // Mutable knobs the hoisted mocks read.
 const state = vi.hoisted(() => ({
   events: [] as DispatchEvent[],
+  // The inputs of the most recent dispatch, so a test can assert what a
+  // handler forwarded to the provider.
+  lastInputs: null as DispatchInputs | null,
+  // Machines `resolveProBonoProviderKeys` reports as serving the caller free.
+  proBonoKeys: new Set<string>(),
   sessionPresent: true,
   // Resolved by the AppView-store fallback for a cocore- key the local
   // store rejects (null = the AppView declines it too).
@@ -56,13 +61,18 @@ vi.mock("@/lib/inference-dispatch.server.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./inference-dispatch.server.ts")>();
   return {
     ...actual,
-    runDispatch: async function* (): AsyncGenerator<DispatchEvent> {
+    runDispatch: async function* (inputs: DispatchInputs): AsyncGenerator<DispatchEvent> {
+      state.lastInputs = inputs;
       for (const ev of state.events) yield ev;
     },
   };
 });
 
-import { handleChatCompletions } from "./openai-routes.server.ts";
+vi.mock("@/lib/pro-bono.server.ts", () => ({
+  resolveProBonoProviderKeys: async (_did: string) => state.proBonoKeys,
+}));
+
+import { handleChatCompletions, handleProBonoChatCompletions } from "./openai-routes.server.ts";
 
 function streamRequest(body: Record<string, unknown>): Request {
   return new Request("https://console.test/v1/chat/completions", {
@@ -256,5 +266,84 @@ describe("handleChatCompletions wire contract", () => {
     const res = await handleChatCompletions(req);
     expect(res.status).toBe(401);
     expect(res.headers.get("content-type") ?? "").toMatch(/application\/json/);
+  });
+});
+
+describe("handleProBonoChatCompletions", () => {
+  beforeEach(() => {
+    state.sessionPresent = true;
+    state.appviewKey = null;
+    state.lastInputs = null;
+    state.proBonoKeys = new Set(["did:plc:providerproviderprovider:machine1"]);
+    // Pro bono receipts carry zero tokens; emit content so the buffered
+    // path doesn't read the completion as an empty-output stall.
+    state.events = [
+      { kind: "chunk", seq: 0, channel: "content", text: '{"headline":"h","summary":"s"}' },
+      { kind: "complete", tokensIn: 0, tokensOut: 0, receiptUri: "at://x" },
+    ];
+  });
+
+  const proBonoRequest = (body: Record<string, unknown>) =>
+    new Request("https://console.test/v1/probono/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer cocore-testkey", "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  test("forwards response_format json_schema as outputSchema (was dropped)", async () => {
+    // Observed 2026-10-08: asked for {headline, summary}, the pro bono path
+    // dispatched no outputSchema and the model returned {headline,
+    // summary_sentence}. The schema must reach the provider like the paid path.
+    const schema = {
+      type: "object",
+      properties: { headline: { type: "string" }, summary: { type: "string" } },
+      required: ["headline", "summary"],
+      additionalProperties: false,
+    };
+    const res = await handleProBonoChatCompletions(
+      proBonoRequest({
+        ...baseBody,
+        stream: false,
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "story", strict: true, schema },
+        },
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(state.lastInputs?.outputSchema?.name).toBe("story");
+    expect(state.lastInputs?.outputSchema?.schema).toEqual(schema);
+    // Still routed only to the pro bono machines.
+    expect(state.lastInputs?.allowedProviderDids).toEqual(state.proBonoKeys);
+  });
+
+  test("forwards tools and tool_choice like the paid path", async () => {
+    const res = await handleProBonoChatCompletions(
+      proBonoRequest({
+        ...baseBody,
+        stream: false,
+        tools: weatherTools,
+        tool_choice: { type: "function", function: { name: "get_weather" } },
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(state.lastInputs?.tools).toEqual(weatherTools);
+    expect(state.lastInputs?.toolChoice).toBeDefined();
+    expect(state.lastInputs?.toolChoiceFunction).toBe("get_weather");
+  });
+
+  test("a plain request carries no schema or tool fields", async () => {
+    const res = await handleProBonoChatCompletions(proBonoRequest({ ...baseBody, stream: false }));
+    expect(res.status).toBe(200);
+    expect(state.lastInputs).not.toBeNull();
+    expect(state.lastInputs).not.toHaveProperty("outputSchema");
+    expect(state.lastInputs).not.toHaveProperty("tools");
+  });
+
+  test("still fails closed with 503 when no machine offers the caller pro bono", async () => {
+    state.proBonoKeys = new Set();
+    const res = await handleProBonoChatCompletions(proBonoRequest(baseBody));
+    expect(res.status).toBe(503);
+    expect(state.lastInputs).toBeNull();
   });
 });

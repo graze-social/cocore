@@ -539,7 +539,7 @@ pub fn reconcile_provider_records(
 /// The owner's pro-bono election for a machine, mirroring the lexicon
 /// `dev.cocore.compute.provider#proBonoPolicy`. Decides, per requester,
 /// whether a job is served free + unmetered with no exchange cut.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ProBonoPolicy {
     /// `any` — every requester is served pro bono. `direct` — only the
     /// requesters in `dids` are. Any other / empty value is treated as
@@ -569,6 +569,43 @@ impl ProBonoPolicy {
     pub fn from_record_value(value: &serde_json::Value) -> Option<Self> {
         let obj = value.get("proBono")?;
         serde_json::from_value(obj.clone()).ok()
+    }
+}
+
+/// The owner's pro-bono election as the serve loop holds it: one cell shared
+/// by every job, swapped in place when the owner-controls poll reads a new
+/// policy off the provider record. Unlike the model set or trust tier, pro
+/// bono only changes how a job's receipt is priced (the advisor never sees
+/// it), so an edit takes effect on the next job without restarting engines.
+/// Each job reads the cell ONCE when it prices its receipt, so a single
+/// receipt is never half-metered across a flip.
+#[derive(Debug, Clone, Default)]
+pub struct LiveProBono(std::sync::Arc<std::sync::RwLock<ProBonoPolicy>>);
+
+impl LiveProBono {
+    pub fn new(policy: ProBonoPolicy) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(policy)))
+    }
+
+    /// A snapshot of the policy in effect right now.
+    pub fn current(&self) -> ProBonoPolicy {
+        match self.0.read() {
+            Ok(p) => p.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Install `next`, returning the previous policy when it actually
+    /// changed (`None` when the owner's edit was a no-op).
+    pub fn replace(&self, next: ProBonoPolicy) -> Option<ProBonoPolicy> {
+        let mut guard = match self.0.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *guard == next {
+            return None;
+        }
+        Some(std::mem::replace(&mut *guard, next))
     }
 }
 
@@ -922,7 +959,8 @@ impl PdsClient {
     }
 
     /// Read the owner-set controls — the `active` start/stop switch, the
-    /// `desiredModels` list, and the `desiredTier` intent — from this DID's
+    /// `desiredModels` list, the `desiredTier` intent, the tool-call
+    /// switches, and the `proBono` election — from this DID's
     /// provider record at `rkey` in one list. Within the record the per-field
     /// defaults are: `active` true (serving) when absent, `desired` empty when
     /// absent, `desiredTier` None when absent.
@@ -949,6 +987,7 @@ impl PdsClient {
         Option<String>,
         Option<bool>,
         Option<bool>,
+        ProBonoPolicy,
     )> {
         let listed = self
             .list_my_records("dev.cocore.compute.provider")
@@ -981,12 +1020,16 @@ impl PdsClient {
         // policy using the same explicit-environment precedence as startup.
         let tool_calls = rec.value.get("toolCalls").and_then(|v| v.as_bool());
         let tool_calls_disabled = rec.value.get("toolCallsDisabled").and_then(|v| v.as_bool());
+        // The owner's pro-bono election, through the same single parser the
+        // startup read uses. Absent / malformed ≡ off (fail closed).
+        let pro_bono = ProBonoPolicy::from_record_value(&rec.value).unwrap_or_default();
         Some((
             active,
             desired,
             desired_tier,
             tool_calls,
             tool_calls_disabled,
+            pro_bono,
         ))
     }
 
@@ -1521,6 +1564,20 @@ mod tests {
             dids: vec!["did:plc:friend".into()],
         };
         assert!(!weird.applies_to("did:plc:friend"));
+    }
+
+    #[test]
+    fn live_pro_bono_replace_reports_only_real_changes() {
+        let live = LiveProBono::new(ProBonoPolicy::default());
+        assert!(live.replace(ProBonoPolicy::default()).is_none());
+        let any = ProBonoPolicy {
+            mode: "any".into(),
+            dids: vec![],
+        };
+        let prev = live.replace(any.clone()).expect("off → any is a change");
+        assert_eq!(prev, ProBonoPolicy::default());
+        assert_eq!(live.current(), any);
+        assert!(live.replace(any).is_none());
     }
 
     #[test]

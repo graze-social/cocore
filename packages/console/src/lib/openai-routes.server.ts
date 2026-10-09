@@ -706,6 +706,13 @@ export async function handleProBonoChatCompletions(request: Request): Promise<Re
     // gate as the friends/verified paths, just a different allow-set.
     allowedProviderDids,
     country: parsed.country,
+    // Same constrained-generation + tool fields as the paid paths: pro bono
+    // changes who pays, not what the caller asked for. Dropping these
+    // returned unconstrained output to `response_format: json_schema`.
+    ...(parsed.outputSchema ? { outputSchema: parsed.outputSchema } : {}),
+    ...(parsed.tools ? { tools: parsed.tools } : {}),
+    ...(parsed.toolChoice ? { toolChoice: parsed.toolChoice } : {}),
+    ...(parsed.toolChoiceFunction ? { toolChoiceFunction: parsed.toolChoiceFunction } : {}),
   };
 
   if (parsed.stream) {
