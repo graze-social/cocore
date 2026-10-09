@@ -539,7 +539,7 @@ pub fn reconcile_provider_records(
 /// The owner's pro-bono election for a machine, mirroring the lexicon
 /// `dev.cocore.compute.provider#proBonoPolicy`. Decides, per requester,
 /// whether a job is served free + unmetered with no exchange cut.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ProBonoPolicy {
     /// `any` — every requester is served pro bono. `direct` — only the
     /// requesters in `dids` are. Any other / empty value is treated as
@@ -569,6 +569,47 @@ impl ProBonoPolicy {
     pub fn from_record_value(value: &serde_json::Value) -> Option<Self> {
         let obj = value.get("proBono")?;
         serde_json::from_value(obj.clone()).ok()
+    }
+}
+
+/// The owner's pro-bono election as the serve loop sees it LIVE. Seeded from
+/// the provider record at startup, then replaced by every owner-controls poll
+/// (`get_provider_control`), and read once per job. It only decides per-job
+/// receipt pricing, so — unlike a model / tier / tool-calls edit — a change
+/// needs no restart. Created once per process (outside the advisor reconnect
+/// loop) so a reconnect never reverts to the startup value. Clones share state.
+#[derive(Clone, Debug)]
+pub struct LiveProBono(std::sync::Arc<tokio::sync::watch::Sender<ProBonoPolicy>>);
+
+impl LiveProBono {
+    pub fn new(policy: ProBonoPolicy) -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(policy)))
+    }
+
+    /// The policy in force right now. A job takes ONE snapshot when it
+    /// starts, so a mid-job owner edit can't split its receipt.
+    pub fn snapshot(&self) -> ProBonoPolicy {
+        self.0.borrow().clone()
+    }
+
+    /// Replace the policy with the owner's latest. Returns the previous
+    /// policy when it actually changed (for logging), `None` when unchanged.
+    pub fn update(&self, next: ProBonoPolicy) -> Option<ProBonoPolicy> {
+        let mut prev = None;
+        self.0.send_if_modified(|cur| {
+            if *cur == next {
+                return false;
+            }
+            prev = Some(std::mem::replace(cur, next));
+            true
+        });
+        prev
+    }
+}
+
+impl Default for LiveProBono {
+    fn default() -> Self {
+        Self::new(ProBonoPolicy::default())
     }
 }
 
@@ -949,6 +990,7 @@ impl PdsClient {
         Option<String>,
         Option<bool>,
         Option<bool>,
+        ProBonoPolicy,
     )> {
         let listed = self
             .list_my_records("dev.cocore.compute.provider")
@@ -981,12 +1023,16 @@ impl PdsClient {
         // policy using the same explicit-environment precedence as startup.
         let tool_calls = rec.value.get("toolCalls").and_then(|v| v.as_bool());
         let tool_calls_disabled = rec.value.get("toolCallsDisabled").and_then(|v| v.as_bool());
+        // The pro-bono election, through the same parser startup uses:
+        // absent / malformed ≡ off (every job metered + billed).
+        let pro_bono = ProBonoPolicy::from_record_value(&rec.value).unwrap_or_default();
         Some((
             active,
             desired,
             desired_tier,
             tool_calls,
             tool_calls_disabled,
+            pro_bono,
         ))
     }
 
@@ -1521,6 +1567,45 @@ mod tests {
             dids: vec!["did:plc:friend".into()],
         };
         assert!(!weird.applies_to("did:plc:friend"));
+    }
+
+    #[test]
+    fn live_pro_bono_swaps_in_owner_edits_and_is_shared_across_clones() {
+        // Seeded off (the startup read) — every requester billed.
+        let live = LiveProBono::default();
+        // The serve context's per-job clone must see the poll's later updates.
+        let job_view = live.clone();
+        assert!(!job_view.snapshot().applies_to("did:plc:anyone"));
+
+        // Owner turns pro bono on from the console → the next poll applies it
+        // live, reporting the previous policy for the log line.
+        let any = ProBonoPolicy {
+            mode: "any".into(),
+            dids: vec![],
+        };
+        assert_eq!(live.update(any.clone()), Some(ProBonoPolicy::default()));
+        assert!(job_view.snapshot().applies_to("did:plc:anyone"));
+
+        // Re-reading the same election is not a change (no log spam).
+        assert_eq!(live.update(any.clone()), None);
+
+        // A `direct` list edit IS a change.
+        let direct = ProBonoPolicy {
+            mode: "direct".into(),
+            dids: vec!["did:plc:friend".into()],
+        };
+        assert_eq!(live.update(direct), Some(any));
+        assert!(job_view.snapshot().applies_to("did:plc:friend"));
+        assert!(!job_view.snapshot().applies_to("did:plc:stranger"));
+
+        // Owner removes the field (or it's malformed) → the shared parser
+        // yields off, and that swaps in too: absent ≡ off.
+        let cleared = ProBonoPolicy::from_record_value(&serde_json::json!({
+            "proBono": { "mode": 7 }
+        }))
+        .unwrap_or_default();
+        assert!(live.update(cleared).is_some());
+        assert!(!job_view.snapshot().applies_to("did:plc:friend"));
     }
 
     #[test]

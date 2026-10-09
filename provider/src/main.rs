@@ -5,7 +5,7 @@ use cocore_provider::{
     attestation, oauth,
     pds::{
         effective_tool_calls, parse_tool_calls_env_override, AttestationFault, EngineFault,
-        ModelPrice, PdsClient, ProBonoPolicy, ProviderRecord, TrustLevel,
+        LiveProBono, ModelPrice, PdsClient, ProBonoPolicy, ProviderRecord, TrustLevel,
     },
     pricing,
     protocol::Register,
@@ -1312,7 +1312,7 @@ async fn wait_until_active(pds: &cocore_provider::pds::PdsClient, rkey: Option<&
         let read = pds
             .get_provider_control(rk)
             .await
-            .map(|(active, _, _, _, _)| active);
+            .map(|(active, _, _, _, _, _)| active);
         if active_gate_decision(read, &mut confirmed_paused) == ActiveGate::Serve {
             clear_serving_paused();
             return;
@@ -1833,6 +1833,12 @@ async fn cmd_serve(
                 effective_tool_calls(tool_calls_env_override, None),
             ),
         };
+    // The pro-bono election only seeds the serve loop: `AdvisorClient::run`'s
+    // owner-controls poll keeps it live, and each job reads it when it starts,
+    // so turning pro bono on/off from the console takes effect without a
+    // restart. Built once, outside the advisor reconnect loops, so a reconnect
+    // keeps the latest election rather than reverting to this startup read.
+    let pro_bono = LiveProBono::new(pro_bono_at_start);
 
     // Feed the effective default into the existing engine knob only when the
     // operator did not set it. Exact model eligibility and the startup canary
@@ -2389,7 +2395,7 @@ async fn cmd_serve(
                             &model_schedules,
                             &configured_models,
                             push_rx.as_mut(),
-                            &pro_bono_at_start,
+                            &pro_bono,
                             tool_calls_at_start,
                             tool_calls_env_override,
                             &invocations,
@@ -2467,7 +2473,7 @@ async fn cmd_serve(
                         );
                         let client = AdvisorClient::new(advisor_url);
                         tokio::select! {
-                            res = client.run(register.clone(), &signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono_at_start, tool_calls_at_start, tool_calls_env_override, &invocations) => {
+                            res = client.run(register.clone(), &signer, &enc, &pds, attestation.clone(), &eng, provider_rkey.as_deref(), &desired_at_start, desired_tier_at_start.as_deref(), &model_schedules, &configured_models, push_rx.as_mut(), &pro_bono, tool_calls_at_start, tool_calls_env_override, &invocations) => {
                                 match &res {
                                     Ok(()) => advisor_fault.reset(),
                                     Err(e) => {
