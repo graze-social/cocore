@@ -259,7 +259,12 @@ function timedRestore(ctx: PdsWriteContext, did: string, meta: PdsMeta) {
   return Effect.gen(function* () {
     const start = Date.now();
     const restored = yield* Effect.tryPromise({
-      try: () => restoreSession(ctx.oauth, did as Did),
+      try: () =>
+        restoreSession(ctx.oauth, did as Did, {
+          // Make session-info agree with reality so the console logs the
+          // user out on their next request instead of 401ing every write.
+          onNeedsReauth: (d) => ctx.accounts.deleteOAuthSession(d),
+        }),
       catch: (e) => e,
     }).pipe(Effect.either);
     const ms = Date.now() - start;

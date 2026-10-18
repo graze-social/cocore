@@ -156,6 +156,14 @@ export function makeAppviewOAuth(accounts: AccountStore): AppviewOAuthClient {
 export async function restoreSession(
   client: AppviewOAuthClient,
   did: Did,
+  opts: {
+    /** Called when the failure is definitively `needs_reauth`, so the caller
+     *  can drop the dead stored session. Without this the stored blob keeps
+     *  its (now useless) refresh token, `/internal/pds/session-info` keeps
+     *  answering `present: true`, and the console treats the user as signed
+     *  in while every write 401s — instead of logging them out. */
+    onNeedsReauth?: (did: Did) => void;
+  } = {},
 ): Promise<RestoredSession | null> {
   try {
     return await client.restore(did);
@@ -176,6 +184,15 @@ export async function restoreSession(
         error: e instanceof Error ? e.message : String(e),
       }),
     );
+    // Only a definitive verdict drops the session; a transient/unknown
+    // failure must never log a user out.
+    if (reason === "needs_reauth") {
+      try {
+        opts.onNeedsReauth?.(did);
+      } catch {
+        /* best-effort: the 401 contract below is unchanged */
+      }
+    }
     return null;
   }
 }

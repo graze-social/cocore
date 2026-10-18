@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   classifyRestoreError,
+  restoreSession,
   startServiceSessionKeepAlive,
   type AppviewOAuthClient,
 } from "./oauth-client.ts";
@@ -91,5 +92,38 @@ describe("startServiceSessionKeepAlive", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("restoreSession onNeedsReauth", () => {
+  const did = "did:plc:abc123" as Parameters<typeof restoreSession>[1];
+  const failingWith = (msg: string) =>
+    ({
+      restore: async () => {
+        throw new Error(msg);
+      },
+    }) as unknown as AppviewOAuthClient;
+
+  it("drops the stored session on a definitive needs_reauth failure", async () => {
+    const onNeedsReauth = vi.fn();
+    const out = await restoreSession(failingWith("invalid_grant"), did, { onNeedsReauth });
+    expect(out).toBeNull();
+    expect(onNeedsReauth).toHaveBeenCalledWith(did);
+  });
+
+  it("never drops the session on a transient or unknown failure", async () => {
+    const onNeedsReauth = vi.fn();
+    expect(await restoreSession(failingWith("fetch failed"), did, { onNeedsReauth })).toBeNull();
+    expect(await restoreSession(failingWith("something odd"), did, { onNeedsReauth })).toBeNull();
+    expect(onNeedsReauth).not.toHaveBeenCalled();
+  });
+
+  it("still returns null if the drop callback throws", async () => {
+    const out = await restoreSession(failingWith("invalid_grant"), did, {
+      onNeedsReauth: () => {
+        throw new Error("db locked");
+      },
+    });
+    expect(out).toBeNull();
   });
 });
