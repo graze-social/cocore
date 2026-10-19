@@ -9,7 +9,9 @@
 
 import * as stylex from "@stylexjs/stylex";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 
+import { clearChatStoreMemory } from "@/components/chat/chat-store.ts";
 import {
   acceptTermsMutationOptions,
   getMyTermsStateQueryOptions,
@@ -28,6 +30,11 @@ import { Flex } from "@/design-system/flex";
 import { Page } from "@/design-system/page/index.tsx";
 import { fontFamily, fontSize } from "@/design-system/theme/typography.stylex";
 import { Body } from "@/design-system/typography";
+import {
+  getSessionQueryOptions,
+  signOutMutationOptions,
+} from "@/integrations/auth/session.functions.ts";
+import { isSessionExpiredError } from "@/lib/session-expired.ts";
 import type { TermsState } from "@/lib/terms-acceptance.server.ts";
 
 const styles = stylex.create({
@@ -59,7 +66,25 @@ interface Props {
 
 export function TermsAcceptanceGate({ state, onAccepted }: Props) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const acceptM = useMutation(acceptTermsMutationOptions);
+  // The underlying ATProto session died (refresh token expired/revoked):
+  // the write can never succeed from here, so instead of showing the raw
+  // 401, sign out and send the user through login, landing back on this
+  // page. Same teardown as the navbar logout so no stale user-scoped cache
+  // survives.
+  const signOutM = useMutation({
+    ...signOutMutationOptions,
+    onSettled: async () => {
+      clearChatStoreMemory();
+      queryClient.setQueryData(getSessionQueryOptions.queryKey, null);
+      const here = `${window.location.pathname}${window.location.search}`;
+      await navigate({ to: "/login", search: { redirect: here } });
+      queryClient.clear();
+      queryClient.setQueryData(getSessionQueryOptions.queryKey, null);
+    },
+  });
+  const sessionExpired = acceptM.isError && isSessionExpiredError(acceptM.error);
   const policy = state.activePolicy;
   const termsUri = policy.termsUri ?? "/terms";
   const termsVersion = policy.termsVersion ?? "v1";
@@ -81,6 +106,9 @@ export function TermsAcceptanceGate({ state, onAccepted }: Props) {
         onSuccess: async () => {
           await queryClient.invalidateQueries({ queryKey: getMyTermsStateQueryOptions.queryKey });
           onAccepted?.();
+        },
+        onError: (e) => {
+          if (isSessionExpiredError(e)) signOutM.mutate();
         },
       },
     );
@@ -146,7 +174,11 @@ export function TermsAcceptanceGate({ state, onAccepted }: Props) {
               </a>{" "}
               · version <code>{termsVersion}</code>
             </Body>
-            {acceptM.isError ? (
+            {sessionExpired ? (
+              <Alert variant="warning" title="Your session expired">
+                <Body>Signing you out so you can sign back in and accept the terms…</Body>
+              </Alert>
+            ) : acceptM.isError ? (
               <Alert variant="critical" title="Could not record acceptance">
                 <Body>
                   {acceptM.error instanceof Error ? acceptM.error.message : String(acceptM.error)}
@@ -156,7 +188,12 @@ export function TermsAcceptanceGate({ state, onAccepted }: Props) {
           </Flex>
         </CardBody>
         <CardFooter>
-          <Button variant="primary" size="lg" isDisabled={acceptM.isPending} onPress={onAgree}>
+          <Button
+            variant="primary"
+            size="lg"
+            isDisabled={acceptM.isPending || signOutM.isPending || sessionExpired}
+            onPress={onAgree}
+          >
             {acceptM.isPending ? "Recording acceptance…" : "I agree"}
           </Button>
         </CardFooter>

@@ -33,7 +33,8 @@
 #
 # Exit codes:
 #   0  success
-#   2  uv install failed
+#   2  uv install failed (or `uv venv` itself failed — uv exits 2 on its
+#      own errors and `set -e` propagates that code)
 #   3  pip install vllm-mlx failed
 #   4  venv verification failed (packages installed but don't import)
 #   5  another bootstrap held the venv lock for 45 minutes
@@ -161,16 +162,19 @@ install_python() {
 create_venv() {
   phase "create venv at $COCORE_PYTHON_VENV"
   mkdir -p "$(dirname "$COCORE_PYTHON_VENV")"
-  if [[ -d "$COCORE_PYTHON_VENV" && -x "$COCORE_PYTHON_VENV/bin/python" ]]; then
-    # uv venv refuses to overwrite an existing venv by default;
-    # the --allow-existing flag makes it reuse the dir. Inside,
-    # `bin/python` is re-linked to the requested Python version.
+  # ALWAYS --allow-existing. The directory exists on every run by the time
+  # we get here — acquire_bootstrap_lock creates it to hold the lock file —
+  # and plain `uv venv` refuses any existing directory ("A directory already
+  # exists at ..."), exit 2. Gating the flag on `bin/python` being present
+  # (as this used to) therefore broke every FRESH install from v0.9.57 on,
+  # and also any half-created venv left behind by an interrupted run.
+  # --allow-existing reuses the dir, re-links `bin/python` to the requested
+  # version, and leaves the lock file and any installed packages alone.
+  if [[ -x "$COCORE_PYTHON_VENV/bin/python" ]]; then
     note "existing venv detected; reusing"
-    "$COCORE_UV" venv --python "$COCORE_PYTHON_VERSION" --allow-existing \
-        "$COCORE_PYTHON_VENV" >&2
-  else
-    "$COCORE_UV" venv --python "$COCORE_PYTHON_VERSION" "$COCORE_PYTHON_VENV" >&2
   fi
+  "$COCORE_UV" venv --python "$COCORE_PYTHON_VERSION" --allow-existing \
+      "$COCORE_PYTHON_VENV" >&2
   note "venv python: $("$COCORE_PYTHON_VENV/bin/python" --version 2>&1)"
 }
 

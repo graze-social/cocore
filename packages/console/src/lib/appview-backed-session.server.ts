@@ -126,6 +126,14 @@ class AppviewBackedSession {
       throw new Error(`appview proxy ${path} internal ${res.status}: ${t.slice(0, 200)}`);
     }
     const out = (await res.json()) as ProxyResult;
+    if (out.status === 401) {
+      // The AppView couldn't restore this DID's session and (for a
+      // definitive needs-reauth) has dropped it. Forget any memoized
+      // "present" so the very next request's auth check sees the truth and
+      // logs the user out, rather than serving a signed-in page whose
+      // writes all 401.
+      sessionInfoCache.delete(this.did);
+    }
     return new Response(out.bodyText, {
       status: out.status,
       headers: { "content-type": out.contentType ?? "application/json" },

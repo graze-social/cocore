@@ -85,30 +85,43 @@ readonly INSTALL_BIN="$COCORE_PREFIX/bin/cocore"
 readonly STATE_DIR="$HOME/.cocore"
 readonly LOG_DIR="$STATE_DIR/logs"
 
-# Catalog mirror — keep in sync with:
-#   * provider/src/pricing.rs              (Rust source of truth)
-#   * packages/console/src/components/start/provider-model-catalog.ts
-#     (web /start picker)
+# Catalog mirror — the `recommended: true` rotation. Keep in sync with:
+#   * provider/src/pricing.rs                     (Rust source of truth)
+#   * packages/console/src/lib/recommended-models.ts (web pickers)
+#   * provider-shell/Sources/CoCoreShell/ModelsView.swift (tray catalog)
+# This list once drifted to the legacy Qwen2.5/Llama-3.3 set, so a user who
+# picked a model in the tray couldn't find it here. Legacy models still
+# work: paste the full NSID at the prompt.
 # Each entry: id | min_ram_gb | one-line description. Order is
 # small → large so the menu walks intuitively. Stub is excluded
 # because the stub engine is always loaded; adding it to
 # COCORE_INFERENCE_MODELS is a no-op.
 readonly CATALOG_IDS=(
-  "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-  "mlx-community/Qwen2.5-3B-Instruct-4bit"
-  "mlx-community/gemma-3-4b-it-qat-4bit"
-  "mlx-community/Qwen2.5-7B-Instruct-4bit"
-  "mlx-community/Qwen2.5-32B-Instruct-4bit"
-  "mlx-community/Llama-3.3-70B-Instruct-4bit"
+  "mlx-community/Qwen3.5-0.8B-MLX-4bit"
+  "mlx-community/Qwen3.5-2B-MLX-4bit"
+  "mlx-community/Qwen3.5-4B-MLX-4bit"
+  "mlx-community/Qwen3.5-9B-MLX-4bit"
+  "mlx-community/Qwen3.5-27B-4bit"
+  "mlx-community/Qwen3.6-27B-4bit"
+  "mlx-community/Qwen3.5-35B-A3B-4bit"
+  "mlx-community/Qwen3.6-35B-A3B-4bit"
+  "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"
+  "mlx-community/Qwen3.5-122B-A10B-4bit"
+  "mlx-community/Qwen3.5-397B-A17B-4bit"
 )
-readonly CATALOG_MIN_RAM=(4 8 8 16 32 64)
+readonly CATALOG_MIN_RAM=(4 6 8 16 24 24 32 32 64 96 256)
 readonly CATALOG_DESCS=(
-  "Qwen 0.5B — fast, low quality; fits any Apple Silicon"
-  "Qwen 3B — small but coherent; tight on 8GB"
-  "Gemma 3 4B QAT — balanced default for 8GB+ Macs"
-  "Qwen 7B — strong general-purpose; 16GB+ recommended"
-  "Qwen 32B — frontier-class; 32GB+ Mac Studio class"
-  "Llama 3.3 70B — heavyweight; 64GB+ Mac Studio class"
+  "Qwen3.5 0.8B — fast, low quality; fits any Apple Silicon"
+  "Qwen3.5 2B — small but coherent; good on 8GB"
+  "Qwen3.5 4B — balanced default for 8GB+ Macs"
+  "Qwen3.5 9B — strong general-purpose; 16GB+ recommended"
+  "Qwen3.5 27B — high-quality dense model; 24GB+"
+  "Qwen3.6 27B — frontier-class dense; 24GB+"
+  "Qwen3.5 35B-A3B MoE — fast for its size; 32GB+"
+  "Qwen3.6 35B-A3B MoE — fast for its size; 32GB+"
+  "Llama 4 Scout 17B×16E MoE — heavyweight; 64GB+"
+  "Qwen3.5 122B-A10B MoE — flagship; 96GB+ Mac Studio/Ultra"
+  "Qwen3.5 397B-A17B MoE — flagship; 256GB+ Ultra"
 )
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }

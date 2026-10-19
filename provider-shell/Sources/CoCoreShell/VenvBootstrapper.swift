@@ -82,6 +82,11 @@ final class VenvBootstrapper: ObservableObject {
         }
         state = .running("Starting…")
         let venv = NSHomeDirectory() + "/.cocore/python"
+        let log = Self.startLog()
+        // Last `error:` line the script printed, so a failure can say WHAT
+        // went wrong instead of just an exit code. Touched only from the
+        // pipe's readability handler (serial) and read after the process exits.
+        let lastError = LockedString()
         let exit: Int32 = await withCheckedContinuation { cont in
             DispatchQueue.global().async { [weak self] in
                 let p = Process()
@@ -97,10 +102,14 @@ final class VenvBootstrapper: ObservableObject {
                 pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
                     guard let chunk = String(data: h.availableData, encoding: .utf8) else { return }
                     NSLog("cocore venv: %@", chunk)
-                    let latest = chunk
+                    Self.append(chunk, to: log)
+                    let lines = chunk
                         .split(whereSeparator: \.isNewline)
-                        .map { $0.trimmingCharacters(in: .whitespaces) }
-                        .last(where: { !$0.isEmpty })
+                        .map { Self.stripAnsi(String($0)).trimmingCharacters(in: .whitespaces) }
+                    if let e = lines.last(where: { $0.hasPrefix("error:") }) {
+                        lastError.set(e)
+                    }
+                    let latest = lines.last(where: { !$0.isEmpty })
                     guard let latest else { return }
                     let clean = latest.replacingOccurrences(of: "==> ", with: "")
                     Task { @MainActor [weak self] in
@@ -117,7 +126,42 @@ final class VenvBootstrapper: ObservableObject {
                 }
             }
         }
-        state = exit == 0 ? .done : .failed("Setup failed (exit \(exit)). See Console.app logs.")
+        if exit == 0 {
+            state = .done
+        } else {
+            // Name the real cause and a file the user can actually open. The
+            // old "See Console.app logs" sent people hunting through the
+            // unified log (where NSLog ages out within hours) for output that
+            // was never written anywhere durable.
+            let cause = lastError.get().map { " \($0)." } ?? ""
+            state = .failed("Setup failed (exit \(exit)).\(cause) Full log: ~/.cocore/logs/\(Self.logName)")
+        }
+    }
+
+    /// Durable copy of the last bootstrap run, alongside the agent's own logs
+    /// in `~/.cocore/logs/` (which the diagnostic bundle collects).
+    private static let logName = "venv-bootstrap.log"
+
+    /// Truncate-and-open the bootstrap log for a fresh run.
+    private static func startLog() -> URL {
+        let dir = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cocore/logs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(logName)
+        let header = "\(ISO8601DateFormatter().string(from: Date())) venv bootstrap started\n"
+        try? header.data(using: .utf8)?.write(to: url)
+        return url
+    }
+
+    nonisolated private static func append(_ s: String, to url: URL) {
+        guard let data = s.data(using: .utf8), let h = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? h.close() }
+        _ = try? h.seekToEnd()
+        try? h.write(contentsOf: data)
+    }
+
+    /// The script colors its `error:` prefix; drop SGR escapes before matching.
+    nonisolated private static func stripAnsi(_ s: String) -> String {
+        s.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
     }
 
     private static func bundledScript() -> String? {
@@ -125,4 +169,12 @@ final class VenvBootstrapper: ObservableObject {
             .appendingPathComponent("Contents/Resources/scripts/bootstrap-python-venv.sh").path
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
+}
+
+/// Minimal thread-safe box for a string written from the pipe handler.
+private final class LockedString: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    func set(_ v: String) { lock.lock(); value = v; lock.unlock() }
+    func get() -> String? { lock.lock(); defer { lock.unlock() }; return value }
 }
