@@ -126,6 +126,51 @@ Two honesty notes for that recipe:
   and the model is (correctly) not advertised for schema jobs. Free-text and
   tool-calling jobs are unaffected.
 
+## Recipe: Gemma 4 (images and JSON) on vllm-mlx
+
+The tray's own engine (`provider/python/cocore_inference_server.py`) handles
+Gemma 4 for you; this is for operators running vllm-mlx themselves. Gemma 4
+checkpoints are multimodal, and vllm-mlx 0.4.1 serves them two ways, each
+missing something:
+
+- Loaded by repo id (`vllm-mlx serve mlx-community/gemma-4-12B-it-qat-4bit`):
+  images work, but `response_format` is never enforced (the JSON-schema
+  builder gets the processor, not a tokenizer, and silently gives up), so
+  schema jobs fall back to "schema in the prompt" and some come back
+  malformed.
+- A text-only repack: schema jobs are enforced, but `image_url` parts are
+  dropped and the model answers as if there were no image.
+
+Load it from the **local snapshot directory** instead and vllm-mlx builds a
+weight-sharing text model next to the vision one: text-only requests go to
+it, images go to mlx_vlm. That route needs the two patches in
+`install_mllm_text_route_patches` (in `cocore_inference_server.py`): Gemma's
+end-of-turn stop ids (without them it runs past `<turn|>` into a second
+answer) and the tokenizer for the schema builder. Apply them before
+`vllm_mlx.cli.main()` and serve the snapshot path under the repo id:
+
+```bash
+SNAP=$(ls -d ~/.cache/huggingface/hub/models--mlx-community--gemma-4-12B-it-qat-4bit/snapshots/*)
+python -c 'import sys; sys.path.insert(0, "provider/python")
+import vllm_mlx.server as s, vllm_mlx.engine.simple as e
+from cocore_inference_server import install_mllm_text_route_patches
+install_mllm_text_route_patches(s, e)
+from vllm_mlx.cli import main; sys.argv = ["vllm-mlx"] + sys.argv[1:]; main()' \
+  serve "$SNAP" --served-model-name mlx-community/gemma-4-12B-it-qat-4bit \
+  --port 8024 --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+Check the startup log for `MLLM text routing: text-only -> mlx_lm TextModel`.
+Two more things worth knowing about vllm-mlx 0.4.1 on any attached model:
+
+- If the client disconnects mid-generation (for example the agent's 300 s
+  first-token budget runs out), the engine can keep a phantom "active"
+  request and answer `SimpleEngine serialized route is busy` to everything
+  after it until restarted. A front proxy that restarts the server after a
+  mid-stream disconnect avoids this.
+- A dense 12B on a base M4 is compute-bound: about 120 prompt tok/s and
+  7–8 output tok/s, so a 15K-token prompt takes 4–6 minutes end to end.
+
 ## Faults you may see on the provider record
 
 | code | meaning |

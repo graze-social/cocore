@@ -8,11 +8,21 @@ from __future__ import annotations
 
 import unittest
 
+import asyncio
+import glob
+import json
+import os
+import tempfile
+import types
+
 from cocore_inference_server import (
     QWEN35_MIN_MLX_VLM,
     _model_type_of,
     _parse_version,
+    eos_token_ids_in,
+    install_mllm_text_route_patches,
     qwen35_norm_shift_hazard,
+    wants_mllm_text_route,
 )
 
 
@@ -68,6 +78,79 @@ class Qwen35HazardTests(unittest.TestCase):
 
     def test_missing_mlx_vlm_defers_to_vllm_import_error(self) -> None:
         self.assertIsNone(qwen35_norm_shift_hazard("qwen3_5", None))
+
+
+
+class MllmTextRouteGateTests(unittest.TestCase):
+    def test_gemma4_families_take_the_route(self) -> None:
+        for mt in ("gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"):
+            self.assertTrue(wants_mllm_text_route(mt), mt)
+
+    def test_other_families_are_untouched(self) -> None:
+        for mt in ("gemma3", "qwen3_5", "qwen3_5_moe", "llama", ""):
+            self.assertFalse(wants_mllm_text_route(mt), mt)
+
+
+class EosIdsTests(unittest.TestCase):
+    def _dir(self, **files: object) -> str:
+        d = tempfile.mkdtemp()
+        for name, body in files.items():
+            with open(os.path.join(d, name + ".json"), "w") as fh:
+                json.dump(body, fh)
+        return d
+
+    def test_union_of_generation_config_and_config(self) -> None:
+        d = self._dir(generation_config={"eos_token_id": [1, 106, 50]}, config={"eos_token_id": 1})
+        self.assertEqual(eos_token_ids_in(d), {1, 50, 106})
+
+    def test_scalar_and_missing(self) -> None:
+        self.assertEqual(eos_token_ids_in(self._dir(config={"eos_token_id": 2})), {2})
+        self.assertEqual(eos_token_ids_in(self._dir()), set())
+
+
+GEMMA4_SNAPSHOTS = glob.glob(os.path.expanduser(
+    "~/.cache/huggingface/hub/models--mlx-community--gemma-4-12B-it-qat-4bit/snapshots/*"))
+
+
+@unittest.skipUnless(GEMMA4_SNAPSHOTS, "needs the cached gemma-4-12B-it-qat-4bit snapshot")
+class MllmTextRoutePatchTests(unittest.TestCase):
+    """The two seams, against fake vllm-mlx modules and the real Gemma 4 tokenizer."""
+
+    def setUp(self) -> None:
+        from transformers import AutoTokenizer
+
+        snap = GEMMA4_SNAPSHOTS[0]
+        self.raw_tok = AutoTokenizer.from_pretrained(snap)
+        seen = self.seen = []
+
+        class SimpleEngine:
+            async def _stream_generate_text(self, *a, **k):
+                seen.append(self._text_tokenizer)
+                yield "chunk"
+
+        self.simple = types.SimpleNamespace(SimpleEngine=SimpleEngine)
+        self.server = types.SimpleNamespace(_get_engine_tokenizer=lambda engine: "PROCESSOR")
+        install_mllm_text_route_patches(self.server, self.simple)
+        self.engine = SimpleEngine()
+        self.engine._model_name = snap
+        self.engine._text_model = object()
+        self.engine._text_tokenizer = self.raw_tok
+
+    def test_json_builder_gets_the_text_tokenizer_with_gemma_eos(self) -> None:
+        tok = self.server._get_engine_tokenizer(self.engine)
+        self.assertNotEqual(tok, "PROCESSOR")
+        self.assertTrue({1, 106}.issubset(set(tok.eos_token_ids)))
+
+    def test_text_route_streams_with_the_fixed_tokenizer(self) -> None:
+        async def drain():
+            return [c async for c in self.engine._stream_generate_text([])]
+
+        self.assertEqual(asyncio.run(drain()), ["chunk"])
+        self.assertIn(106, set(self.seen[0].eos_token_ids))
+
+    def test_engines_without_a_text_route_keep_the_original(self) -> None:
+        self.engine._text_model = None
+        self.assertEqual(self.server._get_engine_tokenizer(self.engine), "PROCESSOR")
 
 
 if __name__ == "__main__":
