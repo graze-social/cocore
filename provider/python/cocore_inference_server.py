@@ -227,6 +227,108 @@ def _refuse_known_corrupt_stack(model: str) -> None:
     raise SystemExit(5)
 
 
+# ---------------------------------------------------------------------------
+# Multimodal Gemma 4: images AND schema-constrained text from one load.
+#
+# Gemma 4 checkpoints (e.g. mlx-community/gemma-4-12B-it-qat-4bit,
+# gemma-4-26B-A4B-it-4bit) are multimodal, so vllm-mlx loads them on its mlx_vlm
+# path. Two things go wrong there for text-only requests, which is all a JSON
+# job is:
+#
+#   * response_format is never enforced. vllm-mlx hands its JSON-schema logits
+#     builder `engine.tokenizer`, which for an MLLM is the *processor*; the
+#     build fails silently and generation falls back to "schema in the prompt".
+#     Measured on 38 real election-summary prompts: 5 malformed-JSON replies on
+#     the multimodal 26B vs 1 (a length cutoff) once constrained decoding ran.
+#   * Serving text-only (vision tower stripped) fixes that but drops images:
+#     a requester got "NOIMAGE" 4/4 for valid image_url parts.
+#
+# vllm-mlx already has the right shape for this: for an MLLM it builds a
+# weight-sharing mlx_lm TextModel and routes text-only requests to it, media to
+# mlx_vlm. It only does so when the model was loaded from a LOCAL directory
+# (build_text_model reads <path>/config.json), and on that route (0.4.1) the
+# text tokenizer is the processor's raw HF tokenizer: mlx_lm then stops only on
+# eos id 1 and runs past Gemma's end-of-turn (106), emitting "<turn|>" and a
+# second answer. So for Gemma 4 we load from the local snapshot (advertising the
+# repo id unchanged) and patch those two seams. Scoped to gemma4 on purpose:
+# other MLLM families would change routing too, and that needs its own testing.
+# ---------------------------------------------------------------------------
+
+
+def wants_mllm_text_route(model_type: str) -> bool:
+    """Families we load from a local snapshot so vllm-mlx builds its text route.
+
+    Pure function so it can be unit-tested without a venv or a model.
+    """
+    return model_type.startswith("gemma4")
+
+
+def eos_token_ids_in(model_dir: "str | Path") -> "set[int]":
+    """Every eos id the checkpoint declares (generation_config.json, then
+    config.json). Gemma 4: {1, 50, 106}. Empty set if neither is readable."""
+    ids: "set[int]" = set()
+    for name in ("generation_config.json", "config.json"):
+        try:
+            with open(Path(model_dir) / name, encoding="utf-8") as fh:
+                value = json.load(fh).get("eos_token_id")
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, list):
+            ids.update(int(v) for v in value)
+        elif value is not None:
+            ids.add(int(value))
+    return ids
+
+
+def _local_snapshot(model: str) -> str:
+    """The local directory for `model` (downloading it if needed, under the same
+    HF_* env the agent set). A model that is already a directory is returned as is."""
+    if Path(model).is_dir():
+        return model
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model)
+
+
+def install_mllm_text_route_patches(server_module, simple_module) -> None:
+    """Patch vllm-mlx's MLLM text route (no-ops unless that route was built)."""
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    def text_tokenizer(engine):
+        tt = getattr(engine, "_text_tokenizer", None)
+        if tt is None or getattr(engine, "_cocore_text_tok_fixed", False):
+            return tt
+        eos = eos_token_ids_in(engine._model_name) if Path(str(engine._model_name)).is_dir() else set()
+        if isinstance(tt, TokenizerWrapper):
+            tt._eos_token_ids = set(tt._eos_token_ids or ()) | eos
+        else:
+            tt = TokenizerWrapper(tt, eos_token_ids=eos or None)
+        engine._text_tokenizer = tt
+        engine._cocore_text_tok_fixed = True
+        print(f"[cocore-engine] MLLM text route: eos ids {sorted(tt.eos_token_ids)}", flush=True)
+        return tt
+
+    orig_stream_text = simple_module.SimpleEngine._stream_generate_text
+
+    async def _stream_generate_text(self, *args, **kwargs):
+        text_tokenizer(self)
+        async for chunk in orig_stream_text(self, *args, **kwargs):
+            yield chunk
+
+    simple_module.SimpleEngine._stream_generate_text = _stream_generate_text
+
+    orig_get_tokenizer = server_module._get_engine_tokenizer
+
+    def _get_engine_tokenizer(engine):
+        if engine is not None and getattr(engine, "_text_model", None) is not None:
+            tt = text_tokenizer(engine)
+            if tt is not None:
+                return tt
+        return orig_get_tokenizer(engine)
+
+    server_module._get_engine_tokenizer = _get_engine_tokenizer
+
+
 def _unlink_if_owned(socket_path: Path, owned_ino: "int | None") -> None:
     """Unlink ``socket_path`` only if it is the exact socket we bound.
 
@@ -430,7 +532,23 @@ def main() -> None:
     # Known-corrupt stack check runs BEFORE the multi-GB load so a stale venv
     # fails in a second with a clear message rather than serving garbage.
     _refuse_known_corrupt_stack(args.model)
-    srv.load_model(args.model, force_mllm=args.vision)
+    load_path = args.model
+    try:
+        if wants_mllm_text_route(_model_type_of(_load_model_config(args.model))):
+            load_path = _local_snapshot(args.model)
+            import vllm_mlx.engine.simple as _simple
+
+            install_mllm_text_route_patches(srv, _simple)
+            print("[cocore-engine] Gemma 4: images via mlx_vlm, text via constrained mlx_lm route", flush=True)
+    except Exception as exc:  # noqa: BLE001 - fall back to the plain load, never block it
+        load_path = args.model
+        print(f"[cocore-engine] MLLM text route unavailable ({exc.__class__.__name__}: {exc}); "
+              "loading without it", flush=True)
+    if load_path == args.model:
+        srv.load_model(args.model, force_mllm=args.vision)
+    else:
+        # Same advertised id: requests still name the repo, only the load path is local.
+        srv.load_model(load_path, force_mllm=args.vision, served_model_name=args.model)
 
     if args.default_chat_template_kwargs:
         try:
