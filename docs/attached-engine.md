@@ -166,8 +166,7 @@ Two more things worth knowing about vllm-mlx 0.4.1 on any attached model:
 - If the client disconnects mid-generation (for example the agent's 300 s
   first-token budget runs out), the engine can keep a phantom "active"
   request and answer `SimpleEngine serialized route is busy` to everything
-  after it until restarted. A front proxy that restarts the server after a
-  mid-stream disconnect avoids this.
+  after it. See the section on that error below for the cause and the fix.
 - A dense 12B on a base M4 is compute-bound: about 120 prompt tok/s and
   7–8 output tok/s, so a 15K-token prompt takes 4–6 minutes end to end.
 
@@ -177,6 +176,27 @@ Two more things worth knowing about vllm-mlx 0.4.1 on any attached model:
 |---|---|
 | `attached-engine-unreachable` | the server never answered `GET /v1/models` within the ready timeout; other models are unaffected |
 | `engine-map-invalid` | the map could not be parsed; no attached model is served until fixed |
+
+## vllm-mlx: "SimpleEngine serialized route is busy" after a hang-up
+
+vllm-mlx 0.4.1 (with Starlette 1.x) can wedge after a client disconnects
+mid-stream, which is exactly what the agent does when its first-token budget
+runs out. Starlette cancels the response task but never closes the body
+iterator, so the generator holding SimpleEngine's generation lock stays
+suspended until Python's cycle collector happens to finalize it. Meanwhile
+every request is refused with `SimpleEngine serialized route is busy`, or,
+with `wait` admission, queues forever. The tray's own engine fixes this in
+`cocore_inference_server.py`:
+
+- `install_stream_close_on_abandon` closes the abandoned iterator immediately;
+- `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait` makes a job that arrives a
+  moment later queue instead of failing;
+- a stall watchdog exits the engine (status 75, so the agent restarts it) if
+  the lock is held with no progress for `COCORE_ENGINE_STALL_EXIT_S` (default
+  900 s). This covers a client that stays connected but stops reading.
+
+If you run vllm-mlx yourself, apply `install_stream_close_on_abandon` and set
+the admission variable the same way before calling `vllm_mlx.cli.main()`.
 
 ## Not in scope (yet)
 
