@@ -6,17 +6,21 @@ Run inside the provider venv (the module imports vllm_mlx at import time):
 """
 from __future__ import annotations
 
-import unittest
-
 import asyncio
 import glob
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import types
+import unittest
 
 from cocore_inference_server import (
     QWEN35_MIN_MLX_VLM,
+    engine_progress_fingerprint,
+    install_stream_close_on_abandon,
+    stall_seconds,
     _model_type_of,
     _parse_version,
     eos_token_ids_in,
@@ -151,6 +155,116 @@ class MllmTextRoutePatchTests(unittest.TestCase):
     def test_engines_without_a_text_route_keep_the_original(self) -> None:
         self.engine._text_model = None
         self.assertEqual(self.server._get_engine_tokenizer(self.engine), "PROCESSOR")
+
+
+class _Lock:
+    def __init__(self, held: bool) -> None:
+        self.held = held
+
+    def locked(self) -> bool:
+        return self.held
+
+
+class StallWatchdogTests(unittest.TestCase):
+    def test_idle_engine_has_no_fingerprint(self) -> None:
+        eng = types.SimpleNamespace(_generation_lock=_Lock(False), _active_requests={"a": {}})
+        self.assertIsNone(engine_progress_fingerprint(eng))
+
+    def test_fingerprint_moves_with_progress(self) -> None:
+        reqs = {"a": {"prompt_tokens": 10, "completion_tokens": 2, "elapsed_s": 1.0}}
+        eng = types.SimpleNamespace(_generation_lock=_Lock(True), _active_requests=reqs)
+        before = engine_progress_fingerprint(eng)
+        reqs["a"]["completion_tokens"] = 3
+        self.assertNotEqual(before, engine_progress_fingerprint(eng))
+
+    def test_stall_clock(self) -> None:
+        fp = (("a", 10, 2, 1.0),)
+        self.assertEqual(stall_seconds(None, 0.0, fp, 100.0), (0.0, 100.0))   # new work
+        self.assertEqual(stall_seconds(fp, 100.0, fp, 400.0), (300.0, 100.0))  # frozen
+        self.assertEqual(stall_seconds(fp, 100.0, None, 500.0), (0.0, 500.0))  # went idle
+        moved = (("a", 10, 3, 2.0),)
+        self.assertEqual(stall_seconds(fp, 100.0, moved, 500.0), (0.0, 500.0))  # progressed
+
+    def test_watchdog_exits_75_on_a_frozen_lock(self) -> None:
+        code = (
+            "import time, types, cocore_inference_server as m\n"
+            "class L:\n    def locked(self): return True\n"
+            "eng = types.SimpleNamespace(_generation_lock=L(), "
+            "_active_requests={'x': {'prompt_tokens': 5, 'completion_tokens': 2, 'elapsed_s': 1.0}})\n"
+            "m._start_stall_watchdog(eng, limit_s=0.3, poll_s=0.1)\n"
+            "time.sleep(10)\n"
+        )
+        here = os.path.dirname(os.path.abspath(__file__))
+        r = subprocess.run([sys.executable, "-c", code], cwd=here, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 75, r.stdout + r.stderr)
+        self.assertIn("no progress", r.stdout)
+
+    def test_admission_defaults_to_wait(self) -> None:
+        self.assertEqual(os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION"), "wait")
+
+
+
+class StreamCloseOnAbandonTests(unittest.TestCase):
+    """A response whose streaming task is cancelled (client gone) must close its body iterator."""
+
+    def _module(self, behaviour):
+        class StreamingResponse:
+            def __init__(self, it):
+                self.body_iterator = it
+
+            async def stream_response(self, send):
+                await behaviour(self, send)
+
+        return types.SimpleNamespace(StreamingResponse=StreamingResponse)
+
+    def _run(self, behaviour):
+        import asyncio
+
+        closed = []
+
+        async def body():
+            try:
+                yield b"a"
+                yield b"b"
+            finally:
+                closed.append(True)
+
+        mod = self._module(behaviour)
+        install_stream_close_on_abandon(mod)
+
+        async def main():
+            it = body()
+            resp = mod.StreamingResponse(it)
+            task = asyncio.ensure_future(resp.stream_response(lambda m: None))
+            try:
+                await task
+            except BaseException:
+                pass
+            await asyncio.sleep(0.05)  # let the scheduled aclose run
+            # Snapshot BEFORE asyncio.run() shuts down: its shutdown_asyncgens()
+            # would close any leftover generator and hide the bug. `it` is
+            # still referenced here, so GC finalization can't hide it either.
+            snapshot = list(closed)
+            del it
+            return snapshot
+
+        return asyncio.run(main())
+
+    def test_cancelled_mid_stream_closes_the_iterator(self) -> None:
+        import asyncio
+
+        async def abandon(self, send):
+            await self.body_iterator.__anext__()   # one chunk out, then the client goes away
+            raise asyncio.CancelledError()
+
+        self.assertEqual(self._run(abandon), [True])
+
+    def test_a_finished_stream_is_left_alone(self) -> None:
+        async def finish(self, send):
+            async for _ in self.body_iterator:
+                pass
+
+        self.assertEqual(self._run(finish), [True])  # closed by exhaustion, no double close error
 
 
 if __name__ == "__main__":

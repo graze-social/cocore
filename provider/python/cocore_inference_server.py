@@ -94,6 +94,19 @@ try:
 except Exception:
     pass
 
+# Queue, don't refuse, while a generation holds the engine. vllm-mlx's
+# SimpleEngine serializes generation behind one lock and by default
+# ("fail_fast") answers any request that arrives while it is held with
+# "SimpleEngine serialized route is busy". When a client hangs up
+# mid-stream (the agent's first-token budget expiring, a requester
+# cancelling), vllm-mlx notices only when it next writes — the abandoned
+# generation keeps the lock until it reaches max_tokens, which on a dense
+# 12B at ~8 tok/s is minutes — so every job the agent sends meanwhile
+# fails instantly. "wait" makes it queue behind the abandoned one instead;
+# the agent's own admission gate keeps that queue at most one deep.
+# Must be set before the engine is constructed (in srv.load_model).
+os.environ.setdefault("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "wait")
+
 import uvicorn  # noqa: E402  (after logging config — intentional)
 import vllm_mlx.server as srv  # noqa: E402
 # LFM is not present in every installed vllm-mlx release. Importing the
@@ -329,6 +342,109 @@ def install_mllm_text_route_patches(server_module, simple_module) -> None:
     server_module._get_engine_tokenizer = _get_engine_tokenizer
 
 
+# ---------------------------------------------------------------------------
+# Close abandoned response streams (the root cause of the "busy" wedge).
+#
+# When a client hangs up mid-stream, Starlette cancels the task that iterates
+# StreamingResponse.body_iterator but never closes the iterator. vllm-mlx's
+# stream is a chain of async generators, the innermost holding SimpleEngine's
+# generation lock in an `async with`; left suspended at a `yield`, that chain
+# only runs its `finally` blocks (abort, release the lock) when Python's
+# cycle collector finalizes it — which on a quiet engine can take forever.
+# Measured over the agent's UDS transport: a 0.8B model's abandoned request
+# sat "running" at completion=3 with no worker thread alive until a manual
+# gc.collect() freed it instantly. Closing the iterator ourselves, in a fresh
+# task outside the cancelled scope, runs those `finally` blocks right away.
+# ---------------------------------------------------------------------------
+
+
+def install_stream_close_on_abandon(responses_module) -> None:
+    import asyncio
+
+    orig = responses_module.StreamingResponse.stream_response
+
+    async def _close(aclose) -> None:
+        try:
+            await aclose()
+        except Exception:  # noqa: BLE001 - best effort; the stall watchdog is the backstop
+            pass
+
+    async def stream_response(self, send):
+        finished = False
+        try:
+            await orig(self, send)
+            finished = True
+        finally:
+            aclose = None if finished else getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                asyncio.get_running_loop().create_task(_close(aclose))
+
+    responses_module.StreamingResponse.stream_response = stream_response
+
+
+# ---------------------------------------------------------------------------
+# Stall watchdog.
+#
+# Queueing (above) covers the common case, where the abandoned generation
+# finishes on its own. It does not cover the one where it never does: twice
+# on 2026-10-18 a SimpleEngine kept a request "active" with frozen progress
+# (completion=2 and =4 tokens, elapsed not advancing) for as long as anyone
+# watched, holding the generation lock — with "wait" admission that would
+# park every later job forever instead of failing it. If the lock stays held
+# and no active request's progress moves for COCORE_ENGINE_STALL_EXIT_S
+# (default 900 s, far beyond the slowest legitimate prefill we have measured:
+# ~165 s for 19K tokens on a dense 12B), this process exits; the agent sees
+# the subprocess die and runs its bounded restart, which reloads the model.
+# ---------------------------------------------------------------------------
+
+STALL_EXIT_DEFAULT_S = 900.0
+
+
+def engine_progress_fingerprint(engine) -> "tuple | None":
+    """None when the engine is idle (lock free), else a value that changes
+    whenever any active request makes progress."""
+    lock = getattr(engine, "_generation_lock", None)
+    if lock is None or not lock.locked():
+        return None
+    active = dict(getattr(engine, "_active_requests", {}) or {})
+    return tuple(sorted(
+        (str(rid), info.get("prompt_tokens"), info.get("completion_tokens"), info.get("elapsed_s"))
+        for rid, info in active.items()
+    ))
+
+
+def stall_seconds(prev_fp, prev_changed_at: float, fp, now: float) -> "tuple[float, float]":
+    """(seconds stalled, new changed_at). Idle or any change resets the clock.
+
+    Pure function so it can be unit-tested without a venv or a model.
+    """
+    if fp is None or fp != prev_fp:
+        return 0.0, now
+    return now - prev_changed_at, prev_changed_at
+
+
+def _start_stall_watchdog(engine, limit_s: float, poll_s: float = 15.0) -> None:
+    def _watch() -> None:
+        prev_fp, changed_at = None, time.monotonic()
+        while True:
+            time.sleep(poll_s)
+            try:
+                fp = engine_progress_fingerprint(engine)
+            except Exception:  # noqa: BLE001 - a diagnostic must never kill a healthy engine
+                continue
+            now = time.monotonic()
+            stalled, changed_at = stall_seconds(prev_fp, changed_at, fp, now)
+            prev_fp = fp
+            if stalled >= limit_s:
+                msg = (f"[cocore-engine] generation lock held with no progress for "
+                       f"{stalled:.0f}s (active={fp}); exiting so the agent restarts the engine")
+                print(msg, flush=True)
+                print(msg, file=sys.stderr, flush=True)
+                os._exit(75)
+
+    threading.Thread(target=_watch, name="engine-stall-watchdog", daemon=True).start()
+
+
 def _unlink_if_owned(socket_path: Path, owned_ino: "int | None") -> None:
     """Unlink ``socket_path`` only if it is the exact socket we bound.
 
@@ -549,6 +665,16 @@ def main() -> None:
     else:
         # Same advertised id: requests still name the repo, only the load path is local.
         srv.load_model(load_path, force_mllm=args.vision, served_model_name=args.model)
+
+    import starlette.responses as _responses
+
+    install_stream_close_on_abandon(_responses)
+    try:
+        _stall_limit = float(os.environ.get("COCORE_ENGINE_STALL_EXIT_S", STALL_EXIT_DEFAULT_S))
+    except ValueError:
+        _stall_limit = STALL_EXIT_DEFAULT_S
+    if _stall_limit > 0 and getattr(srv, "_engine", None) is not None:
+        _start_stall_watchdog(srv._engine, _stall_limit)
 
     if args.default_chat_template_kwargs:
         try:
