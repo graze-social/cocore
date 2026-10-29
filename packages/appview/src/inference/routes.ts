@@ -16,6 +16,7 @@
 
 import type { Did } from "@atcute/lexicons";
 import type { PublishedRecord, RecordTransport } from "@cocore/sdk/publish";
+import { withRecordType } from "@cocore/sdk/record-type";
 import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Stream } from "effect";
 
@@ -233,13 +234,14 @@ function sessionTransport(
       collection: string;
       record: T;
     }): Promise<PublishedRecord> {
+      const record = withRecordType(args.collection, args.record);
       const r = await session.handle("/xrpc/com.atproto.repo.createRecord", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           repo: args.repo,
           collection: args.collection,
-          record: args.record,
+          record,
         }),
       });
       if (!r.ok) {
@@ -260,7 +262,7 @@ function sessionTransport(
             collection: args.collection,
             repo: args.repo,
             rkey,
-            body: args.record,
+            body: record,
           }),
         }).catch(() => {
           /* swallowed — cache hint, not a checkpoint */

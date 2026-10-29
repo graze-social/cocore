@@ -5,6 +5,7 @@ export * from "./mda.ts";
 export * from "./appattest.ts";
 export * from "./p256.ts";
 export * from "./publish.ts";
+export * from "./record-type.ts";
 export * from "./seal.ts";
 export * from "./types.ts";
 export * from "./validate.ts";

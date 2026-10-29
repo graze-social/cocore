@@ -23,6 +23,7 @@
 // Server-only — this module touches the user's OAuth session.
 
 import type { OAuthSession } from "@atcute/oauth-node-client";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 
@@ -257,7 +258,7 @@ export async function addFriend(
     body: JSON.stringify({
       repo: session.did,
       collection: FRIEND_COLLECTION,
-      record,
+      record: withRecordType(FRIEND_COLLECTION, record),
     }),
   });
   if (!r.ok) {

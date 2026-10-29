@@ -20,7 +20,8 @@
 //   * 401 — missing/invalid Authorization or API key
 //   * 404 (model_not_found) — no provider serves the requested model
 //   * 503 (no_providers_connected) — no attested providers connected
-//   * 502 — pipeline failures (pds publish, provider key shape, SSE)
+//   * 424 (pds_publish_failed) — the requester's PDS refused the job records
+//   * 502 — pipeline failures (provider key shape, SSE)
 //
 // The friends-only variant lives at `/v1/private/chat/completions`.
 // This endpoint routes against the whole open network. The handler is

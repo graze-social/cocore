@@ -15,6 +15,7 @@
 
 import type { Did } from "@atcute/lexicons";
 import { isDid } from "@atcute/lexicons/syntax";
+import { withRecordType } from "@cocore/sdk/record-type";
 import { Duration, Effect, Schedule } from "effect";
 
 import { runTraced } from "@/lib/o11y.server.ts";
@@ -209,7 +210,7 @@ function parseCreate(raw: CreateRaw): CreateParsed | string {
   }
   return {
     collection: raw.collection,
-    record: raw.record as Record<string, unknown>,
+    record: withRecordType(raw.collection, raw.record as Record<string, unknown>),
     ...(typeof raw.rkey === "string" ? { rkey: raw.rkey } : {}),
   };
 }
@@ -311,7 +312,7 @@ function parsePut(raw: PutRaw): PutParsed | string {
   return {
     collection: raw.collection,
     rkey: raw.rkey,
-    record: raw.record as Record<string, unknown>,
+    record: withRecordType(raw.collection, raw.record as Record<string, unknown>),
     ...(typeof raw.swapRecord === "string" ? { swapRecord: raw.swapRecord } : {}),
   };
 }

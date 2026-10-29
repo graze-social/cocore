@@ -19,6 +19,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform
 import { makeRuntime } from "@cocore/o11y";
 import { Effect } from "effect";
 
+import { withRecordType } from "@cocore/sdk/record-type";
 import type { Money, SettlementRecord, StrongRef } from "@cocore/sdk/types";
 import { AppPasswordSession, createRecordViaSession } from "./app-password-session.ts";
 
@@ -123,7 +124,7 @@ export class PdsSettlementTransport implements SettlementTransport {
       body: {
         repo: exchangeDid,
         collection: "dev.cocore.compute.settlement",
-        record,
+        record: withRecordType("dev.cocore.compute.settlement", record),
       },
       spanName: "exchange.pds.publish",
       exchangeDid,

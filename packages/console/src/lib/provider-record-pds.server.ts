@@ -1,4 +1,5 @@
 import type { OAuthSession } from "@atcute/oauth-node-client";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import { bridgeHeaders, cocoreConfig } from "@/lib/cocore-config.ts";
 import {
@@ -111,7 +112,7 @@ async function rawPutProviderRecord(
       repo: session.did,
       collection: PROVIDER_COLLECTION,
       rkey,
-      record,
+      record: withRecordType(PROVIDER_COLLECTION, record),
       ...(swapRecord ? { swapRecord } : {}),
     }),
   });

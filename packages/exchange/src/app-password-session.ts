@@ -19,6 +19,7 @@
 // This is scoped to the exchange's own service identity. It does NOT replace
 // per-user OAuth (the console can't hold one app password for every member).
 
+import { withRecordType } from "@cocore/sdk/record-type";
 import { resolvePdsEndpoint } from "@cocore/sdk/resolve";
 
 export type SessionEvent = "created" | "refreshed" | "refresh_failed" | "create_failed";
@@ -233,7 +234,7 @@ export async function createRecordViaSession(
     body: JSON.stringify({
       repo: session.did(),
       collection: args.collection,
-      record: args.record,
+      record: withRecordType(args.collection, args.record as object),
       ...(args.rkey ? { rkey: args.rkey } : {}),
     }),
   });

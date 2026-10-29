@@ -669,7 +669,13 @@ export function dispatchErrorToHttpResponse(errorCode: DispatchErrorCode): {
     case "provider-payouts-not-eligible":
       return { status: 403, type: "permission_error", code: "provider_not_eligible" };
     case "pds-publish-failed":
-      return { status: 502, type: "server_error", code: "pds_publish_failed" };
+      // 424 Failed Dependency, not 502: the job never reached the network —
+      // the requester's own PDS refused (or couldn't take) the job records.
+      // A 5xx reads as "no capacity" and OpenAI SDKs auto-retry it, which
+      // can't help when e.g. a strictly-validating PDS rejects the record
+      // (#257). The stable `pds_publish_failed` code is unchanged; Graze's
+      // feed-processor classifies on it.
+      return { status: 424, type: "server_error", code: "pds_publish_failed" };
     case "provider-encryption-key-malformed":
       return { status: 502, type: "server_error", code: "provider_key_malformed" };
     case "chunk-decrypt-failed":

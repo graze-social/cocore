@@ -15,6 +15,7 @@
 import type { OAuthSession } from "@atcute/oauth-node-client";
 
 import type { PublishedRecord, RecordTransport } from "@cocore/sdk/publish";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import { bridgeHeaders } from "@/lib/cocore-config.ts";
 
@@ -44,13 +45,14 @@ export class PdsPublishTransport implements RecordTransport {
     record: T;
   }): Promise<PublishedRecord> {
     // 1. Authoritative write to the user's PDS.
+    const record = withRecordType(args.collection, args.record);
     const r = await this.session.handle(`/xrpc/com.atproto.repo.createRecord`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         repo: args.repo,
         collection: args.collection,
-        record: args.record,
+        record,
       }),
     });
     if (!r.ok) {
@@ -74,7 +76,7 @@ export class PdsPublishTransport implements RecordTransport {
           collection: args.collection,
           repo: args.repo,
           rkey: rkeyFromUri(out.uri),
-          body: args.record,
+          body: record,
         }),
       }).catch(() => {
         // swallowed on purpose — this is a cache hint, not a checkpoint

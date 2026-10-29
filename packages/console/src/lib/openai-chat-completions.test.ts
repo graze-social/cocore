@@ -148,9 +148,14 @@ describe("dispatchErrorToHttpResponse", () => {
     assert.equal(out.code, "no_providers_connected");
   });
 
+  test("pds-publish-failed is a 424 (requester's PDS), keeping its stable code", () => {
+    const out = dispatchErrorToHttpResponse("pds-publish-failed");
+    assert.equal(out.status, 424);
+    assert.equal(out.code, "pds_publish_failed");
+  });
+
   test("pipeline failures collapse to 502 server_error with a distinct code", () => {
     for (const code of [
-      "pds-publish-failed",
       "provider-encryption-key-malformed",
       "chunk-decrypt-failed",
       "advisor-rejected",

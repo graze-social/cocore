@@ -264,3 +264,101 @@ describe("/internal/pds/* (trusted-DID write)", () => {
     });
   });
 });
+
+// graze-social/cocore#257: callers (the provider agent, the console's
+// dispatch forward, the exchange) send records without `$type`. The
+// reference PDS fills it in; a strictly-validating PDS rejects the write.
+// The proxy must stamp `$type` = collection on every write it relays.
+describe("$type framing (strict PDS)", () => {
+  /** A PDS that, like a strictly-validating one, refuses a record whose
+   *  `$type` is missing or doesn't name the collection. */
+  function strictPds(seen: { path: string; record: Record<string, unknown> }[]) {
+    return fakeOauth({
+      reply: (path, payload) => {
+        const p = payload as { collection: string; rkey?: string; record: Record<string, unknown> };
+        seen.push({ path, record: p.record });
+        if (p.record["$type"] !== p.collection) {
+          return {
+            status: 400,
+            body: {
+              error: "InvalidRecord",
+              message: "Record missing required $type field",
+            },
+          };
+        }
+        return {
+          status: 200,
+          body: { uri: `at://${ALICE}/${p.collection}/${p.rkey ?? "rk"}`, cid: "bafycid" },
+        };
+      },
+    });
+  }
+
+  it("stamps $type on createRecord / putRecord across every route", async () => {
+    const seen: { path: string; record: Record<string, unknown> }[] = [];
+    await withServer(strictPds(seen), async (base, secret) => {
+      const writes: [string, Record<string, string>, unknown][] = [
+        [
+          "/pds/createRecord",
+          { authorization: `Bearer ${secret}` },
+          {
+            collection: "dev.cocore.compute.paymentAuthorization",
+            record: { scope: "singleJob" },
+          },
+        ],
+        [
+          "/pds/putRecord",
+          { authorization: `Bearer ${secret}` },
+          {
+            collection: "dev.cocore.compute.provider",
+            rkey: "self",
+            record: { a: 1 },
+          },
+        ],
+        [
+          "/xrpc/dev.cocore.proxy.createRecord",
+          { authorization: `Bearer ${secret}` },
+          {
+            collection: "dev.cocore.compute.receipt",
+            record: { x: 1 },
+          },
+        ],
+        [
+          "/internal/pds/createRecord",
+          { "x-cocore-internal-secret": INTERNAL_SECRET },
+          {
+            did: ALICE,
+            collection: "dev.cocore.compute.job",
+            record: { model: "m" },
+          },
+        ],
+      ];
+      for (const [path, headers, body] of writes) {
+        const r = await fetch(`${base}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body),
+        });
+        expect(r.status, `${path}: ${await r.clone().text()}`).toBe(200);
+      }
+    });
+    expect(seen.map((s) => s.record["$type"])).toEqual([
+      "dev.cocore.compute.paymentAuthorization",
+      "dev.cocore.compute.provider",
+      "dev.cocore.compute.receipt",
+      "dev.cocore.compute.job",
+    ]);
+  });
+
+  it("leaves a caller-supplied $type untouched", async () => {
+    const seen: { path: string; record: Record<string, unknown> }[] = [];
+    await withServer(strictPds(seen), async (base, secret) => {
+      const r = await post(base, "/pds/createRecord", secret, {
+        collection: "dev.cocore.compute.termsAcceptance",
+        record: { $type: "dev.cocore.compute.termsAcceptance", sig: "s" },
+      });
+      expect(r.status).toBe(200);
+    });
+    expect(seen[0]!.record).toEqual({ $type: "dev.cocore.compute.termsAcceptance", sig: "s" });
+  });
+});
