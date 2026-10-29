@@ -266,7 +266,8 @@ describe("dispatchErrorToSystemOneResponse", () => {
   });
 
   test("pipeline failures keep their chat-surface status", () => {
-    assert.equal(dispatchErrorToSystemOneResponse("pds-publish-failed").status, 502);
+    assert.equal(dispatchErrorToSystemOneResponse("pds-publish-failed").status, 424);
+    assert.equal(dispatchErrorToSystemOneResponse("advisor-transport").status, 502);
   });
 });
 

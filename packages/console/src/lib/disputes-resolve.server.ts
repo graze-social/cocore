@@ -27,6 +27,7 @@
 //     InvalidSwap and the operator retries.
 
 import type { OAuthSession } from "@atcute/oauth-node-client";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import { runTraced } from "@/lib/o11y.server.ts";
 
@@ -359,10 +360,10 @@ export async function resolveDispute(input: ResolveDisputeInput): Promise<Resolv
       decidedAt,
     },
   };
-  // Drop $type when echoing back via putRecord — the AT Protocol
-  // PDS infers it from the collection. Re-sign over the canonical
-  // bytes of every other field minus the prior `sig` (set when the
-  // record was opened); the resolution carries its own signature.
+  // Sign over every field except `$type` and the prior `sig` (set when
+  // the record was opened); the resolution carries its own signature.
+  // `$type` is re-added at write time — the reference PDS infers it from
+  // the collection, but a strictly-validating PDS requires it (#257).
   const {
     $type: _drop,
     sig: _priorSig,
@@ -383,7 +384,7 @@ export async function resolveDispute(input: ResolveDisputeInput): Promise<Resolv
       repo: session.did,
       collection: DISPUTE_COLLECTION,
       rkey: rkeyFromUri(input.disputeUri),
-      record: recordToPut,
+      record: withRecordType(DISPUTE_COLLECTION, recordToPut),
       swapRecord: dispute.cid,
     }),
   });

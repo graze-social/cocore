@@ -13,6 +13,7 @@
 // the rollout safe — a deploy without the env behaves exactly as before.
 
 import type { RecordTransport, PublishedRecord } from "@cocore/sdk/publish";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 function base(): string | null {
   return process.env["COCORE_APPVIEW_INTERNAL_URL"]?.replace(/\/$/, "") || null;
@@ -53,7 +54,7 @@ export class AppviewForwardTransport implements RecordTransport {
     const r = await forwardPdsWrite("createRecord", {
       did: args.repo,
       collection: args.collection,
-      record: args.record,
+      record: withRecordType(args.collection, args.record),
     });
     if (!r.ok) {
       const text = await r.text().catch(() => "");

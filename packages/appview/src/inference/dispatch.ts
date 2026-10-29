@@ -646,7 +646,10 @@ export async function* runDispatch(
   } catch (e) {
     yield {
       kind: "error",
-      reason: `pds publish failed: ${(e as Error).message}`,
+      // Name the requester's PDS explicitly: callers otherwise read a failed
+      // dispatch as "no capacity" and keep retrying a write their own PDS
+      // will never accept (#257).
+      reason: `pds publish failed: the requester's PDS did not accept the job records (this is not a provider-capacity error): ${(e as Error).message}`,
       code: "pds-publish-failed",
     };
     return;

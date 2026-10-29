@@ -19,7 +19,8 @@
 //   * 404 (model_not_found) — no provider serves a System-One model
 //   * 422 (validation_error) — malformed request
 //   * 529 — no capacity right now (the status Jev SDKs back off and retry)
-//   * 502 — pipeline failures (pds publish, malformed decision)
+//   * 424 (pds_publish_failed) — the requester's PDS refused the job records
+//   * 502 — pipeline failures (malformed decision)
 //
 // Not streamed: a System-One model is non-autoregressive and answers every
 // question in one encoder pass. The handler is shared with the legacy

@@ -21,6 +21,7 @@
     "./p256": "./src/p256.ts",
     "./provider-selection": "./src/provider-selection.ts",
     "./publish": "./src/publish.ts",
+    "./record-type": "./src/record-type.ts",
     "./resolve": "./src/resolve.ts",
     "./types": "./src/types.ts",
     "./validate": "./src/validate.ts"

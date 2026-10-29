@@ -27,6 +27,7 @@ import type {
   StrongRef,
   TrustLevel,
 } from "./types.ts";
+import { withRecordType } from "./record-type.ts";
 
 export interface PublishedRecord {
   uri: string;
@@ -65,7 +66,7 @@ export class BridgeRecordTransport implements RecordTransport {
       collection: args.collection,
       repo: args.repo,
       rkey,
-      body: args.record,
+      body: withRecordType(args.collection, args.record),
     };
     const res = await fetch(`${this.endpoint}/xrpc/dev.cocore.bridge.publish`, {
       method: "POST",
@@ -105,7 +106,7 @@ export class PdsRecordTransport implements RecordTransport {
       body: JSON.stringify({
         repo: args.repo,
         collection: args.collection,
-        record: args.record,
+        record: withRecordType(args.collection, args.record),
       }),
     });
     if (!res.ok) {

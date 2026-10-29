@@ -24,6 +24,7 @@
 // signed-in server fns. Never imported client-side.
 
 import type { OAuthSession } from "@atcute/oauth-node-client";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import { runTraced } from "@/lib/o11y.server.ts";
 
@@ -343,7 +344,7 @@ async function putProfileRecord(
       repo: session.did,
       collection: COLLECTION,
       rkey: RKEY,
-      record,
+      record: withRecordType(COLLECTION, record),
     }),
   });
   if (!r.ok) {

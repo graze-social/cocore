@@ -34,6 +34,7 @@ import { timingSafeEqual } from "node:crypto";
 import { HttpRouter, HttpServerRequest, type HttpServerResponse } from "@effect/platform";
 import { Effect, Metric } from "effect";
 import { logWarn, makeRuntime, metrics, record } from "@cocore/o11y";
+import { withRecordType } from "@cocore/sdk/record-type";
 
 import type { AccountStore } from "../operational/account-store.ts";
 import {
@@ -187,7 +188,7 @@ function parseCreate(b: Record<string, unknown>): CreateArgs | string {
     return "rkey must be a string when provided";
   return {
     collection: b.collection,
-    record: b.record,
+    record: withRecordType(b.collection, b.record),
     ...(typeof b.rkey === "string" ? { rkey: b.rkey } : {}),
   };
 }
@@ -202,7 +203,7 @@ function parsePut(b: Record<string, unknown>): PutArgs | string {
   return {
     collection: b.collection,
     rkey: b.rkey,
-    record: b.record,
+    record: withRecordType(b.collection, b.record),
     ...(typeof b.swapRecord === "string" ? { swapRecord: b.swapRecord } : {}),
   };
 }
